@@ -56,6 +56,12 @@ def test_desktop_renderer_is_local_and_gateway_connection_is_described() -> None
     assert "desktopGatewayConnectionSnapshot" in main_ts
     assert "gateway:connection-changed" in main_ts
     assert "gateway:connection" in _read("desktop/electron/src/preload.cts")
+    connection_handler = _section(
+        main_ts,
+        "ipcMain.handle('gateway:connection'",
+        "ipcMain.handle('gateway:cli-invocation'",
+    )
+    assert "refreshSandboxUpgradeReport()" in connection_handler
     assert "if (mainWindow === window) mainWindow = null" in main_ts
 
 
@@ -116,7 +122,7 @@ def test_desktop_owned_gateway_is_unconditionally_loopback_bound() -> None:
     assert "'0.0.0.0'" not in start_gateway
 
 
-def test_desktop_artifact_bridge_credentials_reach_only_the_owned_gateway_child() -> None:
+def test_desktop_browser_credentials_reach_only_the_owned_gateway_child() -> None:
     main_ts = _read("desktop/electron/src/main.ts")
     preload = _read("desktop/electron/src/preload.cts")
     child_environment = _section(
@@ -130,15 +136,15 @@ def test_desktop_artifact_bridge_credentials_reach_only_the_owned_gateway_child(
         "async function startGatewayWithPortRecovery",
     )
 
-    assert "delete environment[DESKTOP_ARTIFACT_BRIDGE_URL_ENV]" in child_environment
-    assert "delete environment[DESKTOP_ARTIFACT_BRIDGE_TOKEN_ENV]" in child_environment
-    assert "await desktopArtifactBridgeLoopback.start()" in start_gateway
-    assert "...artifactBridgeEnvironment" in start_gateway
-    assert start_gateway.index("await desktopArtifactBridgeLoopback.start()") < start_gateway.index(
+    assert "delete environment[DESKTOP_BROWSER_URL_ENV]" in child_environment
+    assert "delete environment[DESKTOP_BROWSER_TOKEN_ENV]" in child_environment
+    assert "await desktopBrowser.start()" in start_gateway
+    assert "...browserEnvironment" in start_gateway
+    assert start_gateway.index("await desktopBrowser.start()") < start_gateway.index(
         "const port = await findGatewayPort()"
     )
-    assert "OPENSQUILLA_DESKTOP_ARTIFACT_BRIDGE_URL" not in preload
-    assert "OPENSQUILLA_DESKTOP_ARTIFACT_BRIDGE_TOKEN" not in preload
+    assert "OPENSQUILLA_DESKTOP_BROWSER_URL" not in preload
+    assert "OPENSQUILLA_DESKTOP_BROWSER_TOKEN" not in preload
 
 
 def test_desktop_activation_and_second_instance_share_safe_reveal_helper() -> None:
@@ -1408,9 +1414,18 @@ def test_desktop_local_packaging_builds_slim_package_without_runtime_fetch() -> 
     scripts = package_json["scripts"]
 
     for local_script in ("dist:local", "pack:local"):
-        commands = scripts[local_script].split(" && ")
+        public_script = local_script.removesuffix(":local")
+        assert scripts[local_script] == f"npm run {public_script}"
+        commands = scripts[public_script].split(" && ")
         assert "npm run fetch:runtimes" not in commands
         assert commands.index("npm run build:web") < commands.index("npm run build:gateway")
+        assert commands.index("npm run build:gateway") < commands.index(
+            f"npm run {public_script}:prepared"
+        )
+        prepared = scripts[f"{public_script}:prepared"].split(" && ")
+        builder = "electron-builder --dir" if public_script == "pack" else "electron-builder"
+        assert prepared.index("npm run verify:prepared") < prepared.index(builder)
+        assert "npm run build:gateway" not in prepared
 
     runtime_resources = {
         (entry["from"], entry["to"])
@@ -1423,8 +1438,8 @@ def test_desktop_local_packaging_builds_slim_package_without_runtime_fetch() -> 
         ("runtime/runtime-pack-catalog.json", "runtime/runtime-pack-catalog.json"),
     }
 
-    assert scripts["dist"].endswith(" && npm run verify:package")
-    assert scripts["pack"].endswith(" && npm run verify:package")
+    assert scripts["dist:prepared"].endswith(" && npm run verify:package")
+    assert scripts["pack:prepared"].endswith(" && npm run verify:package")
 
 
 def test_desktop_onboarding_is_owned_modal_child_of_main_window() -> None:
@@ -2134,7 +2149,13 @@ def test_desktop_update_actions_are_guarded_against_reentry() -> None:
     assert "if (!desktopUpdateCheckAllowed()) return" in check_update
     assert "downloading: updateDownloadInProgress ||" in check_allowed
     assert "applying: updateApplying" in check_allowed
-    assert "downloaded: downloadedUpdateVersion !== null" in check_allowed
+    # Manual installer caches must not suppress discovery of a newer or
+    # withdrawn candidate. Native updates still block checks while downloaded.
+    assert "downloaded: desktopUpdateInstallMode() !== 'manual'" in check_allowed
+    assert (
+        "&& (downloadedUpdateVersion !== null || desktopUpdateStatus === 'downloaded')"
+        in check_allowed
+    )
     assert "if (!mockDownloadedUpdate && !downloadedUpdateVersion) return" in apply_update
     assert apply_update.index("if (updateApplying) return") < apply_update.index(
         "if (!mockDownloadedUpdate && !downloadedUpdateVersion) return"
@@ -2266,8 +2287,13 @@ def test_apply_downloaded_update_waits_for_actual_gateway_exit_before_install() 
     assert "hasGatewayProcessExited(child)" in wait_helper
     assert "child.once('exit', () => finish(true))" in wait_helper
     assert "setTimeout(resolve" not in apply_update
-    assert "await stopAndJoinAllLifecycleOwnedGateways(" in apply_update
-    assert apply_update.index("await stopAndJoinAllLifecycleOwnedGateways(") < apply_update.index(
+    shared_stop = _section(
+        main_ts, "async function stopOwnedGatewaysForUpdate", "async function applyWindowsInstaller"
+    )
+    assert "await stopAndJoinAllLifecycleOwnedGateways(" in shared_stop
+    assert "allowGracefulShutdownWhileQuitting = true" in shared_stop
+    assert "await stopOwnedGatewaysForUpdate()" in apply_update
+    assert apply_update.index("await stopOwnedGatewaysForUpdate()") < apply_update.index(
         "autoUpdater.quitAndInstall(false, true)"
     )
 
@@ -2281,7 +2307,7 @@ def test_apply_downloaded_update_timeout_restores_retry_state_before_returning()
     )
 
     assert "const pendingVersion = downloadedUpdateVersion" in apply_update
-    assert "const exited = await stopAndJoinAllLifecycleOwnedGateways(" in apply_update
+    assert "const exited = await stopOwnedGatewaysForUpdate()" in apply_update
     assert "if (!exited || liveLifecycleOwnedGatewayProcesses().length > 0)" in apply_update
     timeout_branch = _section(
         apply_update,
@@ -2669,21 +2695,28 @@ def test_packaged_session_recovery_gate_uses_installed_electron_and_real_gateway
     assert "preservedDraft" in recovery
 
 
-def test_offline_document_workbench_gate_composes_owned_gateway_and_real_electron() -> None:
+def test_browser_workbench_gates_require_real_electron_and_foreground_input() -> None:
     package_json = json.loads(_read("desktop/electron/package.json"))
-    gate = _read("desktop/electron/scripts/test-offline-document-workbench-e2e.mjs")
     native = _read("desktop/electron/scripts/test-native-workbench-v2-electron.mjs")
     ci = _read(".github/workflows/ci.yml")
 
     assert (
-        package_json["scripts"]["test:offline-document-workbench-e2e"]
-        == "npm run build && node scripts/test-offline-document-workbench-e2e.mjs"
+        package_json["scripts"]["test:desktop-browser"]
+        == "npm run build && node scripts/test-desktop-browser.mjs"
+        " && node scripts/test-desktop-browser-electron.mjs"
     )
-    assert "test_owned_gateway_html_workbench_lifecycle_is_offline_and_immutable" in gate
-    assert "test-native-workbench-v2-electron.mjs" in gate
-    assert "OPENSQUILLA_REQUIRE_ELECTRON_FOREGROUND: '1'" in gate
-    assert "owned-Gateway WebSocket lifecycle" in gate
-    assert "real Electron process" in gate
+    for name, script in (
+        ("native-workbench-v2", "test-native-workbench-v2-electron.mjs"),
+        ("desktop-browser", "test-desktop-browser.mjs"),
+        ("desktop-browser-electron", "test-desktop-browser-electron.mjs"),
+    ):
+        assert script in package_json["scripts"]["test:desktop-workbench"]
+        assert ci.count(f"'{name}:scripts/{script}'") == 3
+    foreground = ci.index('if [[ "${name}" == "native-workbench-v2" ]]; then')
+    invocation = ci.index('"${telemetry[@]}" xvfb-run -a node', foreground)
+    case_setup = ci[foreground:invocation]
+    assert "export OPENSQUILLA_REQUIRE_ELECTRON_FOREGROUND=1" in case_setup
+    assert "else\n              unset OPENSQUILLA_REQUIRE_ELECTRON_FOREGROUND" in case_setup
     assert "OPENSQUILLA_REQUIRE_ELECTRON_FOREGROUND === '1'" in native
     assert "requires an unlocked foreground GUI session" in native
     assert "OPENSQUILLA_WORKBENCH_E2E_MODE || 'stress'" in native
@@ -2707,9 +2740,6 @@ def test_offline_document_workbench_gate_composes_owned_gateway_and_real_electro
     assert "ELECTRON_FOREGROUND_PREREQUISITE_MISSING" in native
     assert "TRUSTED_OVERLAY_FOCUS_CONTRACT_FAILED" in native
     assert "TRUSTED_OVERLAY_INPUT_CONTRACT_FAILED" in native
-    assert ci.count(
-        "offline-document-workbench-e2e:scripts/test-offline-document-workbench-e2e.mjs"
-    ) == 3
 
 
 def test_desktop_gateway_build_and_verifier_cover_runtime_capabilities() -> None:
@@ -3139,7 +3169,11 @@ def test_desktop_update_and_recovery_join_every_lifecycle_owned_gateway() -> Non
 
     assert "await stopAndJoinAllLifecycleOwnedGateways()" in stop_wait
     assert "liveProcesses: liveLifecycleOwnedGatewayProcesses" in coordinator
-    assert "await stopAndJoinAllLifecycleOwnedGateways(" in apply_update
+    shared_stop = _section(
+        main_ts, "async function stopOwnedGatewaysForUpdate", "async function applyWindowsInstaller"
+    )
+    assert "await stopAndJoinAllLifecycleOwnedGateways(" in shared_stop
+    assert "await stopOwnedGatewaysForUpdate()" in apply_update
     assert "liveLifecycleOwnedGatewayProcesses().length > 0" in apply_update
     assert apply_update.index("liveLifecycleOwnedGatewayProcesses().length > 0") < (
         apply_update.index("autoUpdater.quitAndInstall(false, true)")
@@ -3335,7 +3369,6 @@ def test_desktop_orphan_recovery_has_a_real_electron_process_flow() -> None:
 
 
 def test_desktop_e2e_shutdown_helpers_bound_windows_cleanup_without_masking_failures() -> None:
-    v1_flow = _read("desktop/electron/scripts/test-v1-html-agent-edit-e2e.mjs")
     orphan_flow = _read(
         "desktop/electron/scripts/test-desktop-gateway-orphan-recovery-flow.mjs"
     )
@@ -3345,14 +3378,6 @@ def test_desktop_e2e_shutdown_helpers_bound_windows_cleanup_without_masking_fail
     theme_flow = _read("desktop/electron/scripts/test-desktop-theme-flow.mjs")
     helper = _read("desktop/electron/scripts/e2e-shutdown-helpers.mjs")
 
-    assert "const PROVIDER_SHUTDOWN_TIMEOUT_MS = 15_000" in v1_flow
-    assert "const ELECTRON_SHUTDOWN_TIMEOUT_MS = 15_000" in v1_flow
-    assert "trackHttpServerConnections(server)" in v1_flow
-    assert "closeHttpServerWithDeadline(server, connections" in v1_flow
-    assert "phase: 'run-error-before-cleanup'" in v1_flow
-    assert v1_flow.index("phase: 'run-error-before-cleanup'") < v1_flow.index(
-        "await provider?.close()"
-    )
     assert "server.closeIdleConnections?.()" in helper
     assert "server.closeAllConnections?.()" in helper
     assert "for (const socket of sockets) socket.destroy()" in helper
@@ -3370,7 +3395,6 @@ def test_desktop_e2e_shutdown_helpers_bound_windows_cleanup_without_masking_fail
     assert "gatewayExitCount > 0 && allGatewayExitsClean" in helper
     assert "committedExitIndex > lastGatewayExitIndex" in helper
     for flow in (
-        v1_flow,
         orphan_flow,
         profile_flow,
         profile_import_flow,
@@ -3397,9 +3421,23 @@ def test_desktop_e2e_shutdown_helpers_bound_windows_cleanup_without_masking_fail
         assert "canAcceptWindowsElectronShutdownFallback" in flow
         assert "flowSucceeded && shutdownError" in flow
         assert ".close().catch(() => {})" not in flow
-    assert "closeDesktopApp(app, 'restart-electron-shutdown')" in v1_flow
-    assert "closeDesktopApp(app, 'final-electron-shutdown')" in v1_flow
-    assert "await app.close()" not in v1_flow
+
+
+def test_desktop_shutdown_diagnostics_report_file_cleanup_errors_without_masking_exit() -> None:
+    source = _read("desktop/electron/scripts/test-desktop-window-background-flow.mjs")
+    diagnostics = _section(source, "diagnostics: async () => {", "shutdownError = shutdown.error")
+
+    assert "await handle?.close()" in diagnostics
+    assert "logCloseFailed: true" in diagnostics
+    assert (
+        "closeErrorCode: ['ENOENT', 'EACCES', 'EPERM', 'EBUSY', 'EIO'].includes(error?.code)"
+        in diagnostics
+    )
+    assert "...shutdownDiagnostics," in diagnostics
+    assert "? error.code : 'OTHER'" in diagnostics
+    assert "error.message" not in diagnostics
+    assert "return shutdownDiagnostics" in diagnostics
+    assert "flowSucceeded && shutdownError" in source
 
 
 def test_desktop_dual_source_update_resolver_wires_static_channels() -> None:
@@ -3460,7 +3498,8 @@ def test_desktop_dual_source_update_resolver_wires_static_channels() -> None:
     )
     assert "autoUpdater.allowDowngrade = false" in resolver_feed
     assert "current?.rc !== null" in resolver_feed
-    assert "const resolved = await resolveDesktopUpdate()" in check
+    assert "let resolved: ResolvedDesktopUpdate | null" in check
+    assert "resolved = await resolveDesktopUpdate()" in check
     assert "await checkNativeDesktopUpdate(resolved)" in check
     assert "result?.isUpdateAvailable !== true" in native_check
     assert "result?.isUpdateAvailable !== true" in native_download
@@ -3471,9 +3510,9 @@ def test_desktop_dual_source_update_resolver_wires_static_channels() -> None:
     assert "manualInstallerActionInProgress = false" in manual_download
     assert "desktopUpdateStatus === 'checking'" in manual_download
     assert "await checkForUpdates(true)" in manual_download
-    assert "desktopUpdateStatus !== 'available'" in manual_download
+    assert "!['available', 'error'].includes(desktopUpdateStatus)" in manual_download
     assert "desktopUpdateErrorMessage('source_unreachable')" in manual_download
-    assert "'install_failed'" in manual_download
+    assert "const verified = await verifyCachedInstaller(" in manual_download
     assert "manualInstall" in check
     assert "updateAssetUrl(resolved.candidate, resolved.source)" in check
     assert "updateAssetUrl(candidate, source, 'SHA256SUMS')" in main_ts
@@ -3492,10 +3531,17 @@ def test_desktop_dual_source_update_resolver_wires_static_channels() -> None:
         "err.code === 'download_failed' || err.code === 'integrity_failed'"
         in verified_windows_download
     )
-    assert "source: verified.source" in manual_download
-    assert "fallbackUsed: verified.fallbackUsed" in manual_download
-    assert "rememberSuccessfulUpdateSource(verified.source)" in manual_download
-    assert "shell.showItemInFolder(verified.path)" in manual_download
+    assert (
+        "publishVerifiedWindowsInstaller(verified, downloaded.source, downloaded.fallbackUsed)"
+        in manual_download
+    )
+    assert "rememberSuccessfulUpdateSource(downloaded.source)" in manual_download
+    assert "shell.showItemInFolder" not in manual_download
+    assert (
+        manual_download.index("await saveWindowsUpdateCache(")
+        < manual_download.index("const verified = await verifyCachedInstaller(")
+        < manual_download.index("publishVerifiedWindowsInstaller(verified,")
+    )
     assert "shell.openExternal(installerUrl)" not in manual_download
     manual_discovery = _section(
         main_ts,

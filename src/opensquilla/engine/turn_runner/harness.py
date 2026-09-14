@@ -895,21 +895,6 @@ class _TurnRunnerAgentConfigBuilderAdapter(AgentConfigBuilderPort):
                 "tool_result_projection_max_inline_chars",
                 60_000,
             ),
-            tool_result_fresh_diagnostic_policy_enabled=getattr(
-                agent_token_cfg,
-                "tool_result_fresh_diagnostic_policy_enabled",
-                False,
-            ),
-            tool_result_diagnostic_retrieval_gate_enabled=getattr(
-                agent_token_cfg,
-                "tool_result_diagnostic_retrieval_gate_enabled",
-                False,
-            ),
-            tool_result_fresh_diagnostic_inline_max_chars=getattr(
-                agent_token_cfg,
-                "tool_result_fresh_diagnostic_inline_max_chars",
-                64_000,
-            ),
             tool_result_dispatch_max_chars=getattr(
                 agent_token_cfg,
                 "tool_result_dispatch_max_chars",
@@ -949,16 +934,6 @@ class _TurnRunnerAgentConfigBuilderAdapter(AgentConfigBuilderPort):
                 runner._config,
                 "source_diff_candidate_mode",
                 "log",
-            ),
-            runtime_state_capsule_mode=getattr(
-                runner._config,
-                "runtime_state_capsule_mode",
-                "off",
-            ),
-            text_only_tool_recovery_mode=getattr(
-                runner._config,
-                "text_only_tool_recovery_mode",
-                "off",
             ),
             finalize_evidence_gate=bool(
                 getattr(
@@ -1316,7 +1291,6 @@ class _TurnRunnerHistoryLoaderAdapter(HistoryLoaderPort):
         session_key: str,
         trim_last_user: bool,
         bound_user_message_id: str | None = None,
-        restricted_turn: bool = False,
         transcript_snapshot: Any | None = None,
         expected_session_id: str | None = None,
         expected_session_epoch: int | None = None,
@@ -1331,8 +1305,6 @@ class _TurnRunnerHistoryLoaderAdapter(HistoryLoaderPort):
             "trim_last_user": trim_last_user,
             "bound_user_message_id": bound_user_message_id,
         }
-        if _accepts_keyword_arg(self._runner._load_history, "restricted_turn"):
-            kwargs["restricted_turn"] = restricted_turn
         if transcript_snapshot is not None and _accepts_keyword_arg(
             self._runner._load_history,
             "transcript_snapshot",
@@ -1602,24 +1574,12 @@ class _TurnRunnerSystemPromptRefreshAdapter(SystemPromptRefreshPort):
         session_key: str,
         bootstrap_context_mode: str | None,
     ) -> None:
-        restricted_tool_boundary = bool(
-            getattr(agent, "_tool_context", None) is not None
-            and getattr(agent._tool_context, "exclusive_tools", None) is not None
-        )
         assembled = self._runner._assemble_prompt(
             agent_id,
             tool_defs,
             session_key=session_key,
-            bootstrap_context_mode=(
-                "restricted_tool_boundary"
-                if restricted_tool_boundary
-                else bootstrap_context_mode
-            ),
-            workspace_dir=(
-                None
-                if restricted_tool_boundary
-                else getattr(agent.config, "workspace_dir", None)
-            ),
+            bootstrap_context_mode=(bootstrap_context_mode),
+            workspace_dir=(getattr(agent.config, "workspace_dir", None)),
         )
         refreshed_prompt = (
             assembled[0] if isinstance(assembled, tuple) else assembled
@@ -1662,6 +1622,8 @@ class _TurnRunnerAttachmentMessageBuilderAdapter(AttachmentMessageBuilderPort):
     try/except — exceptions propagate to the stage which propagates
     them to the outer ``_run_turn`` terminal handler.
     """
+
+    supports_file_parse_facts = True
 
     def __init__(self, runner: TurnRunner) -> None:
         self._runner = runner
@@ -1717,6 +1679,7 @@ class _TurnRunnerAttachmentMessageBuilderAdapter(AttachmentMessageBuilderPort):
         workspace_dir: str | Path | None = None,
         session_id: str | None = None,
         cancel_check: Callable[[], None],
+        file_parse_fact_sink: Callable[[Any], object] | None = None,
         persist_image_material: bool | None = None,
         image_workspace_dir: str | Path | None = None,
     ) -> list[Any] | None:
@@ -1732,6 +1695,7 @@ class _TurnRunnerAttachmentMessageBuilderAdapter(AttachmentMessageBuilderPort):
                 workspace_attachment_budget_from_config(self._runner._config)
             ),
             cancel_check=cancel_check,
+            file_parse_fact_sink=file_parse_fact_sink,
             **image_kwargs,
         )
 
@@ -1775,6 +1739,7 @@ class _TurnRunnerTranscriptAppendAdapter(TranscriptAppendPort):
         expected_session_id: str | None = None,
         expected_session_epoch: int | None = None,
         provenance: dict[str, Any] | None = None,
+        assistant_replay: dict[str, Any] | None = None,
     ) -> TranscriptAppendResult:
         from opensquilla.engine.runtime import _accepts_keyword_arg
 
@@ -1790,6 +1755,8 @@ class _TurnRunnerTranscriptAppendAdapter(TranscriptAppendPort):
             append_kwargs["message_id"] = assistant_message_id
         if reasoning_content is not None:
             append_kwargs["reasoning_content"] = reasoning_content
+        if assistant_replay is not None:
+            append_kwargs["assistant_replay"] = assistant_replay
         if (
             turn_usage is not None
             and _accepts_keyword_arg(session_manager.append_message, "turn_usage")

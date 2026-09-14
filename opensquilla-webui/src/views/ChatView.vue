@@ -139,23 +139,11 @@
           </div>
         </template>
         <ChatSessionRecoveryStatus
-          v-if="!forkTransition && historyState.sessionMissing"
-          :key="`${sessionKey}:missing`"
-          state="session-missing"
-        />
-        <ChatSessionRecoveryStatus
-          v-else-if="!forkTransition && visibleHistoryRecoveryState"
-          :key="`${sessionKey}:history`"
-          :state="visibleHistoryRecoveryState"
+          v-if="!forkTransition && recoveryNoticeVisible && recoveryNoticeState"
+          :state="recoveryNoticeState"
           :transport-state="gatewayConnectionState"
-          @retry="retryHistory"
-        />
-        <ChatSessionRecoveryStatus
-          v-if="!forkTransition && liveRecoveryState"
-          :key="`${sessionKey}:live`"
-          :state="liveRecoveryState"
-          :transport-state="gatewayConnectionState"
-          @retry="retryLive"
+          automatic
+          @retry="recoveryNoticeState.startsWith('live-') ? retryLive() : retryHistory()"
         />
         <div
           v-if="!forkTransition && showConfirmedEmptySession"
@@ -222,10 +210,12 @@
           :goal="currentGoalRun"
           :goal-elapsed="goalLastElapsed"
           :resolve-session-availability="resolveCreatedSessionAvailability"
+          :resolve-workspace-preview-resource="resolveWorkspacePreviewResource"
           @fork-conversation="forkConversation"
           @edit-message="editMessage"
           @edit-attachment="editAttachmentResource"
           @preview-attachment="previewAttachmentResource"
+          @preview-image="previewImageAttachment"
           @reuse-prompt-annotation="reusePromptAnnotation"
           @regenerate-message="handleRegenerateMessage"
           @toggle-share-message="toggleShareMessage"
@@ -676,6 +666,7 @@
       @keydown="onTextareaKeydown"
       @remove-attachment="removeAttachment"
       @retry-attachment="retryAttachment"
+      @preview-image="previewPendingImage"
       @set-busy-send-mode="busySendMode = $event"
       @set-run-mode="setComposerRunMode"
       @set-session-routing-mode="setComposerSessionRoutingMode"
@@ -786,13 +777,12 @@ import { useSetupStatus } from '@/composables/setup/useSetupStatus'
 import { useAppStore } from '@/stores/app'
 import { useSandboxSetupStore } from '@/stores/sandboxSetup'
 import { useArtifactPromptAnnotationsStore } from '@/stores/artifactPromptAnnotations'
-import { useWorkbenchDocumentContextStore } from '@/stores/workbenchDocumentContext'
 import { useWorkbenchResourcesStore } from '@/stores/workbenchResources'
 import { useWorkbenchStore } from '@/workbench/store'
 import { usePlatform } from '@/platform'
 import {
   focusArtifactPromptAnnotation,
-  notifyArtifactPromptAnnotationsAccepted,
+  notifyPageAnnotationsSent,
   reuseArtifactPromptAnnotation,
 } from '@/workbench/promptAnnotations'
 import ActivityDisclosure from '@/components/chat/ActivityDisclosure.vue'
@@ -805,6 +795,7 @@ import ChatComposer from '@/components/chat/ChatComposer.vue'
 import ProjectWorkspacePickerDialog from '@/components/ProjectWorkspacePickerDialog.vue'
 import ChatMessageList from '@/components/chat/ChatMessageList.vue'
 import ChatSessionRecoveryStatus from '@/components/chat/ChatSessionRecoveryStatus.vue'
+import { useChatRecoveryNotice } from '@/composables/chat/useChatRecoveryNotice'
 import ChatStallNotice from '@/components/chat/ChatStallNotice.vue'
 import ClarifyCard from '@/components/chat/ClarifyCard.vue'
 import ConversationMinimap from '@/components/chat/ConversationMinimap.vue'
@@ -882,6 +873,7 @@ import {
 import { useChatRouterDecisionRuntime } from '@/composables/chat/useChatRouterDecisionRuntime'
 import { useChatAnswerReveal } from '@/composables/chat/useChatAnswerReveal'
 import { useChatRpcEventHandlers } from '@/composables/chat/useChatRpcEventHandlers'
+import { useWorkspacePreviewOpening } from '@/composables/chat/useWorkspacePreviewOpening'
 import { useChatRpcSubscriptions } from '@/composables/chat/useChatRpcSubscriptions'
 import { useChatSend, type ChatSendOutcome } from '@/composables/chat/useChatSend'
 import { useChatSteerDelivery } from '@/composables/chat/useChatSteerDelivery'
@@ -928,6 +920,7 @@ import {
 } from '@/modules/conversationSessionRuntime'
 import {
   SESSION_READ_LIFECYCLE_FACTORY_KEY,
+  SessionReadFailure,
   type SessionReadMetadata,
   type SessionReadPortLease,
   type SessionReadSnapshot,
@@ -1043,8 +1036,6 @@ import {
 } from '@/utils/workbench/artifactPreview'
 import { findArtifactCard, focusArtifactInTranscript } from '@/utils/chat/artifactFocus'
 import {
-  ArtifactProductFailure,
-  artifactProductReasonCode,
   classifyArtifactProductError,
 } from '@/utils/artifactProductErrors'
 import {
@@ -1086,6 +1077,7 @@ import {
 import {
   collectClipboardFiles,
   hasModelInputImageAttachment,
+  normalizeDisplayAttachment,
   isSendableAttachment,
   shouldCaptureFilePaste,
 } from '@/utils/chat/attachments'
@@ -1254,10 +1246,7 @@ function artifactPreviewItemForExplicitOpen(
 }
 
 const artifactPromptAnnotationsStore = useArtifactPromptAnnotationsStore()
-const workbenchDocumentContextStore = useWorkbenchDocumentContextStore()
 const workbenchResourcesStore = useWorkbenchResourcesStore()
-const artifactPromptAnnotationProvider = artifactWorkbench.promptAnnotations
-artifactPromptAnnotationsStore.setProvider(artifactPromptAnnotationProvider)
 const artifactImageLightbox = useArtifactImageLightbox()
 const platform = usePlatform()
 const router = useRouter()
@@ -1376,7 +1365,7 @@ const activePromptAnnotations = computed(() =>
   promptAnnotationsEnabled.value
     ? artifactPromptAnnotationsStore.activeDraftsForSession(sessionKey.value)
     : [])
-const sendablePromptAnnotationIds = computed(() =>
+const sendableAnnotationDraftIds = computed(() =>
   promptAnnotationsEnabled.value
     ? artifactPromptAnnotationsStore.sendableDraftsForSession(sessionKey.value)
       .map(annotation => annotation.annotationId)
@@ -1419,22 +1408,7 @@ async function jumpPromptAnnotation(annotationId: string) {
     pushToast(t('chat.promptAnnotations.focusUnavailable'), { tone: 'warn' })
     return
   }
-  try {
-    await artifactPromptAnnotationsStore.focus(annotationId)
-  } catch (error) {
-    const failure = error instanceof ArtifactProductFailure ? error : null
-    if (failure?.code === 'DOCUMENT_CHANGED') {
-      pushToast(t('chat.promptAnnotations.focusUnavailable'), { tone: 'warn' })
-      return
-    }
-    if (
-      failure?.code === 'ANNOTATION_UNAVAILABLE'
-      && artifactProductReasonCode(failure) === 'not_draft'
-    ) {
-      await artifactPromptAnnotationsStore.load(annotation.sessionKey, { force: true })
-    }
-    pushToast(t('chat.promptAnnotations.focusUnavailable'), { tone: 'warn' })
-  }
+
 }
 
 async function reusePromptAnnotation(annotation: PromptAnnotationSnapshot) {
@@ -1667,12 +1641,16 @@ const conversationSessionRuntime = createConversationSessionRuntime<
   SessionReadPortLease
 >({
   source: conversationEvents,
-  events: { sessionKey: conversationEventSessionKey },
+  events: {
+    sessionKey: conversationEventSessionKey,
+    invalidatesSession: event => event.kind === 'conversation' && event.event.semanticKind === 'session-epoch-changed',
+  },
 })
 const conversationRuntime = conversationSessionRuntime.cursor
 const sessionReadLifecycle = sessionReadLifecycleFactory.create({
   cursor: conversationRuntime,
   subscriptions: conversationSessionRuntime.subscriptions,
+  prepareReadRetirement: key => conversationSessionRuntime.events.prepareReadRetirement(key),
 })
 const activeTaskGroups = ref<Set<string>>(new Set())
 // Task id whose output the live stream renders; binds late events to the
@@ -1833,6 +1811,7 @@ const {
   onFileInputChange,
   addAttachments,
   removeAttachment,
+  retireAttachments,
   retryAttachment,
   hasPendingAttachmentWork,
   prepareAttachmentsForSend,
@@ -2218,6 +2197,7 @@ const chatRouterDecisionRuntime = useChatRouterDecisionRuntime({
 const {
   pendingDecision,
   handleRouterControlReplay,
+  resetRouterReplayCursor,
   queueRouterDecision,
   appendEnsembleProgress,
   markEnsembleHandoff,
@@ -2588,6 +2568,19 @@ const chatSessionSubscription = useChatSessionSubscription({
   resetStreamIdleTimer,
   resetStreamLiveTurnState,
   onLiveSnapshot: snapshot => restoreLiveTurnSnapshot(snapshot),
+  onReadStarted: () => {
+    conversationSessionRuntime.events.invalidateConsumption(sessionKey.value)
+    rpcEventHandlers.beginRecovery()
+  },
+  reconcileHistory: () => chatHistory.reconcileHistory(),
+  onReconciliationInstalled: async () => {
+    await chatApprovals.reconcile()
+  },
+  onSnapshotInstalled: () => {
+    if (!rpcEventHandlers.finishRecovery()) {
+      throw new SessionReadFailure('busy', 'Session recovery buffer overflow; retrying the latest snapshot.', true)
+    }
+  },
   onAuthoritativeIdle: () => {
     if (pendingQueueOwnerContext.value?.sessionKey !== sessionKey.value) {
       activeRunModeLock.value = null
@@ -2634,6 +2627,7 @@ const chatSessionSubscription = useChatSessionSubscription({
 })
 const {
   subscribeSession,
+  reconcileSession,
   retrySessionMetadata,
   cancelActiveSubscription,
   streamGeneration,
@@ -2650,6 +2644,8 @@ const chatSessionBootstrap = useChatSessionBootstrap({
       : await loadHistory({}, context)
   ),
   subscribeSession,
+  reconcileSession,
+  connectionState: gatewayConnectionState,
   cancelHistory: cancelActiveHistory,
   cancelSubscription: cancelActiveSubscription,
 })
@@ -2694,6 +2690,17 @@ function trackSessionBootstrapAdmission<T extends {
 }
 
 let postBootstrapMetadataStarted = false
+function startPostBootstrapMetadata() {
+  if (postBootstrapMetadataStarted) return
+  postBootstrapMetadataStarted = true
+  pendingFeatureToggleRefresh = false
+  void refreshPostBootstrapMetadata()
+  void loadFeatureToggles().then(() => {
+    if (!chatViewDisposed) unsubs.push(bindFeatureRefresh(scheduleHistorySync))
+  })
+  loadSlashCommands()
+}
+
 function schedulePostBootstrapMetadata(
   run: {
     generation: number
@@ -2710,12 +2717,7 @@ function schedulePostBootstrapMetadata(
         || sessionKey.value !== key
         || !isSessionBootstrapCurrent(run.generation, key)
       ) return
-      postBootstrapMetadataStarted = true
-      void refreshPostBootstrapMetadata()
-      void loadFeatureToggles().then(() => {
-        if (!chatViewDisposed) unsubs.push(bindFeatureRefresh(scheduleHistorySync))
-      })
-      loadSlashCommands()
+      startPostBootstrapMetadata()
     },
     () => {},
   )
@@ -2939,9 +2941,10 @@ const chatSessionRuntime = useChatSessionRuntime({
   resetSavingsPopupCooldown,
   restoreWidgetState,
   resetStreamLiveTurnState,
+  retireAttachments,
   resetDraftComposer: () => {
+    artifactImageLightbox.close()
     inputText.value = ''
-    pendingAttachments.value = []
     resetComposerInputHistory()
     autoResizeTextarea()
   },
@@ -3066,6 +3069,8 @@ function projectAcceptedGoalMessage({
 }
 
 const chatGoals = useChatGoals({
+  connectionEpoch: computed(() => gatewayAccess.subscriptionEpoch),
+  connectionAvailable: () => gatewayAccess.isAvailable && gatewayAccess.isAuthenticated,
   goalCenter,
   goalContinuity,
   sessionKey,
@@ -3334,39 +3339,24 @@ const chatSend = useChatSend({
   acceptPendingWorkspaceBinding: activeProjectWorkspace.acceptPendingBinding,
   initialCollaborationMode,
   pendingForkBeforeMessageId,
-  promptAnnotationIds: sendablePromptAnnotationIds,
+  draftIds: sendableAnnotationDraftIds,
   idempotentReplayBlockedReason: liveSendBlockedReason,
-  currentDocumentContext: key => (
-    workbenchDocumentContextStore.currentDocumentContext(key)
-  ),
-  prepareDocumentContextForSend: (key, prepareOptions) => (
-    workbenchDocumentContextStore.prepareDocumentContextForSend(key, prepareOptions)
-  ),
   preparePromptAnnotationsForSend: async (ids, prepareOptions) => {
-    const targetDocuments = new Set(
-      artifactPromptAnnotationsStore.snapshotsForIds(ids).map(item => item.documentId),
-    )
-    for (const documentId of targetDocuments) {
-      const flushed = await workbenchDocumentContextStore.prepareDocumentForSend(
-        sessionKey.value,
-        documentId,
-        prepareOptions,
-      )
-      if (flushed === false) return false
-    }
     const prepared = await artifactPromptAnnotationsStore.prepareForSend(ids)
     return prepared && (prepareOptions?.isCurrent?.() ?? true)
   },
   promptAnnotationSnapshots: ids => artifactPromptAnnotationsStore.snapshotsForIds(ids),
-  acknowledgePromptAnnotations: (
-    requestedIds,
-    acceptedIds,
-    acceptedSessionKey,
-    requestSessionKey,
-  ) => {
-    artifactPromptAnnotationsStore.acknowledgeAccepted(requestedIds, acceptedIds)
-    notifyArtifactPromptAnnotationsAccepted({
-      acceptedIds: [...acceptedIds],
+  annotationAttachments: ids => artifactPromptAnnotationsStore.attachmentsForIds(ids),
+  acknowledgePromptAnnotations: (snapshots, acceptedSessionKey, requestSessionKey) => {
+    let removedIds: string[]
+    try {
+      removedIds = artifactPromptAnnotationsStore.acknowledgeSent(snapshots)
+    } catch {
+      pushToast(t('chat.promptAnnotations.discardFailed'), { tone: 'warn' })
+      return
+    }
+    notifyPageAnnotationsSent({
+      draftIds: removedIds,
       sessionKey: acceptedSessionKey,
       requestSessionKey,
     })
@@ -3753,9 +3743,16 @@ const {
   dismissClarify,
   applyUserInputBootstrap,
 } = chatApprovals
-applyPendingUserInputSnapshot = snapshot => applyUserInputBootstrap({
-  pendingUserInputs: [...snapshot.pendingUserInputs],
-})
+applyPendingUserInputSnapshot = snapshot => {
+  if (snapshot.deferredFields.includes('pendingUserInputs')) return
+  applyUserInputBootstrap({
+    sessionKey: snapshot.sessionKey,
+    epoch: snapshot.epoch,
+    streamSeq: snapshot.pendingUserInputsCursor?.currentStreamSeq,
+    streamGeneration: snapshot.pendingUserInputsCursor?.streamGeneration,
+    pendingUserInputs: [...snapshot.pendingUserInputs],
+  })
+}
 
 const dockedPlanQuestionnaire = computed(() => (
   pendingClarify.value?.presentation === 'plan_questionnaire_v1'
@@ -3839,6 +3836,8 @@ function onPlanQuestionnaireTouchEnd() {
 }
 
 const rpcEventHandlers = useChatRpcEventHandlers({
+  onRecoveryRequired: () => { void recoverCurrentSession() },
+  onTaskSettled: (taskId, epoch) => chatPlans.noteTaskSettled(taskId, epoch),
   conversationRuntime,
   sessionKey,
   currentEpoch,
@@ -3855,6 +3854,7 @@ const rpcEventHandlers = useChatRpcEventHandlers({
   usageAccum,
   usageModel,
   stream: chatStream,
+  onLiveToolResult: payload => workspacePreviewOpening.acceptLiveResult(payload),
   normalizeRunStatus,
   sessionRunStatus,
   applySessionRunState,
@@ -3865,6 +3865,7 @@ const rpcEventHandlers = useChatRpcEventHandlers({
   flushPendingRouterDecision,
   clearPendingRouterDecision,
   handleRouterControlReplay,
+  resetRouterReplayCursor,
   showCompactionToast,
   getCompactionPlacement: id => getCompactionPlacement(id) || undefined,
   showWarningToast: message => pushToast(message || t('chat.warning.default'), { tone: 'warn', duration: 5000 }),
@@ -4098,7 +4099,8 @@ const { stallActive, stallSeconds } = stallWatchdog
 const chatRpcSubscriptions = useChatRpcSubscriptions({
   // The private v4 adapter emits one semantic message. Feed that projection to
   // both business consumers without exposing protocol names in the view.
-  onEvent: (message) => {
+  onEvent: (message, consumption) => {
+    if (consumption && !consumption.isCurrent()) throw new Error('Conversation consumer was superseded.')
     if (message.kind === 'conversation' && message.event.kind === 'known' && message.event.semanticKind !== 'cron-result') {
       stallWatchdog.noteEvent(message.event.semanticKind, message.event.payload)
     } else if (message.kind === 'approval') {
@@ -4107,13 +4109,37 @@ const chatRpcSubscriptions = useChatRpcSubscriptions({
         message.payload,
       )
     }
-    rpcEventHandlers.onConversationEvent(message)
+    return rpcEventHandlers.consumeConversationEvent(message)
   },
+  onRecoveryRequired: recoverCurrentSession,
   onConnectionState: rpcEventHandlers.handlers.onConnectionState,
 }, {
   getSessionKey: () => sessionKey.value,
   runtime: conversationSessionRuntime,
 })
+
+let currentSessionRecovery: Promise<boolean> | null = null
+function recoverCurrentSession(scope?: { readonly keys: readonly string[], readonly global: boolean }): Promise<boolean> {
+  if (scope && (scope.global || scope.keys.length === 0 || scope.keys.some(key => key !== sessionKey.value))) {
+    return Promise.resolve(false)
+  }
+  if (currentSessionRecovery) return currentSessionRecovery
+  const key = sessionKey.value
+  const lease = sessionReadLifecycle.current()
+  const pending = retryLive().then(result => key === sessionKey.value && (
+    result.authoritative
+    // The current owner remains fenced and owns bounded automatic retries (or
+    // a truthful local stale state for an oversized snapshot). A read failure
+    // is not evidence that the shared transport must be recycled.
+    || (lease !== null && sessionReadLifecycle.current() === lease && !result.sessionMissing)
+  ))
+    .catch(() => false)
+  const observed = pending.finally(() => {
+    if (currentSessionRecovery === observed) currentSessionRecovery = null
+  })
+  currentSessionRecovery = observed
+  return observed
+}
 
 // Session switches drop the previous session's stall tracking entirely.
 watch(sessionKey, () => {
@@ -4365,14 +4391,16 @@ const visibleHistoryRecoveryState = computed(() => (
 const liveRecoveryState = computed(() => {
   if (historyState.value.sessionMissing) return null
   if (livePhase.value === 'degraded') return 'live-degraded' as const
-  if (
-    livePhase.value === 'connecting'
-    && historyRecoveryState.value === null
-  ) {
+  if (livePhase.value === 'connecting') {
     return 'live-connecting' as const
   }
   return null
 })
+
+const recoveryNoticeState = computed(() => historyState.value.sessionMissing
+  ? 'session-missing' as const
+  : liveRecoveryState.value ?? visibleHistoryRecoveryState.value)
+const recoveryNoticeVisible = useChatRecoveryNotice(recoveryNoticeState)
 
 const showConfirmedEmptySession = computed(() => shouldShowConfirmedEmptySession({
   isDraftLanding: isNewChatLanding.value,
@@ -4497,7 +4525,10 @@ const queuedImageSendBlockedMessage = computed(() => {
 })
 
 const modelImageSendBlockedMessage = computed(() => {
-  return hasModelInputImageAttachment(pendingAttachments.value)
+  return hasModelInputImageAttachment([
+    ...pendingAttachments.value,
+    ...artifactPromptAnnotationsStore.attachmentsForIds(sendableAnnotationDraftIds.value),
+  ])
     ? queuedImageSendBlockedMessage.value
     : ''
 })
@@ -4838,6 +4869,24 @@ function subagentBody(text: string): string {
 
 /* ── Artifacts ─────────────────────────────────────────────────────── */
 
+function previewImageAttachment(attachment: DisplayAttachment, attachments: readonly DisplayAttachment[]) {
+  artifactImageLightbox.openAttachments({
+    attachment,
+    navigationAttachments: attachments,
+    sessionKey: sessionKey.value,
+  })
+}
+
+function previewPendingImage(attachment: Attachment) {
+  artifactImageLightbox.openAttachments({
+    attachment: normalizeDisplayAttachment(attachment),
+    navigationAttachments: pendingAttachments.value.map(attachment => normalizeDisplayAttachment(attachment)),
+    // Drafts have a provisional runtime key before a session exists in the URL.
+    // Keep local previews owned by the visible route used by App's dialog guard.
+    sessionKey: readSessionFromUrl(),
+  })
+}
+
 async function downloadAttachment(attachment: DisplayAttachment): Promise<boolean> {
   const result = await artifactWorkbench.content.fetchAttachment(attachment, {
     sessionKey: sessionKey.value,
@@ -4923,7 +4972,7 @@ async function previewAttachmentResource(attachment: DisplayAttachment) {
     if (
       !current
       && resource.resource.type !== 'document'
-      && resource.capabilities.manualEdit
+      && resource.capabilities.edit
       && resource.sha256
     ) {
       const imported = await workbenchResourcesStore.importDocument(
@@ -5020,8 +5069,18 @@ const sessionWorkbenchArtifacts = computed(() =>
   sessionArtifacts.value.filter(artifactUsesDocumentWorkbench),
 )
 
-const headerDeliverableCount = computed(() => sessionArtifacts.value.length)
 const workbenchResourceSnapshot = computed(() => workbenchResourcesStore.snapshot(sessionKey.value))
+const headerDeliverableCount = computed(() => {
+  if (!workbenchEnabled.value || !workbenchResourcesEnabled.value) {
+    return sessionArtifacts.value.length
+  }
+  // Local previews are Documents, not public artifacts. Keep their existing
+  // resource-list entry reachable without creating a delivery just for the UI.
+  return Math.max(
+    sessionArtifacts.value.length,
+    workbenchResourcesStore.navigationResources(sessionKey.value).length,
+  )
+})
 const attachmentWorkbenchResources = computed<ReadonlyMap<string, WorkbenchResource>>(() => (
   new Map(
     workbenchResourceSnapshot.value.resources
@@ -5038,7 +5097,7 @@ function focusHeaderAction(
 }
 
 async function openDeliverables() {
-  if (sessionArtifacts.value.length === 0) return
+  if (headerDeliverableCount.value === 0) return
   acknowledgeDeliverableUpdate()
   if (
     workbenchEnabled.value
@@ -5217,7 +5276,7 @@ async function openDeliverableWorkbenchResource(artifact: ArtifactPayload) {
     if (
       !current
       && resource.resource.type !== 'document'
-      && resource.capabilities.manualEdit
+      && resource.capabilities.edit
       && resource.sha256
     ) {
       const imported = await workbenchResourcesStore.importDocument(
@@ -5289,7 +5348,51 @@ async function openDeliverableWorkbenchResource(artifact: ArtifactPayload) {
   }
 }
 
+async function resolveWorkspacePreviewResource(key: string, documentId: string) {
+  if (!attachmentWorkbenchPreviewEnabled.value) return null
+  const ref = createWorkbenchResourceRef('document', documentId)
+  return workbenchResourcesStore.resolve(key, ref)
+}
+
+const workspacePreviewOpening = useWorkspacePreviewOpening({
+  sessionKey,
+  currentEpoch,
+  enabled: attachmentWorkbenchPreviewEnabled,
+  resolve: (key, resource) => workbenchResourcesStore.resolve(key, resource),
+  openCurrent: (key, resource) => workbenchResourcesStore.openCurrent(key, resource),
+  show: (current, key, previewPagePath) => {
+    const artifact = artifactPayloadFromRevision(current.revision)
+    artifact.documentId = current.document.documentId
+    artifact.revisionId = current.revision.revisionId
+    if (previewPagePath) artifact.previewPagePath = previewPagePath
+    const opened = workbenchStore.openItem(artifactPreviewItemForExplicitOpen({
+      artifact,
+      initialSection: 'preview',
+      navigationArtifacts: sessionArtifacts.value,
+      nativeHtml: Boolean(platform.capabilities.hasNativeWorkbenchSurfaces && platform.workbench.native),
+      previewLeaseEligible: true,
+      resourceIdentity: workbenchResourceKey(current.resource.resource),
+      sessionKey: key,
+    }))
+    if (!opened) pushToast(t('workbench.itemLimitReached'), { tone: 'warn', duration: 6000 })
+  },
+  onError: error => {
+    const classified = classifyArtifactProductError(error)
+    const translated = t(classified.messageKey)
+    pushToast(translated === classified.messageKey ? classified.fallbackMessage : translated,
+      { tone: 'danger', duration: 9000 })
+  },
+})
+
 function openArtifact(artifact: ArtifactPayload): boolean {
+  if (artifact.source === 'workspace-preview') {
+    void workspacePreviewOpening.open(
+      typeof artifact.documentId === 'string' ? artifact.documentId : '',
+      artifact.session_key || '',
+      typeof artifact.previewPagePath === 'string' ? artifact.previewPagePath : undefined,
+    )
+    return true
+  }
   // Generated images are also inline media. Route every visual artifact to
   // the authenticated lightbox before the inline-focus fallback so clicking
   // either the thumbnail or its open affordance actually previews it.
@@ -6742,6 +6845,7 @@ onUnmounted(() => {
   cancelSessionBootstrap()
   conversationSessionRuntime.dispose()
   pendingSessionOptionalReads = null
+  pendingFeatureToggleRefresh = false
   releaseOptionalRpcAdmission?.()
   releaseOptionalRpcAdmission = null
   cancelActiveProjectValidation()
@@ -6753,7 +6857,6 @@ onUnmounted(() => {
   cleanupSessionArtifacts()
   cleanupStream()
   cleanupCompaction()
-  artifactPromptAnnotationsStore.setProvider(null)
   cleanupVoiceInput()
   chatApprovals.cleanup()
   metaRuns.cleanup()
@@ -6866,10 +6969,16 @@ watch(
 watch(() => [route.path, route.query.agent, route.query.project], async () => {
   durableRecoveryGeneration += 1
   metaDraftRecovery.invalidate()
-  const generation = draftProjectHydration.begin()
+  draftProjectHydration.invalidate()
   if (!isDraftRoute()) return
-  if (!await syncDraftProjectFromRoute(generation)) return
+  artifactImageLightbox.close()
+  // Retire the previous session before optional project I/O. The shared view
+  // already renders /chat/new here; retaining its old key would also admit
+  // that session's delayed live events, history, and subscription snapshots.
   enterDraft()
+  const generation = draftProjectHydration.begin()
+  if (!await syncDraftProjectFromRoute(generation)) return
+  if (!draftProjectHydration.isCurrent(generation) || !isDraftRoute()) return
   metaDraftRecovery.start(draftAgentId())
 })
 
@@ -6947,9 +7056,19 @@ type SessionOptionalReadRequest = {
 }
 
 let pendingSessionOptionalReads: SessionOptionalReadRequest | null = null
+let pendingFeatureToggleRefresh = false
 
 function flushSessionOptionalReads() {
   if (!optionalSessionRpcAllowed.value) return
+  if (chatViewDisposed || !gatewayAccess.isAvailable) return
+  if (pendingFeatureToggleRefresh) {
+    pendingFeatureToggleRefresh = false
+    // A late first Hello can replace the pre-connection bootstrap generation.
+    // Its retired callback must not strand metadata: the same open gate can
+    // initialize it once, then later Hellos only refresh it (including drafts).
+    if (postBootstrapMetadataStarted) void loadFeatureToggles()
+    else startPostBootstrapMetadata()
+  }
   const pending = pendingSessionOptionalReads
   pendingSessionOptionalReads = null
   if (
@@ -7009,7 +7128,7 @@ watch(sessionKey, () => {
 // for the current Session then; older gateways simply remain on history/live.
 watch(() => gatewayAccess.availability, (state, previous) => {
   if (state !== 'available' || previous === 'available') return
-  void loadFeatureToggles()
+  pendingFeatureToggleRefresh = true
   if (
     sessionKey.value
     && pendingSessionIntent.value !== 'new_chat'
@@ -7019,6 +7138,8 @@ watch(() => gatewayAccess.availability, (state, previous) => {
       artifactMode: 'reconnect',
       forceAnnotations: true,
     })
+  } else {
+    flushSessionOptionalReads()
   }
 })
 

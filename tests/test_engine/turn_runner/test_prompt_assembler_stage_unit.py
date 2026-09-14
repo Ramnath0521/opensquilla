@@ -381,50 +381,6 @@ async def test_prompt_assembler_uses_effective_tool_workspace() -> None:
     assert prompt_assembler.last_kwargs["workspace_dir"] == "D:\\lrk\\opensquilla"
 
 
-@pytest.mark.asyncio
-async def test_restricted_tool_boundary_suppresses_workspace_prompt_inputs() -> None:
-    prompt_assembler = _RecordingPromptAssembler(
-        metadata_to_emit={"injected_workspace_files_count": 0}
-    )
-    executor = _RecordingPipelineExecutor(
-        turn=_make_turn(
-            metadata={
-                "skill_count": 0,
-                "skills_rendered_count": 0,
-                "skills_prompt_chars": 0,
-            }
-        ),
-        provider=_StubProvider(),
-    )
-    builder = _RecordingPromptReportBuilder()
-    stage = _make_stage(
-        assembler=prompt_assembler,
-        executor=executor,
-        builder=builder,
-    )
-    skill_catalog = object()
-
-    await stage.run(
-        _make_input(
-            extra_prompt_context={"project": "/secret/workspace"},
-            bootstrap_context_mode="full",
-            effective_tool_context=ToolContext(
-                workspace_dir="/secret/workspace",
-                exclusive_tools={"artifact_reader"},
-            ),
-            skill_catalog=skill_catalog,
-        )
-    )
-
-    assert prompt_assembler.last_kwargs["workspace_dir"] is None
-    assert prompt_assembler.last_kwargs["extra_context"] is None
-    assert (
-        prompt_assembler.last_kwargs["bootstrap_context_mode"]
-        == "restricted_tool_boundary"
-    )
-    assert executor.requests[0].skill_catalog is None
-    assert builder.last_kwargs["metadata"]["injected_workspace_files_count"] == 0
-    assert builder.last_kwargs["metadata"]["skill_count"] == 0
 
 
 @pytest.mark.asyncio
@@ -760,7 +716,7 @@ async def test_explicit_model_equal_to_routed_keeps_savings() -> None:
 
 
 @pytest.mark.asyncio
-async def test_case05_pipeline_filter_skills_metadata_merge() -> None:
+async def test_case05_pipeline_resolve_skill_catalog_metadata_merge() -> None:
     assembler = _RecordingPromptAssembler(metadata_to_emit={"skill_count": 2})
     executor = _RecordingPipelineExecutor(
         turn=_make_turn(metadata={"skills_prompt_chars": 1234}),

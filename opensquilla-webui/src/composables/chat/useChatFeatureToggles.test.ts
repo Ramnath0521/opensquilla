@@ -108,6 +108,12 @@ function createHarness(options: {
         return {}
       }),
       merge: vi.fn(async () => ({})),
+      setTelemetryConsent: vi.fn(async (scope, enabled) => ({
+        scope,
+        enabled,
+        noticeVersion: enabled ? `${scope}-v1` : null,
+        consentedAtUtc: enabled ? '2026-09-03T00:00:00Z' : null,
+      })),
     },
     modelRouting: {
       get: vi.fn(async () => await rpcRequest('models.routing.get', undefined, options.readCallOptions) as import('@/modules/providerConfiguration').ModelRoutingSnapshot),
@@ -670,7 +676,16 @@ describe('useChatFeatureToggles model routing mode', () => {
 
     expect(watcherStart).toBeGreaterThanOrEqual(0)
     expect(watcherEnd).toBeGreaterThan(watcherStart)
-    expect(reconnectWatcher).toContain('void loadFeatureToggles()')
+    expect(reconnectWatcher).toContain('pendingFeatureToggleRefresh = true')
+    expect(reconnectWatcher).toContain('flushSessionOptionalReads()')
+    const flushStart = chatViewSource.indexOf('function flushSessionOptionalReads()')
+    const flushEnd = chatViewSource.indexOf('function scheduleSessionOptionalReads(', flushStart)
+    const admittedRefresh = chatViewSource.slice(flushStart, flushEnd)
+    expect(flushStart).toBeGreaterThanOrEqual(0)
+    expect(flushEnd).toBeGreaterThan(flushStart)
+    expect(admittedRefresh).toContain('if (!optionalSessionRpcAllowed.value) return')
+    expect(admittedRefresh).toContain('if (pendingFeatureToggleRefresh) {')
+    expect(admittedRefresh).toContain('if (postBootstrapMetadataStarted) void loadFeatureToggles()')
   })
 
   it.each([

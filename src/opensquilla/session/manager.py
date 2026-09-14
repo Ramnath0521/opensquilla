@@ -13,11 +13,14 @@ import threading
 import time
 import uuid
 from collections.abc import AsyncIterator, Awaitable, Callable, Sequence
+from copy import deepcopy
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+
+import structlog
 
 from opensquilla.contracts.turn_execution import AssistantMessageReservation
 from opensquilla.engine.steps.inject_time_prefix import stamp as _stamp_time_prefix
@@ -81,10 +84,12 @@ from opensquilla.turn_outcome_projection import (
 )
 
 if TYPE_CHECKING:
+    from opensquilla.execution_workspaces import PreparedExecutionWorkspace
     from opensquilla.provider.types import ProviderRequestCorrelation
 
 _SANDBOX_RUN_CONTEXT_ORIGIN_KEY = "sandbox_run_context"
 _MODEL_ROUTING_MODES = frozenset({"direct", "router", "ensemble"})
+_log = structlog.get_logger(__name__)
 
 
 @dataclass(frozen=True, slots=True)
@@ -373,7 +378,7 @@ def _now_iso() -> str:
 
 @dataclass(frozen=True)
 class PreparedSessionIntent:
-    """Pure session mutation plan consumed by the turn-acceptance transaction."""
+    """Session mutation plan and optional uncommitted filesystem preparation."""
 
     node: SessionNode
     action: str
@@ -381,6 +386,66 @@ class PreparedSessionIntent:
     previous_session_id: str | None = None
     previous_node: SessionNode | None = None
     initial_transcript_entries: tuple[TranscriptEntry, ...] = ()
+    workspace_preparation: PreparedSessionWorkspace | None = None
+
+
+@dataclass
+class PreparedSessionWorkspace:
+    """Settle a private allocation before its requesting coroutine can leave."""
+
+    allocation: PreparedExecutionWorkspace
+    storage: SessionStorage
+    session_key: str
+    session_id: str
+    committed: bool = False
+
+    def mark_committed(self, session_id: str) -> None:
+        # A successful request replay may belong to another candidate's session.
+        if session_id == self.session_id:
+            self.committed = True
+
+    async def close(self) -> None:
+        if self.committed:
+            return
+
+        async def settle() -> None:
+            try:
+                current = await self.storage.get_session(self.session_key)
+            except Exception as exc:
+                _log.warning(
+                    "execution_workspace.commit_outcome_unknown",
+                    session_key=self.session_key, error_type=type(exc).__name__,
+                )
+                return
+            if (
+                current is not None
+                and current.execution_workspace == self.allocation.binding
+            ):
+                self.committed = True
+                return
+            await asyncio.to_thread(self.allocation.rollback)
+
+        await _settle_workspace_operation(settle())
+
+
+async def _settle_workspace_operation[T](operation: Awaitable[T]) -> T:
+    """Keep a worker's result observable, propagating cancellation only when settled."""
+
+    task = asyncio.ensure_future(operation)
+    cancellation: asyncio.CancelledError | None = None
+    while not task.done():
+        try:
+            await asyncio.shield(task)
+        except asyncio.CancelledError as exc:
+            cancellation = cancellation or exc
+        except BaseException:
+            break
+    if cancellation is not None:
+        # Observe worker errors without allowing them to hide the caller's cancel.
+        with contextlib.suppress(BaseException):
+            task.result()
+        raise cancellation
+    return task.result()
 
 
 @contextlib.asynccontextmanager
@@ -498,6 +563,7 @@ def _compaction_entry_payloads(entries: list[TranscriptEntry]) -> list[dict[str,
                 "tool_calls": silent_reply.segments,
                 "tool_call_id": entry.tool_call_id,
                 "reasoning_content": entry.reasoning_content,
+                "assistant_replay": deepcopy(entry.assistant_replay),
                 "turn_usage": entry.turn_usage,
                 "turn_context": entry.turn_context,
             }
@@ -525,6 +591,7 @@ def _transcript_preimage(entries: list[TranscriptEntry]) -> tuple[tuple[Any, ...
             entry.provenance_source_tool,
             entry.schema_version,
             _stable_json(entry.tool_calls),
+            _stable_json(entry.assistant_replay),
             _stable_json(entry.turn_usage),
             _stable_json(entry.turn_context),
         )
@@ -734,6 +801,11 @@ class SessionManager:
         checkpoint_workspace_dir: str | Path | None = None,
         media_root: str | Path | None = None,
         model_routing_mode_provider: Callable[[], str] | None = None,
+        execution_workspace_factory: (
+            Callable[
+                [SessionNode], Awaitable[dict[str, Any] | PreparedExecutionWorkspace | None]
+            ] | None
+        ) = None,
     ) -> None:
         self._storage = storage
         self._memory_sync_notify = memory_sync_notify
@@ -750,6 +822,7 @@ class SessionManager:
         # children; None disables the copy (e.g. in tests that never touch disk).
         self._media_root = Path(media_root).expanduser() if media_root is not None else None
         self._model_routing_mode_provider = model_routing_mode_provider
+        self._execution_workspace_factory = execution_workspace_factory
         # In-process epoch cache so _emit_to_subscribers can
         # read the current epoch without a DB round-trip on every event.
         # Invalidated (updated) whenever increment_epoch commits a new value.
@@ -849,6 +922,46 @@ class SessionManager:
 
     # ── Lifecycle ────────────────────────────────────────────────────────────
 
+    async def _prepare_execution_workspace(
+        self, node: SessionNode,
+    ) -> PreparedSessionWorkspace | None:
+        from opensquilla.execution_workspaces import validate_execution_workspace
+
+        if node.execution_workspace is not None:
+            node.execution_workspace = await asyncio.to_thread(
+                validate_execution_workspace, node.execution_workspace,
+            )
+            return None
+        if self._execution_workspace_factory is None:
+            return None
+        preparation = None
+
+        async def prepare() -> None:
+            nonlocal preparation
+            from opensquilla.execution_workspaces import PreparedExecutionWorkspace
+
+            if node.execution_workspace is None and self._execution_workspace_factory is not None:
+                allocated = await self._execution_workspace_factory(node)
+                if isinstance(allocated, PreparedExecutionWorkspace):
+                    preparation = PreparedSessionWorkspace(
+                        allocated, self._storage, node.session_key, node.session_id,
+                    )
+                    node.execution_workspace = allocated.binding
+                else:
+                    node.execution_workspace = allocated
+            if node.execution_workspace is not None:
+                node.execution_workspace = await asyncio.to_thread(
+                    validate_execution_workspace, node.execution_workspace,
+                )
+
+        try:
+            await _settle_workspace_operation(prepare())
+        except BaseException:
+            if preparation is not None:
+                await preparation.close()
+            raise
+        return preparation
+
     @staticmethod
     def _build_session_node(
         session_key: str,
@@ -909,7 +1022,7 @@ class SessionManager:
         agent_id: str = "main",
         **create_kwargs: Any,
     ) -> PreparedSessionIntent:
-        """Prepare create/reset/continue state without writing durable state."""
+        """Prepare session state; the caller must settle any private workspace."""
 
         session_key = canonicalize_session_key(session_key)
         agent_id = normalize_agent_id(agent_id)
@@ -924,10 +1037,12 @@ class SessionManager:
                 agent_id=agent_id,
                 **create_kwargs,
             )
+            preparation = await self._prepare_execution_workspace(node)
             return PreparedSessionIntent(
                 node=node,
                 action="create",
                 expected_epoch=int(node.epoch or 0),
+                workspace_preparation=preparation,
             )
         if resolved is SessionIntent.RESET_SAME_KEY:
             reset = self._build_reset_node(existing)
@@ -962,7 +1077,19 @@ class SessionManager:
             agent_id=agent_id,
             **self._prepare_new_session_kwargs(kwargs),
         )
-        await self._storage.upsert_session(node)
+        preparation = await self._prepare_execution_workspace(node)
+        if preparation is None:
+            await self._storage.upsert_session(node)
+            return node
+
+        async def persist() -> None:
+            await self._storage.upsert_session(node)
+            preparation.mark_committed(node.session_id)
+
+        try:
+            await _settle_workspace_operation(persist())
+        finally:
+            await preparation.close()
         return node
 
     async def get_or_create(
@@ -1071,7 +1198,9 @@ class SessionManager:
             expected_session_id=expected_session_id,
             expected_session_epoch=expected_session_epoch,
         )
-        return [entry.model_dump(mode="json") for entry in entries]
+        return [
+            entry.model_dump(mode="json", exclude={"assistant_replay"}) for entry in entries
+        ]
 
     async def inject_message(
         self,
@@ -1748,6 +1877,7 @@ class SessionManager:
             display_name=display_name,
             origin=_branch_origin(parent.origin),
             workspace_id=parent.workspace_id,
+            execution_workspace=deepcopy(parent.execution_workspace),
             model_routing_mode=str(parent_routing["mode"]),
             model_routing_revision=0,
         )
@@ -1927,6 +2057,7 @@ class SessionManager:
                         tool_calls=entry.tool_calls,
                         tool_call_id=entry.tool_call_id,
                         reasoning_content=entry.reasoning_content,
+                        assistant_replay=deepcopy(entry.assistant_replay),
                         turn_usage=entry.turn_usage,
                         turn_context=attach_fork_terminal_outcome_projection(
                             entry.turn_context,
@@ -2052,6 +2183,7 @@ class SessionManager:
             forked_from_parent=True,
             origin=_branch_origin(parent.origin),
             workspace_id=parent.workspace_id,
+            execution_workspace=deepcopy(parent.execution_workspace),
             model_routing_mode=str(parent_routing["mode"]),
             model_routing_revision=0,
         )
@@ -2088,6 +2220,7 @@ class SessionManager:
                 tool_calls=entry.tool_calls,
                 tool_call_id=entry.tool_call_id,
                 reasoning_content=entry.reasoning_content,
+                assistant_replay=deepcopy(entry.assistant_replay),
                 turn_usage=entry.turn_usage,
                 turn_context=attach_fork_terminal_outcome_projection(
                     entry.turn_context,
@@ -2233,6 +2366,7 @@ class SessionManager:
         tool_calls: list[dict[str, Any]] | None = None,
         tool_call_id: str | None = None,
         reasoning_content: str | None = None,
+        assistant_replay: dict[str, Any] | None = None,
         turn_usage: dict[str, Any] | None = None,
         turn_context: dict[str, Any] | None = None,
         token_count: int | None = None,
@@ -2275,6 +2409,7 @@ class SessionManager:
             tool_calls=tool_calls,
             tool_call_id=tool_call_id,
             reasoning_content=reasoning_content if role == "assistant" else None,
+            assistant_replay=deepcopy(assistant_replay) if role == "assistant" else None,
             turn_usage=turn_usage if role == "assistant" else None,
             turn_context=dict(turn_context) if turn_context is not None else None,
             token_count=token_count,
@@ -2313,6 +2448,7 @@ class SessionManager:
         tool_calls: list[dict[str, Any]] | None = None,
         tool_call_id: str | None = None,
         reasoning_content: str | None = None,
+        assistant_replay: dict[str, Any] | None = None,
         turn_usage: dict[str, Any] | None = None,
         token_count: int | None = None,
         provenance: dict[str, Any] | None = None,
@@ -2377,6 +2513,7 @@ class SessionManager:
             tool_calls=tool_calls,
             tool_call_id=tool_call_id,
             reasoning_content=reasoning_content,
+            assistant_replay=assistant_replay,
             turn_usage=turn_usage,
             token_count=token_count,
             provenance=provenance,
@@ -3710,6 +3847,8 @@ class SessionManager:
                     content=raw.get("content", ""),
                     tool_calls=raw.get("tool_calls"),
                     tool_call_id=raw.get("tool_call_id"),
+                    reasoning_content=raw.get("reasoning_content"),
+                    assistant_replay=deepcopy(raw.get("assistant_replay")),
                     turn_usage=raw.get("turn_usage"),
                     turn_context=raw.get("turn_context"),
                 )

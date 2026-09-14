@@ -838,7 +838,7 @@ def test_global_context_window_override_prevents_catalog_only_escalation(
     wrapper = _SelectorFallbackProvider(object(), _Selector())
     config = ChatConfig(context_window_tokens_global_override=8_192)
 
-    assert wrapper._can_escalate_local_admission_failure(config) is False
+    assert wrapper._local_admission_fallback_index(config) == 0
     assert seen == [("small-model", 8_192), ("large-model", 8_192)]
 
 
@@ -1659,16 +1659,16 @@ async def test_unknown_primary_capability_defers_to_provider_image_validation() 
 def _fallback_tool_definitions() -> list[ToolDefinition]:
     return [
         ToolDefinition(
-            name="document_apply",
-            description="Apply a document mutation.",
+            name="write_file",
+            description="Write a file.",
             input_schema=ToolInputSchema(
                 properties={"html": {"type": "string"}},
                 required=["html"],
             ),
         ),
         ToolDefinition(
-            name="document_patch",
-            description="Patch a document mutation.",
+            name="apply_patch",
+            description="Apply a file patch.",
             input_schema=ToolInputSchema(
                 properties={"patch": {"type": "string"}},
                 required=["patch"],

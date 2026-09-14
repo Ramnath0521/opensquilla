@@ -6,14 +6,13 @@ import asyncio
 import contextlib
 import inspect
 from collections.abc import Awaitable, Callable
-from dataclasses import asdict
 from typing import TYPE_CHECKING, Any
 
 import structlog
 
 from opensquilla.artifacts import enrich_artifact_event_dict
 from opensquilla.engine.stream_wrappers import is_context_bound_owner, wrap_stream
-from opensquilla.engine.types import AnswerGenerationResetEvent
+from opensquilla.engine.types import AnswerGenerationResetEvent, public_agent_event_payload
 from opensquilla.gateway.config import GatewayConfig, effective_agent_stream_idle_timeout_seconds
 from opensquilla.gateway.project_workspace_runtime import (
     AcceptedRunModeOverride,
@@ -131,6 +130,7 @@ async def run_direct_turn(
     publish: Callable[[str, str, dict[str, Any]], Awaitable[None]],
     normalize_terminal: Callable[[str, dict[str, Any]], dict[str, Any]],
     session_model: Callable[[SessionNode, str], str | None],
+    tui_connection: bool = False,
 ) -> None:
     """Stream one committed turn; acceptance and persistence belong to the caller."""
 
@@ -253,6 +253,7 @@ async def run_direct_turn(
             default_elevated=configured_default_elevated(config),
         )
         pin_sandbox_policy(tool_ctx, config)
+        from opensquilla.telemetry.contracts.common import ClientSurface, ExecutionMode
         raw_stream = runner.run(
             provider_message,
             session_key,
@@ -267,6 +268,8 @@ async def run_direct_turn(
             semantic_message=semantic_message,
             fresh_user_session=fresh_user_session,
             root_turn_id=turn_id,
+            telemetry_surface=ClientSurface.TUI if tui_connection else None,
+            telemetry_execution_mode=ExecutionMode.GATEWAY if tui_connection else None,
             **owner_kwargs(runner.run),
         )
         raw_idle_timeout = effective_agent_stream_idle_timeout_seconds(config)
@@ -287,7 +290,7 @@ async def run_direct_turn(
             if isinstance(event, AnswerGenerationResetEvent):
                 event_dict = serialize_public_event(event)
             else:
-                event_dict = asdict(event)
+                event_dict = public_agent_event_payload(event)
             event_kind = event_dict.pop("kind", event.__class__.__name__)
             if event_kind == "thinking" and not event_dict.get("block_id"):
                 event_dict.pop("block_id", None)

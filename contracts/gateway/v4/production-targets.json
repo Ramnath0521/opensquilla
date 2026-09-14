@@ -3,6 +3,21 @@
   "targets": [
     {
       "kind": "event",
+      "wireName": "transport.flow.dirty",
+      "roles": ["payload"]
+    },
+    {
+      "kind": "method",
+      "wireName": "transport.flow.update",
+      "roles": ["params", "result"]
+    },
+    {
+      "kind": "method",
+      "wireName": "sessions.messages.snapshot.read",
+      "roles": ["params", "result"]
+    },
+    {
+      "kind": "event",
       "wireName": "approval.events",
       "roles": [
         "payload"
@@ -178,41 +193,6 @@
     },
     {
       "kind": "method",
-      "wireName": "artifacts.prompt_annotations.create",
-      "roles": [
-        "result"
-      ]
-    },
-    {
-      "kind": "method",
-      "wireName": "artifacts.prompt_annotations.discard",
-      "roles": [
-        "result"
-      ]
-    },
-    {
-      "kind": "method",
-      "wireName": "artifacts.prompt_annotations.focus",
-      "roles": [
-        "result"
-      ]
-    },
-    {
-      "kind": "method",
-      "wireName": "artifacts.prompt_annotations.list",
-      "roles": [
-        "result"
-      ]
-    },
-    {
-      "kind": "method",
-      "wireName": "artifacts.prompt_annotations.update",
-      "roles": [
-        "result"
-      ]
-    },
-    {
-      "kind": "method",
       "wireName": "artifacts.revisions.list",
       "roles": [
         "result"
@@ -221,13 +201,6 @@
     {
       "kind": "method",
       "wireName": "artifacts.revisions.restore",
-      "roles": [
-        "result"
-      ]
-    },
-    {
-      "kind": "method",
-      "wireName": "artifacts.source.patch",
       "roles": [
         "result"
       ]
@@ -431,27 +404,6 @@
     },
     {
       "kind": "method",
-      "wireName": "documents.editSessions.close",
-      "roles": [
-        "result"
-      ]
-    },
-    {
-      "kind": "method",
-      "wireName": "documents.editSessions.heartbeat",
-      "roles": [
-        "result"
-      ]
-    },
-    {
-      "kind": "method",
-      "wireName": "documents.editSessions.start",
-      "roles": [
-        "result"
-      ]
-    },
-    {
-      "kind": "method",
       "wireName": "documents.import",
       "roles": [
         "result"
@@ -634,6 +586,20 @@
     {
       "kind": "method",
       "wireName": "meta.drafts.list",
+      "roles": [
+        "result"
+      ]
+    },
+    {
+      "kind": "method",
+      "wireName": "meta.inspect",
+      "roles": [
+        "result"
+      ]
+    },
+    {
+      "kind": "method",
+      "wireName": "meta.list",
       "roles": [
         "result"
       ]
@@ -1078,6 +1044,13 @@
     {
       "kind": "method",
       "wireName": "sessions.forkThroughTurn",
+      "roles": [
+        "result"
+      ]
+    },
+    {
+      "kind": "method",
+      "wireName": "sessions.list",
       "roles": [
         "result"
       ]

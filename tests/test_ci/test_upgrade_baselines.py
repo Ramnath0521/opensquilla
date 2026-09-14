@@ -1,9 +1,13 @@
 from __future__ import annotations
 
+import hashlib
+import importlib.util
 import json
 import os
 import shutil
+import sqlite3
 import subprocess
+from contextlib import closing
 from pathlib import Path
 
 import pytest
@@ -12,6 +16,121 @@ import yaml
 ROOT = Path(__file__).resolve().parents[2]
 SCRIPTS = ROOT / ".github" / "scripts"
 DRIVER = ROOT / "desktop/electron/scripts/test-packaged-real-update-flow.mjs"
+
+
+@pytest.fixture
+def complete_v054_profile(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.syspath_prepend(str(SCRIPTS))
+    import upgrade_baseline
+
+    spec = importlib.util.spec_from_file_location(
+        "v054_preservation", SCRIPTS / "verify-release-profile-preservation.py"
+    )
+    assert spec and spec.loader
+    probe = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(probe)
+    home = tmp_path / "legacy-profile"
+    probe.seed_profile(home, "v054", baseline_version="0.5.4")
+    probe.verify_profile(home, "v054")
+    return home, probe, upgrade_baseline
+
+
+def test_complete_v054_fixture_retains_original_files_and_both_v010_ids(complete_v054_profile):
+    home, _, baseline = complete_v054_profile
+    manifest = baseline.manifest()
+    assert len(manifest["migration_files"]) == 41
+    for name, digest in manifest["migration_files"].items():
+        # The baseline hashes Git blobs; Windows checkouts may use CRLF.
+        payload = (ROOT / "migrations" / name).read_text(encoding="utf-8").encode("utf-8")
+        assert hashlib.sha256(payload).hexdigest() == digest
+    ledger = baseline.verify_ledger(home / "state/sessions.db", exact=True)
+    assert {key for key in ledger if key.startswith("V010__")} == {
+        "V010__meta_skill_runs", "V010__transcript_turn_usage",
+    }
+
+
+def test_complete_v054_upgrade_preserves_history_and_is_idempotent(complete_v054_profile):
+    from opensquilla.persistence.migrator import apply_pending
+
+    home, probe, baseline = complete_v054_profile
+    database = home / "state/sessions.db"
+    original = baseline.read_ledger(database)
+    candidate_ids = {path.stem for path in (ROOT / "migrations").glob("V*.py")}
+    assert set(apply_pending(str(database), ROOT / "migrations")) == candidate_ids - original.keys()
+    assert set(baseline.verify_ledger(database)) == candidate_ids
+    probe.verify_profile(home, "v054")
+    assert apply_pending(str(database), ROOT / "migrations") == []
+    probe.verify_profile(home, "v054")
+    with closing(sqlite3.connect(database)) as connection:
+        assert connection.execute("PRAGMA integrity_check").fetchone() == ("ok",)
+
+
+@pytest.mark.parametrize("missing", [
+    "V010__meta_skill_runs.py", "V010__transcript_turn_usage.py", "V040__document_resources.py",
+])
+def test_complete_v054_missing_migration_refuses_without_writes_then_recovers(
+    complete_v054_profile, tmp_path: Path, missing: str,
+):
+    from opensquilla.persistence.migrator import SchemaAheadError, apply_pending
+
+    home, probe, baseline = complete_v054_profile
+    database = home / "state/sessions.db"
+    incomplete = tmp_path / "incomplete"
+    shutil.copytree(ROOT / "migrations", incomplete)
+    (incomplete / missing).unlink()
+    before = database.read_bytes()
+    with pytest.raises(SchemaAheadError, match=Path(missing).stem):
+        apply_pending(str(database), incomplete)
+    assert database.read_bytes() == before
+    baseline.verify_ledger(database, exact=True)
+    probe.verify_profile(home, "v054")
+    apply_pending(str(database), ROOT / "migrations")
+    probe.verify_profile(home, "v054")
+    assert apply_pending(str(database), ROOT / "migrations") == []
+
+
+def test_complete_v054_seed_refuses_overwrite(complete_v054_profile):
+    home, probe, _ = complete_v054_profile
+    before = (home / "state/sessions.db").read_bytes()
+    with pytest.raises(FileExistsError):
+        probe.seed_profile(home, "v054", baseline_version="0.5.4")
+    assert (home / "state/sessions.db").read_bytes() == before
+
+
+def test_complete_v054_seed_rejects_tampered_sql(complete_v054_profile, tmp_path, monkeypatch):
+    _, probe, baseline = complete_v054_profile
+    fixture = tmp_path / "tampered"
+    shutil.copytree(baseline.FIXTURE, fixture)
+    with (fixture / "sessions.sql").open("ab") as stream:
+        stream.write(b"\n-- changed\n")
+    monkeypatch.setattr(baseline, "FIXTURE", fixture)
+    with pytest.raises(ValueError, match="SQL digest mismatch"):
+        probe.seed_profile(tmp_path / "new-profile", "v054", baseline_version="0.5.4")
+
+
+def test_complete_v054_ledger_verification_rejects_missing_old_id(complete_v054_profile):
+    home, _, baseline = complete_v054_profile
+    database = home / "state/sessions.db"
+    with closing(sqlite3.connect(database)) as connection, connection:
+        connection.execute("DELETE FROM _yoyo_migration WHERE migration_id = ?", (
+            "V040__document_resources",
+        ))
+    with pytest.raises(AssertionError, match="V040__document_resources"):
+        baseline.verify_ledger(database)
+
+
+def test_windows_upgrade_gates_complete_old_ledger_before_install_and_after_restart():
+    source = (SCRIPTS / "verify-release-windows-upgrade.ps1").read_text(encoding="utf-8")
+    seed = source.index("python $probe seed --home $migrationProfile")
+    candidate_install = source.index("$installed = Start-Process")
+    native_gate = source.index("python $migrationProbe --gateway $gateway.FullName")
+    uninstall = source.index("$uninstall = Start-Process")
+    assert seed < candidate_install < native_gate < uninstall
+    assert "--baseline-version '0.5.4'" in source[seed:candidate_install]
+    assert "if ($LASTEXITCODE -ne 0) { throw" in source[native_gate:native_gate + 330]
+    for line in source.splitlines():
+        if "python $probe verify --home $profile" in line:
+            assert "--baseline-version $BaselineVersion" in line
 
 
 @pytest.mark.parametrize(
@@ -306,8 +425,41 @@ def rehearsal_driver(tmp_path: Path) -> tuple[str, Path]:
     # manifest is real; no application, release download, or installer is run.
     driver = tmp_path / "driver.mjs"
     shutil.copyfile(DRIVER, driver)
+    # Only exercise driver orchestration here. Native process identities and
+    # inherited handles have independent signed-exit-observer contract tests.
+    observer = tmp_path / "fixtures/packaged-cached-handoff/signed-exit-observer.mjs"
+    observer.parent.mkdir(parents=True)
+    observer.write_text(
+        """
+import assert from 'node:assert/strict'
+export function trackSignedChildClose(child) { assert.equal(child.pid, 12345) }
+export async function captureSignedHandoffProcesses({ app }) {
+  return { child: app.process(), electronPid: 12345 }
+}
+export async function observeSignedHandoff({ child, clickPromise }) {
+  assert.equal(child.pid, 12345)
+  await clickPromise
+  return { syntheticOrchestrationOnly: true }
+}
+export async function releaseExitedHandoffTransport(child, evidence) {
+  assert.equal(child.pid, 12345)
+  assert.equal(evidence.syntheticOrchestrationOnly, true)
+}
+export async function preserveFailedDriverUntilExit({ originalError }) {
+  assert.ok(originalError instanceof Error)
+}
+""",
+        encoding="utf-8",
+    )
+    (tmp_path / "packaged-first-send-cleanup.mjs").write_text(
+        "export async function closeElectronAndObserveExit(app) { await app.close() }\n",
+        encoding="utf-8",
+    )
     (tmp_path / "packaged-smoke-helpers.mjs").write_text(
         """
+import { EventEmitter } from 'node:events'
+import { mkdir, writeFile } from 'node:fs/promises'
+import { join } from 'node:path'
 export function requiredOption(name) {
   const index = process.argv.indexOf(name)
   if (index < 0 || !process.argv[index + 1]) throw new Error(`Missing ${name}`)
@@ -316,12 +468,41 @@ export function requiredOption(name) {
 export async function waitFor(check) {
   if (!await check()) throw new Error('bridge unavailable')
 }
-export async function launchPackagedCandidate({ env }) {
+export async function launchPackagedCandidate({ env, userDataDir, model }) {
   console.log('SYNTHETIC_DESKTOP_LAUNCHED')
+  if (env.OPENSQUILLA_DESKTOP_UPDATE_SOURCE !== process.env.SYNTHETIC_EXPECTED_SOURCE) {
+    throw new Error('requested source was not passed to the packaged client')
+  }
+  const signed = process.env.SYNTHETIC_UPDATE_MODE === 'signed-handoff'
+  if (signed) {
+    if (model !== 'opensquilla-release-session-recovery-smoke') {
+      throw new Error('signed handoff must preserve the seed provider model')
+    }
+    await mkdir(userDataDir, { recursive: true })
+    await writeFile(join(userDataDir, 'desktop-credential.json'), 'synthetic retained credential')
+  }
+  if (signed && (env.OPENSQUILLA_DESKTOP_ENABLE_WIN_INSTALL !== '1'
+      || env.OPENSQUILLA_DESKTOP_ENABLE_WIN_UPDATE !== '0'
+      || env.OPENSQUILLA_DESKTOP_MOCK_UPDATE_VERSION !== '')) {
+    throw new Error('signed handoff must use the production installation path')
+  }
   let checks = 0
   const version = process.env.SYNTHETIC_BASELINE_VERSION
-  return {
-    firstWindow: async () => ({ evaluate: async (callback) => {
+  const app = new EventEmitter()
+  return Object.assign(app, {
+    firstWindow: async () => ({
+      locator: (selector) => ({
+        waitFor: async () => {},
+        isEnabled: async () => true,
+        click: async () => {
+          console.log(`SYNTHETIC_UI_CLICK:${selector}`)
+          if (selector.includes('desktop-update-relaunch')) {
+            console.log('SYNTHETIC_RELAUNCH_REQUESTED')
+            queueMicrotask(() => app.emit('close'))
+          }
+        },
+      }),
+      evaluate: async (callback) => {
       const body = callback.toString()
       if (body.includes('typeof window')) return true
       if (body.includes('getUpdateState')) return { currentVersion: version }
@@ -335,15 +516,31 @@ export async function launchPackagedCandidate({ env }) {
         const manifest = await response.json()
         return {
           status: 'available', latestVersion: manifest.version,
-          source: 'oss', installMode: 'native',
+          source: 'oss', installMode: signed ? 'manual' : 'native',
+          fallbackUsed: process.env.SYNTHETIC_FALLBACK_FAULT !== 'discovery',
         }
       }
-      if (body.includes('downloadUpdate')) throw new Error(`DOWNLOAD_REACHED:${version}`)
+      if (body.includes('downloadUpdate')) {
+        if (process.env.SYNTHETIC_COMPLETE_SIGNED !== '1') {
+          throw new Error(`DOWNLOAD_REACHED:${version}`)
+        }
+        return {
+          status: 'downloaded', latestVersion: process.env.SYNTHETIC_CANDIDATE_VERSION,
+          source: 'oss', installMode: 'manual', progress: 100,
+          fallbackUsed: process.env.SYNTHETIC_FALLBACK_FAULT !== 'download',
+          canInstall: process.env.SYNTHETIC_CAN_INSTALL === '1',
+        }
+      }
+      if (body.includes('relaunchToUpdate')) {
+        console.log('SYNTHETIC_RELAUNCH_REQUESTED')
+        queueMicrotask(() => app.emit('close'))
+        return true
+      }
       throw new Error(`unexpected desktop call: ${body}`)
     } }),
-    process: () => ({ killed: false }),
+    process: () => ({ killed: false, pid: 12345 }),
     close: async () => {},
-  }
+  })
 }
 """,
         encoding="utf-8",
@@ -357,12 +554,26 @@ def _run_rehearsal_driver(
     baseline: str | None,
     installed: str,
     candidate: str = "0.5.5",
+    mode: str = "native",
+    source_sha: str | None = "a" * 40,
+    expected_sha: str | None = hashlib.sha256(b"candidate artifact").hexdigest(),
+    cached_bytes: bytes = b"candidate artifact",
+    complete_signed: bool = False,
+    can_install: bool = True,
+    download_source_mode: str | None = None,
+    fallback_fault: str = '',
 ) -> subprocess.CompletedProcess[str]:
     node, driver = rehearsal_driver
     manifest = driver.parent / "channel.json"
     manifest.write_text(
         json.dumps(
-            {"schemaVersion": 1, "version": candidate, "tag": f"v{candidate}", "prerelease": False}
+            {
+                "schemaVersion": 1,
+                "version": candidate,
+                "tag": f"v{candidate}",
+                "prerelease": False,
+                "platforms": {"win32-x64": {"installer": f"OpenSquilla-{candidate}-win-x64.exe"}},
+            }
         ),
         encoding="utf-8",
     )
@@ -378,13 +589,35 @@ def _run_rehearsal_driver(
         "--expected-version",
         candidate,
         "--mode",
-        "native",
+        mode,
     ]
     if baseline is not None:
         arguments.extend(["--baseline-version", baseline])
+    if download_source_mode is not None:
+        arguments.extend(["--download-source-mode", download_source_mode])
+    if mode == "signed-handoff":
+        arguments.extend(["--ready-output", str(driver.parent / "handoff.json")])
+        if source_sha is not None:
+            arguments.extend(["--source-sha", source_sha])
+        if expected_sha is not None:
+            arguments.extend(["--expected-sha256", expected_sha])
+        cache = driver.parent / "user-data" / "update-downloads"
+        cache.mkdir(parents=True, exist_ok=True)
+        (cache / f"OpenSquilla-{candidate}-win-x64.exe").write_bytes(cached_bytes)
     return subprocess.run(
         arguments,
-        env={**os.environ, "SYNTHETIC_BASELINE_VERSION": installed},
+        env={
+            **os.environ,
+            "SYNTHETIC_BASELINE_VERSION": installed,
+            "SYNTHETIC_CANDIDATE_VERSION": candidate,
+            "SYNTHETIC_UPDATE_MODE": mode,
+            "SYNTHETIC_COMPLETE_SIGNED": "1" if complete_signed else "0",
+            "SYNTHETIC_CAN_INSTALL": "1" if can_install else "0",
+            "SYNTHETIC_EXPECTED_SOURCE": (
+                "github" if download_source_mode == "github-to-oss" else "oss"
+            ),
+            "SYNTHETIC_FALLBACK_FAULT": fallback_fault,
+        },
         capture_output=True,
         text=True,
         check=False,
@@ -428,6 +661,130 @@ def test_rehearsal_driver_rejects_invalid_versions_before_launch(
     )
     assert result.returncode != 0
     assert message in result.stderr
+    assert "SYNTHETIC_DESKTOP_LAUNCHED" not in result.stdout
+
+
+@pytest.mark.parametrize("baseline", [None, "0.5.3", "0.5.4", "0.5.5rc1"])
+def test_signed_handoff_rejects_missing_or_legacy_baseline_before_launch(
+    rehearsal_driver: tuple[str, Path], baseline: str | None
+) -> None:
+    result = _run_rehearsal_driver(
+        rehearsal_driver,
+        baseline=baseline,
+        installed=baseline or "0.5.3",
+        candidate="0.5.6",
+        mode="signed-handoff",
+    )
+    assert result.returncode != 0
+    assert "signed-handoff requires" in result.stderr
+    assert "SYNTHETIC_DESKTOP_LAUNCHED" not in result.stdout
+
+
+@pytest.mark.parametrize("missing", ["source_sha", "expected_sha"])
+def test_signed_handoff_requires_pinned_artifact_before_launch(
+    rehearsal_driver: tuple[str, Path], missing: str
+) -> None:
+    result = _run_rehearsal_driver(
+        rehearsal_driver,
+        baseline="0.5.5",
+        installed="0.5.5",
+        candidate="0.5.6",
+        mode="signed-handoff",
+        **{missing: None},
+    )
+    assert result.returncode != 0
+    assert "signed-handoff requires --ready-output" in result.stderr
+    assert "SYNTHETIC_DESKTOP_LAUNCHED" not in result.stdout
+
+
+@pytest.mark.parametrize("fault", ["capability-denied", "cache-replaced"])
+def test_signed_handoff_rejects_unverified_or_changed_candidate(
+    rehearsal_driver: tuple[str, Path], fault: str
+) -> None:
+    result = _run_rehearsal_driver(
+        rehearsal_driver,
+        baseline="0.5.5",
+        installed="0.5.5",
+        candidate="0.5.6",
+        mode="signed-handoff",
+        complete_signed=True,
+        can_install=fault != "capability-denied",
+        cached_bytes=b"tampered" if fault == "cache-replaced" else b"candidate artifact",
+    )
+    assert result.returncode != 0
+    assert "SYNTHETIC_RELAUNCH_REQUESTED" not in result.stdout
+    assert "AssertionError" in result.stderr
+    assert "ERR_MODULE_NOT_FOUND" not in result.stderr
+    assert not (rehearsal_driver[1].parent / "handoff.json").exists()
+
+
+def test_signed_handoff_records_only_handoff_until_outer_audit_verifies_install(
+    rehearsal_driver: tuple[str, Path],
+) -> None:
+    result = _run_rehearsal_driver(
+        rehearsal_driver,
+        baseline="0.5.5",
+        installed="0.5.5",
+        candidate="0.5.6",
+        mode="signed-handoff",
+        complete_signed=True,
+    )
+    assert result.returncode == 0, result.stderr
+    output = json.loads((rehearsal_driver[1].parent / "handoff.json").read_text(encoding="utf-8"))
+    assert output["ok"] is False
+    assert output["stage"] == "installer-handoff"
+    assert output["handoffObserved"] is True
+    assert output["requiresPostInstallVerification"] is True
+    assert output["installMode"] == "manual"
+    assert output["mode"] == "signed-handoff"
+    assert output["canInstall"] is True
+    assert output["fromVersion"] == "0.5.5"
+    assert output["toVersion"] == "0.5.6"
+    assert output["sha256"] == hashlib.sha256(b"candidate artifact").hexdigest()
+    assert (
+        output["credentialSha256"] == hashlib.sha256(b"synthetic retained credential").hexdigest()
+    )
+    assert output["sourceSha"] == "a" * 40
+    assert 'SYNTHETIC_UI_CLICK:[data-testid="desktop-update-indicator"]' in result.stdout
+    assert 'SYNTHETIC_UI_CLICK:[data-testid="desktop-update-relaunch"]' in result.stdout
+
+
+@pytest.mark.parametrize("fault", ["", "discovery", "download"])
+def test_signed_download_fallback_requires_both_stage_observations(
+    rehearsal_driver: tuple[str, Path], fault: str
+) -> None:
+    result = _run_rehearsal_driver(
+        rehearsal_driver, baseline="0.5.5", installed="0.5.5", candidate="0.5.6",
+        mode="signed-handoff", complete_signed=True,
+        download_source_mode="github-to-oss", fallback_fault=fault,
+    )
+    if fault:
+        assert result.returncode != 0
+        assert "SYNTHETIC_RELAUNCH_REQUESTED" not in result.stdout
+        assert not (rehearsal_driver[1].parent / "handoff.json").exists()
+    else:
+        assert result.returncode == 0, result.stderr
+        output = json.loads((rehearsal_driver[1].parent / "handoff.json").read_text())
+        assert output["sourceFallbackVerified"] is True
+        assert output["source"] == "oss"
+        assert output["networkIsolationVerified"] is False
+        assert output["remotePublicationVerified"] is False
+        assert output["discoveryScope"] == "controlled loopback channel; production asset sources"
+
+
+@pytest.mark.parametrize("mode,source", [
+    ("native", "github-to-oss"), ("manual", "oss"),
+    ("signed-cached-handoff", "github-to-oss"), ("signed-handoff", "invalid"),
+])
+def test_download_source_override_rejects_other_modes_before_launch(
+    rehearsal_driver: tuple[str, Path], mode: str, source: str
+) -> None:
+    result = _run_rehearsal_driver(
+        rehearsal_driver, baseline="0.5.5", installed="0.5.5",
+        candidate="0.5.6", mode=mode, download_source_mode=source,
+    )
+    assert result.returncode != 0
+    assert "--download-source-mode" in result.stderr
     assert "SYNTHETIC_DESKTOP_LAUNCHED" not in result.stdout
 
 
