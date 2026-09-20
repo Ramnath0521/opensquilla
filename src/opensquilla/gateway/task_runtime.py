@@ -1473,6 +1473,10 @@ class TaskRuntime:
         self._reserved_overflow_victims: set[str] = set()
         self._last_envelope_by_session: dict[str, RouteEnvelope] = {}
         self._last_envelope_task_id_by_session: dict[str, str] = {}
+        # Process completion deduplication is intentionally in-memory. Notices
+        # are owner-routed control input; durable process recovery is out of
+        # scope for the managed execution API.
+        self._process_completion_seen: dict[tuple[str, str], None] = {}
         self._state_lock = asyncio.Lock()
         # Admission is per session so durable RPC ingress crosses reserve,
         # commit, and activation in order. This prevents resets from overtaking
@@ -3785,6 +3789,87 @@ class TaskRuntime:
             update_envelope_cache=False,
         )
 
+    async def _deliver_process_completion(
+        self, task: _RuntimeTask, payload: dict[str, Any],
+    ) -> None:
+        """Accept one notice through the same generation fence as ordinary ingress."""
+        from opensquilla.tools.builtin.shell import is_background_process_completion_consumed
+
+        envelope = task.envelope
+        execution_id = str(payload["execution_id"])
+        key = (envelope.session_key, execution_id)
+
+        def consumed() -> bool:
+            return payload.get("completion_consumed") is True or (
+                is_background_process_completion_consumed(
+                    execution_id, session_key=envelope.session_key, task_id=task.task_id,
+                )
+            )
+
+        def accepted() -> None:
+            self._process_completion_seen[key] = None
+            if len(self._process_completion_seen) > 4096:
+                self._process_completion_seen.pop(next(iter(self._process_completion_seen)))
+
+        async with self.collect_admission(envelope.session_key):
+            if self._closing or task.cancel_requested or key in self._process_completion_seen:
+                return
+            if consumed():
+                return
+            if not await self._recovered_route_owner_is_current(envelope):
+                return
+            status = str(payload.get("status") or "done")
+            notice = (
+                "[Managed process completed]\n"
+                f"execution_id={execution_id} status={status} "
+                f"returncode={payload.get('returncode')}"
+            )
+            tail = str(payload.get("output_tail") or payload.get("output") or "")[-2000:]
+            if tail:
+                notice += f"\noutput_tail:\n{tail}"
+            async with self._state_lock:
+                if self._closing or task.cancel_requested or consumed():
+                    return
+                running = self._running_by_session.get(envelope.session_key)
+                if running is not None and (
+                    running.envelope.session_id != envelope.session_id
+                    or running.envelope.session_epoch != envelope.session_epoch
+                ):
+                    return
+                if (
+                    running is not None
+                    and running.status is AgentTaskStatus.RUNNING
+                    and not running.terminal_closing
+                    and not running.cancel_requested
+                ):
+                    # No await between the terminal guard and append: terminal
+                    # settlement claims this same lock before draining steers.
+                    running.pending_input_provider.append(_SteeredInput(text=notice))
+                    accepted()
+                    return
+            # Terminalization drops the envelope cache. The originating route
+            # remains valid while its durable session generation is unchanged,
+            # including after an intervening user turn in the same session.
+            followup = replace(
+                _reusable_route_envelope(envelope),
+                input_provenance={
+                    "kind": "process_completed",
+                    "execution_id": execution_id,
+                },
+            )
+            await self.cancel_auxiliary(envelope.session_key)
+            if consumed():
+                return
+            await self._reserve_persist_and_activate(
+                followup,
+                notice,
+                mode="followup",
+                run_kind="runtime_send",
+                accepted_run_mode_override=task.accepted_run_mode_override,
+                update_envelope_cache=False,
+            )
+            accepted()
+
     async def wait(self, task_id: str, timeout: float | None = None) -> AgentTaskRecord:
         runtime_task = self._tasks.get(task_id)
         if runtime_task is None:
@@ -4858,12 +4943,52 @@ class TaskRuntime:
                 log.warning("task_runtime.progress_projection_failed", task_id=task.task_id)
             return cast(dict[str, Any], progress)
 
+        async def emit_process_event(event: dict[str, Any]) -> None:
+            payload = dict(event)
+            execution_id = str(payload.get("execution_id") or payload.get("session_id") or "")
+            # The shell's legacy session_id aliases execution_id. Gateway
+            # projections must carry the actual admitted session generation.
+            payload.update(
+                session_key=task.envelope.session_key,
+                session_id=task.envelope.session_id,
+                session_epoch=task.envelope.session_epoch,
+                task_id=task.task_id,
+                execution_id=execution_id,
+            )
+            try:
+                await self._emit(
+                    task.envelope.session_key,
+                    "session.event.process_completed",
+                    payload,
+                )
+            except Exception:
+                log.warning("task_runtime.process_completion_projection_failed", exc_info=True)
+            if payload.get("notify_on_exit") is not True or not execution_id:
+                return
+            # The shell finalizer calls once. Retry transient admission failures
+            # here, without keeping a separate producer or durable queue alive.
+            for attempt in range(3):
+                try:
+                    await self._deliver_process_completion(task, payload)
+                    return
+                except Exception:
+                    log.warning(
+                        "task_runtime.process_completion_wake_failed",
+                        session_key=task.envelope.session_key,
+                        execution_id=execution_id,
+                        attempt=attempt + 1,
+                        exc_info=True,
+                    )
+                    if attempt < 2:
+                        await asyncio.sleep(0.05 * (2 ** attempt))
+
         runtime_services = {
             **task.envelope.runtime_services,
             "update_progress": update_progress,
             "plan_storage": self._storage,
             "goal_service": self._goal_service,
             "plan_event_emitter": self._emit,
+            "process_event_emitter": emit_process_event,
             "suspend_compute_slot": lambda: self._suspend_compute_slot(task),
         }
         # WebChat and the gateway CLI resolve request IDs outside the session

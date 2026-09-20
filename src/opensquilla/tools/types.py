@@ -323,7 +323,6 @@ class ToolContext:
     persist_attachment_working_files: Callable[[], Awaitable[None]] | None = field(
         default=None, repr=False,
     )
-
     # Explicit config additions are tracked separately from an unrestricted
     # allowlist so opting into one default-deny tool does not restrict the
     # normal catalog or authorize every other default-deny tool. Append to
@@ -335,6 +334,14 @@ class ToolContext:
     # never grant them. They keep tool projection and dispatch on one frozen
     # per-turn authority snapshot.
     sandboxed_workspace_authoring: Any | None = field(default=None, repr=False)
+
+    # Async completion sink owned by the current TaskRuntime. Shell process
+    # sessions use it to publish one structured completion event without
+    # introducing a second event bus. Keep it after every historical field so
+    # positional ToolContext callers retain their existing argument order.
+    process_event_emitter: Callable[[dict[str, Any]], Awaitable[None]] | None = field(
+        default=None, repr=False
+    )
 
 
 def is_goal_owned_main_default_turn(ctx: ToolContext | None) -> bool:
@@ -441,6 +448,7 @@ CRON_AGENT_DENY: frozenset[str] = frozenset(
         "subagents",
         "message",
         "exec_command",
+        "process",
         "background_process",
         "write_file",
         "edit_file",
