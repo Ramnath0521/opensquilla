@@ -1470,7 +1470,6 @@ function promptAnnotationBlockedMessage(): string {
   if (!promptAnnotationsEnabled.value) return ''
   const reason = artifactPromptAnnotationsStore.sendBlockedReason(sessionKey.value)
   if (reason === 'editing') return t('chat.promptAnnotations.editingBlocked')
-  if (reason === 'empty') return t('chat.promptAnnotations.emptyBlocked')
   if (reason === 'too-long') return t('chat.promptAnnotations.tooLongBlocked')
   return ''
 }
@@ -3709,7 +3708,6 @@ const chatSend = useChatSend({
     return prepared && (prepareOptions?.isCurrent?.() ?? true)
   },
   promptAnnotationSnapshots: ids => artifactPromptAnnotationsStore.snapshotsForIds(ids),
-  annotationAttachments: ids => artifactPromptAnnotationsStore.attachmentsForIds(ids),
   acknowledgePromptAnnotations: (snapshots, acceptedSessionKey, requestSessionKey) => {
     let removedIds: string[]
     try {
@@ -4813,7 +4811,7 @@ const composerPlaceholder = computed(() => {
 const hasSendContent = computed(() => {
   return inputText.value.trim().length > 0
     || pendingAttachments.value.some(isSendableAttachment)
-    || activePromptAnnotations.value.length > 0
+    || sendableAnnotationDraftIds.value.length > 0
 })
 const composerHasSendContent = computed(() =>
   replanActive.value ? inputText.value.trim().length > 0 : hasSendContent.value,
@@ -4920,10 +4918,7 @@ const queuedImageSendBlockedMessage = computed(() => {
 })
 
 const modelImageSendBlockedMessage = computed(() => {
-  return hasModelInputImageAttachment([
-    ...pendingAttachments.value,
-    ...artifactPromptAnnotationsStore.attachmentsForIds(sendableAnnotationDraftIds.value),
-  ])
+  return hasModelInputImageAttachment(pendingAttachments.value)
     ? queuedImageSendBlockedMessage.value
     : ''
 })
