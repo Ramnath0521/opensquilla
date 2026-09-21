@@ -295,7 +295,19 @@
                 @set-run-mode="emit('setRunMode', $event)"
               />
             </div>
-            <div ref="moreActionsAnchorEl" class="chat-settings-anchor">
+            <ChatComposerGoalMode
+              :active="goalDraftArmed"
+              @disarm="emit('disarmGoal')"
+            />
+            <ChatComposerPlanMode
+              :available="planModeAvailable === true"
+              :mode="collaborationMode || 'default'"
+              :busy="planModeBusy === true"
+              :disabled="planModeDisabled === true"
+              :applies-next-turn="planModeAppliesNextTurn === true"
+              @set-mode="emit('setCollaborationMode', $event)"
+            />
+            <div ref="moreActionsAnchorEl" class="chat-settings-anchor chat-more-actions-anchor">
               <button
                 class="btn btn--icon btn--ghost chat-more-actions-btn"
                 :class="{ 'is-active': moreActionsOpen }"
@@ -365,23 +377,11 @@
               </div>
             </div>
           </div>
-          <ChatComposerGoalMode
-            :active="goalDraftArmed"
-            @disarm="emit('disarmGoal')"
-          />
-          <ChatComposerPlanMode
-            :available="planModeAvailable === true"
-            :mode="collaborationMode || 'default'"
-            :busy="planModeBusy === true"
-            :disabled="planModeDisabled === true"
-            :applies-next-turn="planModeAppliesNextTurn === true"
-            @set-mode="emit('setCollaborationMode', $event)"
-          />
           <div class="chat-input-actions chat-input-actions--right">
             <div
               v-if="modelRoutingVisible"
               ref="modelRoutingAnchorEl"
-              class="chat-settings-anchor"
+              class="chat-settings-anchor chat-model-routing-anchor"
             >
               <button
                 class="chat-model-routing-btn"
@@ -460,7 +460,9 @@
                 <button
                   v-if="canStop && !showSkillQueueSend"
                   key="stop"
-                  class="btn btn--icon btn--danger chat-send-btn"
+                  class="btn btn--icon btn--danger chat-send-btn chat-stop-btn"
+                  :disabled="stopPending"
+                  :aria-busy="stopPending || undefined"
                   :title="stopTargetsPlanRun
                     ? t('chat.planRun.stopExecutionEsc')
                     : t('chat.stopResponseEsc')"
@@ -560,6 +562,7 @@ const props = withDefaults(defineProps<{
   isStreaming: boolean
   canStop: boolean
   stopTargetsPlanRun?: boolean
+  stopPending?: boolean
   isNewLanding: boolean
   placeholder: string
   sendButtonTitle: string
@@ -1525,6 +1528,7 @@ button.attachment-chip__primary:focus-visible {
 }
 
 .chat-input-panel {
+  container: chat-composer / inline-size;
   display: flex;
   flex-direction: column;
   min-height: 128px;
@@ -1811,15 +1815,44 @@ button.attachment-chip__primary:focus-visible {
 }
 
 .chat-input-actions--left {
-  flex-shrink: 0;
+  flex: 0 1 auto;
   flex-wrap: wrap;
   max-width: 100%;
 }
 
 .chat-input-actions--right {
-  flex-shrink: 0;
+  flex: 0 1 auto;
+  justify-content: flex-end;
   margin-left: auto;
   max-width: 100%;
+}
+
+.chat-model-routing-anchor {
+  flex: 0 1 auto;
+  min-width: 0;
+  max-width: 14rem;
+}
+
+@container chat-composer (max-width: 38rem) {
+  .chat-input-footer {
+    flex-direction: column;
+    align-items: stretch;
+    gap: 0.375rem;
+  }
+
+  .chat-input-actions--right {
+    align-self: flex-end;
+    margin-left: 0;
+  }
+
+  .chat-more-actions-anchor {
+    margin-left: auto;
+  }
+
+  .chat-more-actions-menu {
+    right: 0;
+    left: auto;
+  }
 }
 
 .chat-input-wrap {
@@ -1894,13 +1927,14 @@ button.attachment-chip__primary:focus-visible {
   justify-content: center;
   gap: 6px;
   height: 30px;
-  max-width: min(230px, 40vw);
+  min-width: 0;
+  max-width: 100%;
   padding: 0 9px;
   width: auto;
   position: relative;
-  border: 1px solid var(--border);
+  border: 1px solid transparent;
   border-radius: var(--radius-control);
-  background: var(--bg-surface);
+  background: transparent;
   color: var(--text-muted);
   font-family: inherit;
   font-weight: 500;
@@ -1917,10 +1951,13 @@ button.attachment-chip__primary:focus-visible {
 }
 
 .chat-model-routing-btn__label {
+  flex: 0 1 auto;
+  min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
   font-size: var(--fs-xs);
+  text-align: left;
 }
 
 .chat-model-routing-btn__dot {
@@ -1941,9 +1978,6 @@ button.attachment-chip__primary:focus-visible {
 
 .chat-model-routing-btn__default {
   flex-shrink: 0;
-  padding: 1px 4px;
-  border: 1px solid var(--border);
-  border-radius: var(--radius-control);
   color: var(--text-dim);
   font-size: var(--fs-xs);
   line-height: 1.2;
@@ -1967,8 +2001,8 @@ button.attachment-chip__primary:focus-visible {
 
 .chat-model-routing-btn:hover,
 .chat-model-routing-btn.is-open {
-  border-color: color-mix(in srgb, var(--accent) 35%, var(--border));
-  background: color-mix(in srgb, var(--accent) 7%, var(--bg-surface));
+  border-color: var(--border);
+  background: var(--bg-hover);
   color: var(--text);
 }
 
@@ -2081,6 +2115,11 @@ button.attachment-chip__primary:focus-visible {
   background: var(--bg-hover);
   color: var(--text-dim);
   border-color: var(--bg-hover);
+}
+
+.chat-stop-btn {
+  min-width: 44px;
+  min-height: 44px;
 }
 
 .chat-send-control {

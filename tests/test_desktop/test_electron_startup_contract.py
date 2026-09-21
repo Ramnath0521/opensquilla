@@ -1570,7 +1570,9 @@ def test_desktop_tokenrhythm_single_page_onboarding_defaults_to_router() -> None
 
     assert "routerSupported: true" in tokenrhythm_catalog
     assert "ensembleSelectionMode: 'static_tokenrhythm_b5'" in tokenrhythm_catalog
-    assert "model: 'deepseek-v4-pro-0813'" in tokenrhythm_catalog
+    assert "model: ROUTER_PROFILES.tokenrhythm.c1.model" in tokenrhythm_catalog
+    openrouter_catalog = _section(main_ts, "id: 'openrouter'", "id: 'openai'")
+    assert "model: ROUTER_PROFILES.openrouter.c1.model" in openrouter_catalog
     assert "desktopRouterConfigTomlLines(credential, existingRaw, routerWriteIntent)" in main_ts
     assert "`preset_binding = ${tomlValue(binding)}`" in router_config
     assert "return selected.routerSupported ? 'squilla_router' : 'direct';" in onboarding_html
@@ -1589,15 +1591,15 @@ def test_desktop_tokenrhythm_single_page_onboarding_defaults_to_router() -> None
     assert "DESKTOP_ENSEMBLE_PROFILES" not in main_ts
 
     expected_models = (
-        "deepseek-v4-flash-0731",
+        "qwen3.7-flash",
+        "deepseek-flash",
         "deepseek-v4-pro-0813",
-        "kimi-k2.7-code",
-        "glm-5.2",
+        "glm-5.3",
         "kimi-k2.6",
     )
     for model in expected_models:
         assert model in tokenrhythm_profile
-    assert "ensembleEnabled: true" in tokenrhythm_profile
+    assert "ensembleEnabled: false" in tokenrhythm_profile
     assert "thinkingLevel" not in tokenrhythm_profile
     assert "ensemble_enabled = ${tomlValue(ensembleEnabled)}" in router_config
 

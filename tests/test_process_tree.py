@@ -326,6 +326,114 @@ async def test_posix_anchor_owns_signalling_and_closes_with_its_lifecycle(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("exit_during_drain", [False, True])
+async def test_posix_natural_completion_racing_stop_preserves_empty_confirmation(
+    exit_during_drain: bool,
+) -> None:
+    stream = asyncio.StreamReader()
+    anchor_process = SimpleNamespace(returncode=None)
+    anchor = process_tree._PosixGroupAnchor(process=anchor_process, pgid=4242)
+    owner = process_tree.ProcessTreeOwner(
+        process=SimpleNamespace(returncode=None), pid=4242, pgid=4242, posix_anchor=anchor,
+    )
+    anchor.bind(owner)
+
+    class Input:
+        closed = False
+
+        def is_closing(self) -> bool:
+            return self.closed
+
+        def write(self, command: bytes) -> None:
+            if command == process_tree._POSIX_ANCHOR_TERMINATE:
+                # The group became empty before the stop command arrived.
+                # Its authoritative EMPTY report replaces a signal ACK.
+                owner.process.returncode = 7
+                stream.feed_data(process_tree._POSIX_ANCHOR_EMPTY)
+
+        async def drain(self) -> None:
+            if exit_during_drain:
+                anchor_process.returncode = 0
+                raise BrokenPipeError
+
+        def close(self) -> None:
+            self.closed = True
+
+    async def wait() -> int:
+        anchor_process.returncode = 0
+        return 0
+
+    anchor_process.stdin = Input()
+    anchor_process.wait = wait
+    anchor._monitor_task = asyncio.create_task(anchor._watch_empty(stream))
+    try:
+        assert await asyncio.wait_for(
+            owner.terminate(graceful_timeout=0.1, kill_timeout=0.1), timeout=0.5,
+        )
+        assert anchor.empty is True
+        assert anchor.cleanup_incomplete is False
+        assert owner.is_active() is False
+        assert await owner.terminate(graceful_timeout=0.0, kill_timeout=0.0)
+    finally:
+        anchor._monitor_task.cancel()
+        await asyncio.gather(anchor._monitor_task, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_posix_stop_after_leader_exit_signals_before_settling(monkeypatch) -> None:
+    commands: list[bytes] = []
+    stream = asyncio.StreamReader()
+    anchor_process = SimpleNamespace(returncode=None)
+    anchor = process_tree._PosixGroupAnchor(process=anchor_process, pgid=4242)
+    owner = process_tree.ProcessTreeOwner(
+        process=SimpleNamespace(returncode=7), pid=4242, pgid=4242, posix_anchor=anchor,
+    )
+    anchor.bind(owner)
+
+    class Input:
+        def is_closing(self) -> bool:
+            return False
+
+        def write(self, command: bytes) -> None:
+            commands.append(command)
+            if command == process_tree._POSIX_ANCHOR_TERMINATE:
+                stream.feed_data(process_tree._POSIX_ANCHOR_CAPTURED)
+                stream.feed_data(process_tree._POSIX_ANCHOR_EMPTY)
+
+        async def drain(self) -> None:
+            return None
+
+        def close(self) -> None:
+            pass
+
+    async def wait() -> int:
+        anchor_process.returncode = 0
+        return 0
+
+    original_settle = anchor.settle
+
+    async def settle_after_signal(timeout: float) -> None:
+        # The leader may exit while descendants remain. Stop must signal them
+        # before spending any of its grace budget waiting for the anchor.
+        assert process_tree._POSIX_ANCHOR_TERMINATE in commands
+        await original_settle(timeout)
+
+    monkeypatch.setattr(anchor, "settle", settle_after_signal)
+    anchor_process.stdin = Input()
+    anchor_process.wait = wait
+    anchor._monitor_task = asyncio.create_task(anchor._watch_empty(stream))
+    try:
+        assert await owner.terminate(graceful_timeout=0.1, kill_timeout=0.1)
+        assert commands == [
+            process_tree._POSIX_ANCHOR_TERMINATE, process_tree._POSIX_ANCHOR_RELEASE,
+        ]
+        assert owner.is_active() is False
+    finally:
+        anchor._monitor_task.cancel()
+        await asyncio.gather(anchor._monitor_task, return_exceptions=True)
+
+
+@pytest.mark.asyncio
 async def test_posix_incomplete_cleanup_remains_failed_after_anchor_exit() -> None:
     anchor = process_tree._PosixGroupAnchor(
         process=SimpleNamespace(returncode=0),
@@ -603,6 +711,23 @@ def test_posix_captured_pid_identity_change_is_not_signalled(
     process_tree._signal_captured_posix_processes((captured,), signal.SIGTERM)
 
     assert signalled == []
+
+
+@pytest.mark.parametrize("members", [(100,), (100, 101), None])
+def test_posix_no_root_capture_requires_independent_empty_group_confirmation(
+    monkeypatch: pytest.MonkeyPatch, members: tuple[int, ...] | None,
+) -> None:
+    uid = 501
+    anchor = process_tree._PosixProcessInfo(100, 1, 100, uid, "anchor")
+    monkeypatch.setattr(process_tree.sys, "platform", "linux")
+    monkeypatch.setattr(process_tree.os, "geteuid", lambda: uid, raising=False)
+    monkeypatch.setattr(process_tree, "_posix_process_snapshot", lambda: {100: anchor})
+    monkeypatch.setattr(process_tree, "_posix_group_members", lambda _pgid: members)
+
+    capture = process_tree._capture_posix_group_descendants(100, 100)
+
+    assert capture.processes == ()
+    assert capture.complete is (members == (100,))
 
 
 def test_linux_descendant_capture_does_not_fall_back_to_numeric_pid(

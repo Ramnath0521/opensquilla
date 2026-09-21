@@ -17,6 +17,7 @@ const confirmChoiceAction = vi.fn()
 vi.mock('@/composables/setup/useSetupCatalog', () => ({
   SETTINGS_SECTIONS: [
     { id: 'general', label: 'General', icon: 'settings', client: false, group: 'preferences' },
+    { id: 'provider', label: 'Model Service', icon: 'settings', client: false, group: 'ai' },
     { id: 'capabilities', label: 'Capabilities', icon: 'skills', client: false, group: 'ai' },
   ],
   useSetupCatalog: () => catalogApi,
@@ -179,6 +180,37 @@ afterEach(() => {
 })
 
 describe('SettingsDialog save-all pending state', () => {
+  it('shows the provider warning as a small dot only after status is loaded', async () => {
+    mockCatalog()
+    catalogApi.sectionDirty = () => false
+    catalogApi.sectionStatus = () => ({ label: 'Needs action', tone: 'is-warn' })
+    catalogApi.loaded.value = false
+    const el = await mountDialog()
+    const provider = el.querySelector('#settings-rail-provider')!
+    expect(provider.querySelector('.settings-rail__dot')).toBeNull()
+    expect(provider.querySelector('.settings-rail__warn')).toBeNull()
+
+    catalogApi.loaded.value = true
+    await nextTick()
+    expect(provider.querySelector('.settings-rail__dot.is-danger')).not.toBeNull()
+    expect(provider.getAttribute('aria-label')).toContain('Needs action')
+    expect(provider.querySelector('.settings-rail__warn')).toBeNull()
+  })
+
+  it('omits status dots from optional sections and configured providers', async () => {
+    mockCatalog()
+    catalogApi.sectionDirty = () => false
+    catalogApi.sectionStatus = (id: string) => id === 'capabilities'
+      ? { label: 'Optional', tone: 'is-muted' }
+      : { label: 'Ready', tone: 'is-ok' }
+    const el = await mountDialog()
+    expect(el.querySelector('#settings-rail-provider .settings-rail__dot')).toBeNull()
+    expect(el.querySelector('#settings-rail-provider .settings-rail__warn')).toBeNull()
+    expect(el.querySelectorAll('.settings-rail__dot')).toHaveLength(0)
+    expect(el.querySelector('#settings-rail-capabilities')?.getAttribute('aria-label')).toContain('Optional')
+    expect(el.querySelector('.settings-rail__warn')).toBeNull()
+  })
+
   it('shows local section feedback instead of a blank loading pane', async () => {
     mockCatalog()
     catalogApi.loaded.value = false

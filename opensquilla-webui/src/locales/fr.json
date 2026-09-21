@@ -1,4 +1,23 @@
 {
+  "processes": {
+    "title": "Processus en arrière-plan",
+    "runningCount": "{count} en cours",
+    "refresh": "Actualiser",
+    "logs": "Journaux",
+    "stop": "Arrêter",
+    "close": "Fermer",
+    "loading": "Chargement…",
+    "loadError": "Impossible d’actualiser les processus. Réessayez.",
+    "stopError": "Impossible d’arrêter le processus. Actualisez et réessayez.",
+    "logError": "Impossible de charger la sortie. Réessayez.",
+    "emptyLog": "Aucune sortie pour le moment.",
+    "truncated": "Aperçu limité de la sortie.",
+    "running": "En cours",
+    "done": "Terminé (0)",
+    "failed": "Terminé ({code})",
+    "killed": "Arrêté",
+    "timed_out": "Délai dépassé"
+  },
   "imageClipboard": {
     "copyImage": "Copier l’image",
     "copySource": "Copier le code SVG",
@@ -4806,15 +4825,6 @@
       "bulkDeleteDone": "{count} sessions supprimées",
       "bulkDeletePartial": "{count} sessions n'ont pas pu être supprimées",
       "bulkDeleteFailed": "Impossible de supprimer les sessions sélectionnées"
-    },
-    "setupBanner": {
-      "ariaLabel": "Configuration de la passerelle requise",
-      "title": "Configuration requise",
-      "dismiss": "Ignorer",
-      "dismissNotice": "Ignorer l'avis de configuration",
-      "hint": "La passerelle n'est pas encore prête à fonctionner.",
-      "finishSetup": "Terminer la configuration",
-      "viewReadiness": "Voir la préparation"
     },
     "shortcuts": {
       "toggleSidebar": {
