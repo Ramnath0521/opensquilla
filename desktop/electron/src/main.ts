@@ -1531,7 +1531,7 @@ function secureDesktopRendererDocument(response: Response): Response {
       "font-src 'self' opensquilla-app://desktop data:",
       "media-src 'self' opensquilla-app://desktop blob: data: http: https:",
       "connect-src 'self' opensquilla-app://desktop http: https: ws: wss:",
-      "frame-src blob: http: https:",
+      "frame-src blob: data: http: https:",
       "worker-src 'self' opensquilla-app://desktop blob:",
     ].join('; '),
   )
@@ -9539,6 +9539,10 @@ async function createMainWindow(): Promise<BrowserWindow> {
       contextIsolation: true,
       nodeIntegration: false,
       sandbox: true,
+      // Electron disables Chromium's built-in PDF plugin by default. The
+      // Workbench intentionally uses the native PDF viewer for PDF artifacts;
+      // keep the renderer sandboxed while enabling that viewer.
+      plugins: true,
     },
   })
   mainWindow = window
