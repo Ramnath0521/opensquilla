@@ -580,6 +580,7 @@ function applyDesktopNativeTheme(source: DesktopNativeThemeSource): { source: De
 let gatewayProcess: ChildProcessWithoutNullStreams | null = null
 let gatewayProfileKey: string | null = null
 let isQuitting = false
+let gatewayShutdownRequestInterceptorInstalled = false
 // A child remains lifecycle-owned until its exit event, even after stopGateway
 // clears the current slot so a replacement cannot accidentally reuse it. Quit,
 // update, cleanup, and recovery all join this set before Electron may exit.
@@ -1485,6 +1486,13 @@ async function proxyDesktopRendererRequest(
   const body = method === 'GET' || method === 'HEAD'
     ? undefined
     : new Uint8Array(await request.arrayBuffer())
+  if (isCurrentGatewayShutdownRequest(`${gatewayState.url}${pathAndQuery}`, method)) {
+    const child = gatewayProcess
+    if (child && gatewayState.owned) {
+      trackStoppingGatewayProcess(child)
+      cancelGatewayUnexpectedExitRestart('Gateway shutdown endpoint requested')
+    }
+  }
   const response = await electronNet.fetch(`${gatewayState.url}${pathAndQuery}`, {
     method,
     headers,
@@ -8826,10 +8834,43 @@ function hasGatewayProcessExited(process: ChildProcessWithoutNullStreams | null)
 function trackStoppingGatewayProcess(child: ChildProcessWithoutNullStreams): void {
   if (hasGatewayProcessExited(child) || gatewayStoppingProcesses.has(child)) return
   gatewayStoppingProcesses.add(child)
-  child.once('exit', () => {
+  // The close handler classifies the child's final status. Keep the explicit
+  // stop marker until close because Node emits exit before close; clearing it
+  // on exit would make an intentional clean stop look like an unexpected
+  // ready-child disconnect and schedule a replacement.
+  child.once('close', () => {
     gatewayStoppingProcesses.delete(child)
     if (updateGatewayShutdownProcess === child) updateGatewayShutdownProcess = null
   })
+}
+
+function isCurrentGatewayShutdownRequest(url: string, method: string): boolean {
+  if (method !== 'POST' || !gatewayState.url) return false
+  try {
+    const request = new URL(url)
+    const gateway = new URL(gatewayState.url)
+    return request.origin === gateway.origin && request.pathname === '/api/system/shutdown'
+  } catch {
+    return false
+  }
+}
+
+function installGatewayShutdownRequestInterceptor(window: BrowserWindow): void {
+  if (gatewayShutdownRequestInterceptorInstalled) return
+  gatewayShutdownRequestInterceptorInstalled = true
+  window.webContents.session.webRequest.onBeforeRequest(
+    { urls: ['<all_urls>'] },
+    (details, callback) => {
+      if (isCurrentGatewayShutdownRequest(details.url, details.method)) {
+        const child = gatewayProcess
+        if (child && gatewayState.owned) {
+          trackStoppingGatewayProcess(child)
+          cancelGatewayUnexpectedExitRestart('Gateway shutdown endpoint requested')
+        }
+      }
+      callback({})
+    },
+  )
 }
 
 function liveLifecycleOwnedGatewayProcesses(): ChildProcessWithoutNullStreams[] {
@@ -9315,7 +9356,6 @@ async function startGateway(): Promise<GatewayState> {
     const childWasReady = childReadyAuthority !== null
     const unexpectedReadyExit = isCurrentGateway
       && childWasReady
-      && abnormalExit
       && !isQuitting
       && !gatewayStoppingProcesses.has(child)
     desktopLog('gateway_exited', {
@@ -9329,7 +9369,7 @@ async function startGateway(): Promise<GatewayState> {
       gatewayStopping: gatewayStoppingProcesses.has(child),
     })
     gatewayReadyProcesses.delete(child)
-    if (unexpectedReadyExit) {
+    if (unexpectedReadyExit && abnormalExit) {
       desktopReliabilityTelemetry.recordCrash({
         component: 'gateway',
         errorCode: 'gateway_unexpected_exit',
@@ -9355,7 +9395,12 @@ async function startGateway(): Promise<GatewayState> {
       publishGatewayConnection()
       return
     }
-    if (abnormalExit) {
+    // A ready Gateway can receive SIGTERM and exit cleanly (code=0). That is
+    // still an unexpected disconnect while the Desktop app is alive. Treat it
+    // like an abnormal ready exit so the bounded recovery series can restore
+    // the child. The stopping set and lifecycle authority checks above/below
+    // keep explicit quit, update, and profile recovery drains excluded.
+    if (abnormalExit || unexpectedReadyExit) {
       if (scheduleGatewayUnexpectedExitRestart(
         classifiedMessage,
         childWasReady,
@@ -9497,6 +9542,7 @@ async function createMainWindow(): Promise<BrowserWindow> {
     },
   })
   mainWindow = window
+  installGatewayShutdownRequestInterceptor(window)
   trackDesktopReliabilityWindow(window)
   installDesktopZoomShortcuts(
     window.webContents,
