@@ -4,10 +4,8 @@ from __future__ import annotations
 
 import asyncio
 import sys
-from pathlib import Path
 from typing import Any
 
-from opensquilla.paths import default_opensquilla_home
 from opensquilla.sandbox.capability_service import CapabilityReport, capability_report_from_setup
 from opensquilla.sandbox.setup_state import (
     SandboxSetupState,
@@ -19,15 +17,17 @@ from opensquilla.sandbox.types import SandboxSetupRequiredError
 _LOCK = asyncio.Lock()
 _SETTING_UP = False
 _LAST_RESULT: SetupResult | None = None
+_LAST_RESULT_FROM_EXPLICIT_SETUP = False
 _GENERATION = 0
 
 
 def mark_sandbox_startup_pending() -> None:
     """Publish passive status before the gateway schedules initialization."""
-    global _GENERATION, _LAST_RESULT, _SETTING_UP
+    global _GENERATION, _LAST_RESULT, _SETTING_UP, _LAST_RESULT_FROM_EXPLICIT_SETUP
 
     _GENERATION += 1
     _SETTING_UP = False
+    _LAST_RESULT_FROM_EXPLICIT_SETUP = False
 
     _LAST_RESULT = SetupResult(
         state=SandboxSetupState.SETTING_UP,
@@ -96,7 +96,7 @@ async def current_sandbox_capability_report(
 
 async def initialize_sandbox_runtime(config: Any) -> SetupResult:
     """Initialize the existing sandbox; never install or elevate on startup."""
-    global _LAST_RESULT, _SETTING_UP
+    global _LAST_RESULT, _SETTING_UP, _LAST_RESULT_FROM_EXPLICIT_SETUP
 
     generation = _GENERATION
     async with _LOCK:
@@ -110,7 +110,9 @@ async def initialize_sandbox_runtime(config: Any) -> SetupResult:
             return _LAST_RESULT
         _SETTING_UP = True
         try:
-            await _initialize_backend_and_probe(config)
+            from opensquilla.sandbox.integration import initialize_runtime_backend
+
+            await initialize_runtime_backend()
             _require_current_generation(generation)
             result = SetupResult(
                 state=SandboxSetupState.READY,
@@ -138,11 +140,12 @@ async def initialize_sandbox_runtime(config: Any) -> SetupResult:
             if generation == _GENERATION:
                 _SETTING_UP = False
         _LAST_RESULT = result
+        _LAST_RESULT_FROM_EXPLICIT_SETUP = False
         return result
 
 
 async def ensure_sandbox_setup_auto(config: Any) -> SetupResult:
-    global _LAST_RESULT, _SETTING_UP
+    global _LAST_RESULT, _SETTING_UP, _LAST_RESULT_FROM_EXPLICIT_SETUP
 
     generation = _GENERATION
     async with _LOCK:
@@ -150,8 +153,19 @@ async def ensure_sandbox_setup_auto(config: Any) -> SetupResult:
         # A client can lose the setup response while the elevated helper keeps
         # running (for example, across Windows UAC). A later request waits for
         # the active operation through _LOCK, then reuses its authoritative
-        # READY result instead of rotating credentials or repairing ACLs twice.
-        if _LAST_RESULT is not None and _LAST_RESULT.state is SandboxSetupState.READY:
+        # READY result for portable backends. Windows is different: passive
+        # startup deliberately avoids LogonUser, so an old marker may contain
+        # a stale offline-account password. An explicit Safe selection must
+        # revalidate and repair that identity instead of trusting the passive
+        # READY result.
+        if (
+            _LAST_RESULT is not None
+            and _LAST_RESULT.state is SandboxSetupState.READY
+            and (
+                _LAST_RESULT.platform != "win32"
+                or _LAST_RESULT_FROM_EXPLICIT_SETUP
+            )
+        ):
             return _LAST_RESULT
         _SETTING_UP = True
         setup_result: SetupResult | None = None
@@ -159,9 +173,12 @@ async def ensure_sandbox_setup_auto(config: Any) -> SetupResult:
             setup_result = await ensure_sandbox_setup(config)
             _require_current_generation(generation)
             if setup_result.state is SandboxSetupState.READY:
-                await _initialize_backend_and_probe(config)
+                from opensquilla.sandbox.integration import initialize_runtime_backend
+
+                await initialize_runtime_backend()
                 _require_current_generation(generation)
             _LAST_RESULT = setup_result
+            _LAST_RESULT_FROM_EXPLICIT_SETUP = setup_result.state is SandboxSetupState.READY
             return setup_result
         except Exception as exc:  # noqa: BLE001
             _require_current_generation(generation)
@@ -173,6 +190,7 @@ async def ensure_sandbox_setup_auto(config: Any) -> SetupResult:
                 detail=str(exc),
             )
             _LAST_RESULT = result
+            _LAST_RESULT_FROM_EXPLICIT_SETUP = False
             return result
         finally:
             if generation == _GENERATION:
@@ -184,49 +202,14 @@ def _require_current_generation(generation: int) -> None:
         raise asyncio.CancelledError("Sandbox initialization belongs to a retired runtime.")
 
 
-def _startup_probe_cwd(config: Any) -> Path:
-    """Choose an existing, non-temporary directory for backend probes."""
-
-    for name in ("state_dir", "config_path"):
-        raw = getattr(config, name, None)
-        if not raw:
-            continue
-        try:
-            candidate = Path(raw).expanduser()
-            if name == "config_path":
-                candidate = candidate.parent
-            candidate = candidate.resolve(strict=True)
-        except (OSError, RuntimeError, TypeError, ValueError):
-            continue
-        if candidate.is_dir():
-            return candidate
-    home = default_opensquilla_home()
-    try:
-        resolved_home = home.expanduser().resolve(strict=True)
-    except OSError:
-        resolved_home = Path(__file__).resolve().parent
-    return resolved_home if resolved_home.is_dir() else Path(__file__).resolve().parent
-
-
-async def _initialize_backend_and_probe(config: Any) -> Any:
-    """Select the backend and run its real, bounded startup readiness probe."""
-
-    from opensquilla.sandbox.integration import initialize_runtime_backend
-
-    backend = await initialize_runtime_backend()
-    probe = getattr(backend, "probe_runtime", None)
-    if callable(probe):
-        await probe(cwd=_startup_probe_cwd(config))
-    return backend
-
-
 def reset_sandbox_setup_runtime_state() -> None:
-    global _GENERATION, _LAST_RESULT, _LOCK, _SETTING_UP
+    global _GENERATION, _LAST_RESULT, _LAST_RESULT_FROM_EXPLICIT_SETUP, _LOCK, _SETTING_UP
 
     _GENERATION += 1
     _LOCK = asyncio.Lock()
     _SETTING_UP = False
     _LAST_RESULT = None
+    _LAST_RESULT_FROM_EXPLICIT_SETUP = False
 
 
 __all__ = [
