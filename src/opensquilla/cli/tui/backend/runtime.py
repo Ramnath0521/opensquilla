@@ -56,6 +56,8 @@ async def run_tui_runtime(
     async with surface_factory() as tui_surface:
         if hooks.expose_surface is not None:
             hooks.expose_surface(tui_surface)
+        with contextlib.suppress(Exception):
+            await hooks.on_surface_ready()
         turn_task: asyncio.Task[bool] | None = None
         # Abort tasks are held (and drained on shutdown) so a fire-and-forget
         # cancel RPC is never garbage-collected mid-flight or abandoned while
@@ -67,7 +69,7 @@ async def run_tui_runtime(
         # they must never be promoted directly to sessions.send.
         pending_steer_retry_ids: set[str] = set()
 
-        async def _schedule_abort(abort_turn: Awaitable[None]) -> None:
+        async def _schedule_abort(abort_turn: Awaitable[Any]) -> None:
             with contextlib.suppress(Exception):
                 await abort_turn
 
@@ -103,7 +105,12 @@ async def run_tui_runtime(
             return None
 
         def _cancel_callback() -> None:
-            _cancel_inflight_turn()
+            if turn_task is not None and not turn_task.done():
+                _cancel_inflight_turn()
+            else:
+                abort_task = asyncio.create_task(_schedule_abort(hooks.on_cancel_user_input()))
+                abort_tasks.add(abort_task)
+                abort_task.add_done_callback(abort_tasks.discard)
 
         tui_surface.set_cancel_callback(_cancel_callback)
 
@@ -198,17 +205,14 @@ async def run_tui_runtime(
                 if steered:
                     if hooks.notice is not None:
                         hooks.notice(
-                            "[bold]Pending steer confirmed with its original "
-                            "request ID.[/bold]"
+                            "[bold]Pending steer confirmed with its original request ID.[/bold]"
                         )
                     # A replayed receipt confirms this input already belongs to
                     # the original turn; it must not become a second turn.
                     continue
 
                 if hooks.notice is not None:
-                    hooks.notice(
-                        "[dim]Steer no longer applies; queued for the next turn.[/dim]"
-                    )
+                    hooks.notice("[dim]Steer no longer applies; queued for the next turn.[/dim]")
                 return promoted
 
         async def _run_shutdown_drain() -> bool:
@@ -231,7 +235,7 @@ async def run_tui_runtime(
                     _run_dispatch(queued, queued_client_message_id),
                     name=task_name,
                 )
-                keep_going = await _await_turn_or_cancel()
+                keep_going = await _await_turn_for_exit()
                 if not keep_going:
                     return False
             return True
@@ -259,6 +263,39 @@ async def run_tui_runtime(
                 except BaseException:  # noqa: BLE001 - shutdown path
                     pass
             next_line_task = None
+
+        async def _cancel_question_before_exit() -> None:
+            nonlocal turn_task
+            try:
+                cancelled_question = await asyncio.wait_for(
+                    hooks.on_cancel_user_input(), timeout=_ABORT_DRAIN_TIMEOUT_S,
+                )
+            except Exception as exc:
+                # The abort may already be accepted. A lost receipt must not
+                # trap exit behind a task that is waiting for terminal input.
+                _notice_turn_failed(exc)
+                cancelled_question = True
+            if not cancelled_question:
+                return
+            _notice_queue_discarded(runtime_state.clear_pending())
+            pending_steer_retry_ids.clear()
+            if turn_task is not None:
+                turn_task.cancel()
+                with contextlib.suppress(Exception, asyncio.CancelledError):
+                    await turn_task
+                turn_task = None
+
+        async def _await_turn_for_exit() -> bool:
+            # Ordinary work still drains. It may ask a question after exit was
+            # submitted, so keep checking the local pending state while the
+            # terminal no longer reads answers. The hook makes no RPC unless
+            # an actual pending question needs cancelling.
+            while True:
+                await _cancel_question_before_exit()
+                current = turn_task
+                if current is None or current.done():
+                    return await _await_turn_or_cancel()
+                await asyncio.wait({current}, timeout=0.1)
 
         try:
             while True:
@@ -324,14 +361,8 @@ async def run_tui_runtime(
                 next_line_task = None
 
                 if submitted is None:
-                    if turn_task is not None and not turn_task.done():
-                        try:
-                            await turn_task
-                        except asyncio.CancelledError:
-                            _emit(config.event_sink, TuiEvent(TuiEventKind.TURN_CANCELLED))
-                        except Exception as exc:
-                            _notice_turn_failed(exc)
-                        turn_task = None
+                    if not await _await_turn_for_exit():
+                        return runtime_state
                     if not await _run_shutdown_drain():
                         return runtime_state
                     if hooks.notice is not None:
@@ -360,7 +391,21 @@ async def run_tui_runtime(
                 if not user_input.strip():
                     continue
 
+                # Observe at submission, including slash commands and busy-turn
+                # steering, without handing input content to the activity hook.
+                with contextlib.suppress(Exception):
+                    await hooks.on_user_activity()
+
                 category = config.classify_input(user_input)
+
+                try:
+                    if await hooks.on_answer_user_input(user_input):
+                        continue
+                except Exception as exc:
+                    # A question reply must never become queued model input
+                    # when the server may already have accepted the answer.
+                    _notice_turn_failed(exc)
+                    continue
 
                 if (
                     category is TuiInputKind.COMMAND_REQUIRES_IDLE
@@ -421,7 +466,7 @@ async def run_tui_runtime(
                 ):
                     assert client_message_id is not None
                     try:
-                        # The optimistic prompt, sessions.steer, a safe queue
+                        # The optimistic prompt, sessions.steer.v2, a safe queue
                         # fallback, and any later sessions.send promotion must
                         # all retain the composer-allocated identity.
                         with tui_input_identity_scope(client_message_id):
@@ -462,9 +507,7 @@ async def run_tui_runtime(
                                 )
                             continue
                         if hooks.notice is not None:
-                            hooks.notice(
-                                f"[red]Steer failed: {_escape(str(exc))}[/red]"
-                            )
+                            hooks.notice(f"[red]Steer failed: {_escape(str(exc))}[/red]")
                         steered = False
                     if steered:
                         try:
@@ -548,15 +591,8 @@ async def run_tui_runtime(
                     continue
 
                 if category is TuiInputKind.EXIT:
-                    if turn_task is not None and not turn_task.done():
-                        try:
-                            await turn_task
-                        except asyncio.CancelledError:
-                            hooks.clear_current_cancel()
-                            _emit(config.event_sink, TuiEvent(TuiEventKind.TURN_CANCELLED))
-                        except Exception as exc:
-                            _notice_turn_failed(exc)
-                        turn_task = None
+                    if not await _await_turn_for_exit():
+                        return runtime_state
                     if not await _run_shutdown_drain():
                         return runtime_state
                     try:
@@ -584,9 +620,7 @@ async def run_tui_runtime(
                     if hooks.notice is not None:
                         position = runtime_state.pending_size
                         prefix = "Steer unavailable; queued" if steer_fell_back else "Queued"
-                        hooks.notice(
-                            f"[dim]{prefix} (#{position}) behind the running turn.[/dim]"
-                        )
+                        hooks.notice(f"[dim]{prefix} (#{position}) behind the running turn.[/dim]")
                     continue
 
                 if runtime_state.pending_size:
@@ -642,9 +676,7 @@ async def run_tui_runtime(
                 # reaches the backend before the client connection closes.
                 # The drain is bounded: a gateway that never answers the
                 # abort must not hang exit, so stragglers are cancelled.
-                _, stragglers = await asyncio.wait(
-                    set(abort_tasks), timeout=_ABORT_DRAIN_TIMEOUT_S
-                )
+                _, stragglers = await asyncio.wait(set(abort_tasks), timeout=_ABORT_DRAIN_TIMEOUT_S)
                 for straggler in stragglers:
                     straggler.cancel()
             with contextlib.suppress(Exception):

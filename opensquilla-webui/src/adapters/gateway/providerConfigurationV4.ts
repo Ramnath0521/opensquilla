@@ -1,5 +1,7 @@
 import type { TransportCallOptions as RpcCallOptions } from './transportTypes'
 import { readTransportFailure } from './transportTypes'
+import { MODELS_CAPACITY_RESOLVE_METHOD } from '@/contracts/generated/v4/modelsCapacityResolve'
+import { validateParams as validateCapacityParams, validateResult as validateCapacityResult } from '@/contracts/generated/v4/modelsCapacityResolveValidators.mjs'
 import type {
   ModelCatalogResult,
   ModelDescriptor,
@@ -14,10 +16,13 @@ import type {
   RoutingMode,
 } from '@/modules/providerConfiguration'
 import { ProviderConfigurationError } from '@/modules/providerConfiguration'
+import { mapSetupError } from './setupWorkflowV4'
+import { MODELS_ROUTING_RESET_RECOMMENDED_METHOD } from '@/contracts/generated/v4/modelsRoutingResetRecommended'
+import { validateParams as validateResetRecommendedParams, validateResult as validateResetRecommendedResult } from '@/contracts/generated/v4/modelsRoutingResetRecommendedValidators.mjs'
 import { MODELS_ROUTING_GET_METHOD } from '@/contracts/generated/v4/modelsRoutingGet'
 import { validateResult as validateModelsRoutingGetResult } from '@/contracts/generated/v4/modelsRoutingGetValidators.mjs'
 import { MODELS_LIST_METHOD } from '@/contracts/generated/v4/modelsList'
-import { validateResult as validateModelsListResult } from '@/contracts/generated/v4/modelsListValidators.mjs'
+import { validateParams as validateModelsListParams, validateResult as validateModelsListResult } from '@/contracts/generated/v4/modelsListValidators.mjs'
 import { MODELS_ROUTING_SET_METHOD } from '@/contracts/generated/v4/modelsRoutingSet'
 import { validateParams as validateModelsRoutingSetParams, validateResult as validateModelsRoutingSetResult } from '@/contracts/generated/v4/modelsRoutingSetValidators.mjs'
 import { MODELS_ROUTING_CHANGED_EVENT } from '@/contracts/generated/v4/modelsRoutingChangedEvent'
@@ -28,6 +33,7 @@ import { PROVIDERS_STATUS_METHOD } from '@/contracts/generated/v4/providersStatu
 import { validateParams as validateProvidersStatusParams, validateResult as validateProvidersStatusResult } from '@/contracts/generated/v4/providersStatusValidators.mjs'
 
 interface RpcTransport {
+  supports?(method: string): boolean
   request<T = unknown>(method: string, params?: Record<string, unknown>, options?: RpcCallOptions): Promise<T>
 }
 interface EventTransport {
@@ -60,7 +66,7 @@ function mapProviderError(error: unknown): ProviderConfigurationError {
           : code?.startsWith('INVALID_')
             ? 'invalid'
             : 'unavailable'
-  return new ProviderConfigurationError(domainCode, failure.message, error)
+  return new ProviderConfigurationError(domainCode, failure.message, error, mapSetupError(error).details)
 }
 
 async function requestProvider<T>(
@@ -207,13 +213,41 @@ export function createV4ProviderConfiguration(
   events: EventTransport,
 ): ProviderConfiguration {
   return {
+    get capacitySupported() {
+      return rpc.supports?.(MODELS_CAPACITY_RESOLVE_METHOD) === true
+    },
+    async resolveCapacity(models) {
+      if (rpc.supports?.(MODELS_CAPACITY_RESOLVE_METHOD) !== true) {
+        throw new ProviderConfigurationError('unsupported', 'Model capacity requires a newer Gateway.')
+      }
+      const params = { models: models.map(({ provider, model }) => ({ provider, model })) }
+      if (!validateCapacityParams(params)) throw new ProviderConfigurationError('invalid', 'Invalid model capacity targets')
+      const result = await requestProvider(rpc, MODELS_CAPACITY_RESOLVE_METHOD, params, options())
+      if (!validateCapacityResult(result)) throw new Error('Invalid model capacity response')
+      return result as { models: import('@/modules/providerConfiguration').ModelCapacity[] }
+    },
+    get resetRecommendedSupported() {
+      return rpc.supports?.(MODELS_ROUTING_RESET_RECOMMENDED_METHOD) === true
+    },
+    async resetRecommended(command, request) {
+      if (rpc.supports?.(MODELS_ROUTING_RESET_RECOMMENDED_METHOD) !== true) {
+        throw new ProviderConfigurationError('unsupported', 'This Gateway does not support resetting recommended routing.')
+      }
+      const params = { ...command }
+      if (!validateResetRecommendedParams(params)) throw new ProviderConfigurationError('invalid', 'Invalid recommended routing parameters')
+      const result = await requestProvider(rpc, MODELS_ROUTING_RESET_RECOMMENDED_METHOD, params, options(request?.signal))
+      if (!validateResetRecommendedResult(result)) throw new Error(`${MODELS_ROUTING_RESET_RECOMMENDED_METHOD} returned an invalid response`)
+      return routing(result)
+    },
     async catalog(request) {
       const result = await requestProvider(rpc, ONBOARDING_CATALOG_METHOD, undefined, options(request?.signal))
       if (!validateOnboardingCatalogResult(result)) throw new Error(`${ONBOARDING_CATALOG_METHOD} returned an invalid response`)
       return providerCatalog(result)
     },
     async list(request) {
-      const result = await requestProvider(rpc, MODELS_LIST_METHOD, undefined, options(request?.signal))
+      const params = request?.scope ? { scope: request.scope } : undefined
+      if (!validateModelsListParams(params ?? {})) throw new Error(`${MODELS_LIST_METHOD} params are invalid`)
+      const result = await requestProvider(rpc, MODELS_LIST_METHOD, params, options(request?.signal))
       if (!validateModelsListResult(result)) throw new Error(`${MODELS_LIST_METHOD} returned an invalid response`)
       return modelCatalog(result)
     },

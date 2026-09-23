@@ -6,13 +6,198 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ## [Unreleased]
 
+## [0.5.5] - 2026-09-23
+
 ### Added
+
+- Tencent SkillHub is available for Community Skill search and installation in
+  the Web UI, CLI, and Agent tools, with clearer source browsing and install results.
+- Persistent task workspaces support local HTML previews, inline file actions,
+  and read-only source previews with search, paging, and local Desktop open/reveal.
+- Model settings expose per-model context and output limits; custom providers
+  support additional request-body fields through TOML configuration.
+- Managed commands support interactive terminal input and background processes;
+  recommended and Desktop installations include platform PTY support.
+
+- The WebUI and Desktop composer can recover unsent attachment drafts across
+  reloads, with conversation and account/profile scoping, local storage limits,
+  expiry, and explicit recovery errors for unavailable file bytes.
+- Desktop file selection can reference files in the active project without
+  uploading a snapshot; queued use rechecks the current workspace and permissions.
+- Plan proposals can be hidden and restored without losing history or stopping
+  work. Queued and running implementations expose the normal task cancellation
+  control. Retried implementation requests preserve their original identity.
+- Ordinary tasks, Plan implementation and Goals share adjustable `update_plan`
+  progress. Planning can investigate with normal tools and permissions;
+  implementation no longer requires ordered checkpoints or a delivery-only phase.
+- Goals support natural control within the current task. Physical usage is
+  attributed to the root Goal across children and late results. Automatic
+  continuation requires the owner's live authenticated connection and session
+  subscription; Gateway restart always requires explicit resume.
+- Human input and approval waits release compute capacity while preserving task
+  identity and session exclusion. Cancelled questionnaires are closed in the
+  history used by subsequent turns, while their original questions are preserved.
+  Unsupported legacy database lineages are
+  preserved and rejected consistently, and preview/nightly Desktop profiles
+  are isolated from stable data.
+- Shell calls with an authorized but invalid working directory now report a
+  correctable argument error without executing the command or requesting broader
+  sandbox permissions.
 
 - Browser extensions can now reach state-changing HTTP and WebSocket endpoints
   through a loopback request authority when their exact custom-scheme origin
   (for example `chrome-extension://<id>`) is listed in `cors.allowed_origins`.
   Non-loopback request authorities remain rejected by those guards, `"*"` is
   never accepted, and existing CORS response-header behavior is unchanged.
+
+### Changed
+
+- Default multi-model fusion uses the C5 lineup for OpenRouter and TokenRhythm,
+  with four candidate models and a tool-capable aggregator.
+- The one-time configuration version 2 migration replaces C0–C3 Router text
+  tiers with the OpenRouter or TokenRhythm primary provider's recommendations,
+  including custom or mixed tiers and configurations with Router disabled.
+  The previous configuration is backed up first; reapply custom tiers after
+  upgrading. Custom edits made after this migration remain intact.
+- New Windows installers are Authenticode signed and support verified installer
+  handoff and cached update recovery. Existing releases keep their signing status.
+- Sandboxed channel document authoring uses generic tools and Skills. The
+  format-specific `create_csv`, `create_xlsx`, `create_pptx`, and
+  `create_pdf_report` tools are retired; ordinary channel authoring requires a
+  supported managed sandbox and is unavailable on Windows.
+- Workspace `BOOTSTRAP.md`, `HEARTBEAT.md`, and `TOOLS.md` integration and the
+  legacy memory flush/repair pipelines are retired. Existing user files remain
+  in place; move instructions still needed at runtime into `AGENTS.md`.
+- Source wheel builds require a verified WebUI bundle built with Node.js 22.12+
+  and npm. Published wheels, Desktop installers, and containers include it.
+
+- Removed per-Goal Token budgets and foreground/background execution settings.
+  Existing Goal history and usage totals remain readable. Previously paused
+  Goals can be resumed explicitly; old settings no longer limit work or allow
+  disconnected continuation.
+- Documents are consumed through bounded file tools with page, slide, paragraph
+  and sheet-range access. Uploaded originals stay immutable; supported edits use
+  persistent session working copies, and forks copy edited bytes under the current
+  file policy. Scanned PDF pages remain explicitly distinguishable from extracted
+  text.
+- Staged attachment uploads survive Gateway restarts within their original
+  10-minute lifetime. Context admission can compact older history once and retry
+  with a fresh text-and-image budget when the selected model's capacity is known.
+
+- Retired four experiment-only diagnostic outputs: runtime-recovery events,
+  final-diff observations, salvage events and focused-verification classification.
+  These events are no longer produced even when runtime event output is configured;
+  final-diff `log` remains accepted but no longer observes. Actual recovery,
+  warnings, salvage, observer events and independent turn-call logs remain.
+  An unused failure-summary cache is removed; public settings/defaults are unchanged.
+  Historical experiment-delivery details are preserved in Git history.
+- Retired the opt-in patch evidence ledger collector and JSON export. Legacy
+  path configuration remains accepted and excludes old diagnostic files from
+  final-diff checks, but no longer creates or overwrites a ledger. Recovery
+  decisions, source-diff salvage and model-visible defaults are unchanged.
+- Retired optional runtime experiments: strict/variant finalize challenges,
+  submit review, patch-evidence prompts, tool-description overrides, tool-loop
+  observation, runtime capsules, text-only tool nudges, and independent deadline
+  thinking cutoffs. Legacy configuration fields remain accepted but inert.
+  Base evidence gates, recovery, tool-result retrieval, Plan/Goal delivery, and
+  deadline wrap-up remain available. Strict-only counters and the retired
+  observers no longer emit runtime diagnostics.
+- The bundled Skill catalog now exposes eight ordinary entry points and three
+  stable Meta workflows, with coding instructions available in coding mode.
+  Internal helpers remain available to their owning workflows. The optional
+  relevance filter is retired; old filter settings are ignored during upgrade.
+- Redundant bundled wrappers, including `cron`, `memory`, `git-diff`, and
+  `http-fetch`, are retired while their native tools remain available. The
+  weather and tmux wrappers and the dedicated HTML-to-PDF/LaTeX wrappers are
+  also retired; generic tools remain available, but their former scripts and
+  output contracts are not preserved. PDF extraction, composition and
+  generation remain supported; arbitrary in-place PDF rewriting is no longer
+  a dedicated Skill capability.
+- In total, 31 bundled Skills are retired: four native-tool wrappers, five
+  audio wrappers, `summarize`, five weather/tmux/HTML-to-PDF/LaTeX/PDF-rewrite
+  wrappers, eight obsolete paper helpers, three creator helpers whose work
+  now runs in the creator runtime, and five stack-trace probes.
+- Catalog retirement takes effect when the upgraded Gateway restarts and
+  rebuilds its Skill snapshot. Personal, project and other user-installed
+  copies are not removed, and memory files and scheduled jobs stay in place.
+  Old Meta workflow definitions that reference retired Skills must be updated
+  by their authors; they are not automatically migrated.
+- Retired opt-in projection experiments: signal-scan hints, provider-history
+  deduplication, tiny compaction guards, configurable stub previews, and fresh
+  diagnostic preservation/retrieval gates. Existing configuration fields remain
+  accepted but no longer activate these mechanisms. Default Tokenjuice results,
+  Store/retrieval guarantees, fixed previews and compaction safety protections
+  remain unchanged; experimental diagnostic counters and events are removed.
+
+### Fixed
+
+- Gateway startup, sleep/wake recovery, clean-exit restart, Windows Safe mode,
+  session ownership, and shared storage recovery are more reliable.
+- Cross-window chat state, unsent drafts, attachment lifetime, image history,
+  embedded PDF previews, and tool-result presentation recover more consistently.
+- Context compaction uses the selected model's actual capacity and preserves
+  history when a summary is incomplete. Model reasoning survives tool calls
+  and replay, and MCP stdio accepts large responses.
+- One-shot schedules reject expired times before saving, and concurrent edits
+  retain their intended next run.
+
+- Ordinary task progress now uses the same compact ribbon as Plan execution and
+  disappears when the task ends, including after reconnecting or refreshing.
+  The optional `update_plan` tool is discovered on demand in ordinary Default
+  tasks, with guidance to skip simple work and avoid redundant updates.
+- Rescheduling a one-shot job while it runs now preserves the new occurrence
+  when the old execution finishes. The replacement starts with a fresh retry
+  budget, while the old result remains recorded in execution history.
+- Interactive Gateway CLI questions now wait for an answer in the same task,
+  preventing unanswered questions from starting extra Goal turns. Pending
+  questions recover on reconnect, and replies support safe retries and cancellation.
+  Ordinary Goal continuations also respect the session's selected model-routing mode.
+- DeepSeek settings now discover official models for the model picker and expose
+  refresh, loading, and discovery errors in the provider editor. New configurations
+  use `deepseek-flash` with current vision support and peak-rate cost estimates;
+  saved legacy model IDs remain unchanged.
+
+- Python code execution in packaged Gateways now uses the bundled Python runtime,
+  allowing tools to create documents with bundled dependencies such as `python-pptx`.
+  Linux Bubblewrap also retains read-only access to the selected Python runtime
+  instead of unnecessarily falling back to a system Python without those dependencies.
+- Automatic session titles now fall back to the first user message when the
+  naming model refuses. Known historical refusal titles also use this display
+  fallback, including the original message archived by context compaction;
+  manual names and stored title data remain unchanged.
+- Improved anonymous stability telemetry across Desktop, CLI, and TUI, honoring
+  existing privacy controls.
+- Default Gateway, CLI, decision, trace and safety logs no longer retain
+  prompt/conversation previews, tool output or exception payloads. Gateway
+  operational logs keep their level prefix and use JSON metadata with event
+  identifiers, counts, status codes and exception types; decision logs no longer
+  store prompt-derived intent text.
+  Support bundles re-filter current and rotated legacy logs, omitting legacy
+  free text that cannot be safely parsed. Existing local logs are not deleted
+  and may still contain pre-upgrade private content: review them before sharing
+  outside the bundle flow. Explicit raw turn-call capture remains opt-in (#1208).
+
+- Skill and Meta catalog reads remain compatible when the Web UI and Gateway
+  are upgraded separately. Meta details fall back on older gateways; new
+  gateways preserve public Meta list and detail responses for older clients.
+  Managed instances keep their source and lifecycle identity, and dependency
+  status refreshes after setup without retaining old missing-dependency counts.
+- Retired nested Skill-filter environment variables no longer prevent Gateway
+  startup. Newly authored personal and project Meta SOPs receive the correct
+  invocation defaults, and command completion follows the public catalog.
+
+- Aborting a turn no longer leaves an orphan task that crashes while the turn
+  generator is finalized. The gateway now closes the runner stream when the
+  consuming task exits, and the turn scope stack (process ownership, sandbox
+  policy, Git run mode, runtime pack, and managed toolchain state) tolerates
+  being unwound from a different asyncio Context, such as asyncio's
+  async-generator finalizer. Previously every `chat.abort` logged
+  `Task exception was never retrieved` with a nested
+  `ValueError: ... was created in a different Context` chain, and the
+  subscriber-visible turn-terminal event could be lost.
+
+- Skill catalog filtering and trigger matching tolerate numeric or nested YAML
+  trigger values, including restored caches and older Gateway responses (#1018).
 
 ## [0.5.4] - 2026-08-25
 

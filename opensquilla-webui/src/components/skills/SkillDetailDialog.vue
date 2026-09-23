@@ -24,6 +24,29 @@
       <section class="sk-detail__body">
         <p class="sk-detail__desc">{{ localizedSkillDescription(skill, String(locale)) }}</p>
 
+        <div v-if="canUseInTask" class="sk-detail__section sk-detail__launch">
+          <button type="button" class="btn btn--primary" :disabled="mutationDisabled || loadingContent" @click="emit('useInTask', skill)">
+            {{ t('cronSkills.skillDetail.useInTask') }}
+          </button>
+          <p class="sk-detail__advisory-note">{{ t('cronSkills.skillDetail.useInTaskHint') }}</p>
+        </div>
+
+        <div v-if="canSetEnabled && !isMetaSkill(skill) && skill.name !== 'code-task'" class="sk-detail__section">
+          <div class="sk-detail__section-title">{{ t('cronSkills.skillDetail.allowUse') }}</div>
+          <p class="sk-detail__advisory-note">{{ t('cronSkills.skillDetail.allowUseHelp') }}</p>
+          <button
+            type="button"
+            role="switch"
+            :aria-checked="!skill.disabled"
+            :aria-label="t('cronSkills.skillDetail.allowUse')"
+            class="btn btn--sm"
+            :disabled="mutationDisabled || settingEnabled"
+            @click="emit('setEnabled', skill.name, Boolean(skill.disabled))"
+          >
+            {{ settingEnabled ? t('cronSkills.skillDetail.saving') : skill.disabled ? t('cronSkills.skillDetail.enable') : t('cronSkills.skillDetail.disable') }}
+          </button>
+        </div>
+
         <div v-if="isMetaSkill(skill) && skill.triggers && skill.triggers.length" class="sk-detail__section">
           <div class="sk-detail__section-title">{{ t('cronSkills.skillDetail.triggers') }}</div>
           <div class="sk-detail__sub-list">
@@ -172,6 +195,7 @@
           <div class="sk-detail__section-title">SKILL.md</div>
           <div v-if="loadingContent" class="sk-detail__content-state">{{ t('cronSkills.skillDetail.loadingContent') }}</div>
           <div v-else-if="contentError" class="sk-detail__content-state sk-detail__content-state--error">{{ contentError }}</div>
+          <div v-else-if="skill.disabled" class="sk-detail__content-state">{{ t('cronSkills.skillDetail.disabledContent') }}</div>
           <pre v-else class="sk-detail__pre">{{ skill.content || t('cronSkills.skillDetail.emptyContent') }}</pre>
         </div>
       </section>
@@ -216,12 +240,17 @@ const props = defineProps<{
   installingDepsId: string | null
   uninstallingName: string | null
   mutationDisabled?: boolean
+  canSetEnabled?: boolean
+  settingEnabled?: boolean
+  canUseInTask?: boolean
 }>()
 
 const emit = defineEmits<{
   close: []
   installDeps: [name: string, installId: string]
   uninstall: [name: string, installId: string]
+  setEnabled: [name: string, enabled: boolean]
+  useInTask: [skill: Skill]
 }>()
 
 const dialogRef = ref<HTMLDialogElement | null>(null)

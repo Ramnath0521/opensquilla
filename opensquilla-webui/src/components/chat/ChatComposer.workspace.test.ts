@@ -119,7 +119,33 @@ describe('ChatComposer project draft', () => {
     app.unmount()
   })
 
-  it('announces an unavailable active project and disables sending', async () => {
+  it.each([false, true])('disables project changes during a pending binding (selected=%s)', async selected => {
+    const chooseProject = vi.fn()
+    const closeProject = vi.fn()
+    const host = document.createElement('div')
+    document.body.appendChild(host)
+    const app = createApp(ChatComposer, composerProps({
+      ...(!selected ? { projectWorkspace: null } : {}),
+      canCloseProject: selected,
+      projectBindingBusy: true,
+      onChooseProject: chooseProject,
+      onCloseProject: closeProject,
+    }))
+    app.use(i18n)
+    app.mount(host)
+    await nextTick()
+
+    const action = host.querySelector<HTMLButtonElement>(selected
+      ? '.chat-project-chip button'
+      : '.chat-project-choose')!
+    expect(action.disabled).toBe(true)
+    action.click()
+    expect(chooseProject).not.toHaveBeenCalled()
+    expect(closeProject).not.toHaveBeenCalled()
+    app.unmount()
+  })
+
+  it('keeps unavailable project context and disables sending without another send notice', async () => {
     const host = document.createElement('div')
     document.body.appendChild(host)
     const app = createApp(ChatComposer, composerProps({
@@ -137,8 +163,13 @@ describe('ChatComposer project draft', () => {
 
     expect(host.querySelector('.chat-project-chip')?.getAttribute('data-status')).toBe('unavailable')
     expect(host.querySelector('.chat-project-chip__status')?.textContent).toContain('unavailable')
-    expect(host.querySelector<HTMLButtonElement>('.chat-send-btn')?.disabled).toBe(true)
-    expect(host.querySelector('#chat-composer-send-status')?.textContent).toContain('unavailable')
+    const send = host.querySelector<HTMLButtonElement>('.chat-send-btn')!
+    expect(send.disabled).toBe(true)
+    expect(send.hasAttribute('title')).toBe(false)
+    expect(send.getAttribute('aria-describedby')).toBeNull()
+    expect(host.querySelector('.chat-composer-send-status')).toBeNull()
+    expect(host.querySelector('.chat-composer-status-announcement')).toBeNull()
+    expect(host.querySelector('.chat-send-tooltip')).toBeNull()
 
     app.unmount()
   })

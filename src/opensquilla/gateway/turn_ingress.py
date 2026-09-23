@@ -11,6 +11,7 @@ from typing import Any
 from opensquilla.application.turn_admission import AdmitTurnResult
 from opensquilla.application.turn_input import TurnRequestIdentity as TurnRequestIdentity
 from opensquilla.application.turn_input import complete_durable_ingress as complete_durable_ingress
+from opensquilla.contracts.selected_skills import normalize_selected_skills
 from opensquilla.session.keys import canonicalize_session_key
 from opensquilla.session.storage import TurnAcceptanceResult
 
@@ -18,6 +19,8 @@ _FINGERPRINT_FIELDS: tuple[tuple[str, tuple[str, ...]], ...] = (
     ("message", ("message",)),
     ("display_text", ("displayText", "display_text")),
     ("attachments", ("attachments",)),
+    ("workspace_files", ("workspaceFiles",)),
+    ("selected_skills", ("selectedSkills",)),
     ("intent", ("intent",)),
     (
         "initial_collaboration_mode",
@@ -32,6 +35,8 @@ _FINGERPRINT_FIELDS: tuple[tuple[str, tuple[str, ...]], ...] = (
         "initial_routing_mode",
         ("initialRoutingMode", "initial_routing_mode"),
     ),
+    ("initial_model", ("initialModel", "initial_model")),
+    ("initial_provider", ("initialProvider", "initial_provider")),
     ("fork_before_message_id", ("forkBeforeMessageId", "fork_before_message_id")),
     ("queue_mode", ("queueMode", "queue_mode")),
     ("no_memory_capture", ("noMemoryCapture", "no_memory_capture")),
@@ -42,6 +47,8 @@ _FINGERPRINT_FIELDS: tuple[tuple[str, tuple[str, ...]], ...] = (
     ),
     ("run_kind", ("runKind", "run_kind")),
     ("workspace_id", ("workspaceId", "workspace_id")),
+    ("page_context", ("pageContext",)),
+    # Historical fingerprints keep already accepted requests replayable after retirement.
     (
         "prompt_annotation_ids",
         ("promptAnnotationIds", "prompt_annotation_ids"),
@@ -56,6 +63,10 @@ def _canonical_fingerprint_payload(params: Mapping[str, Any]) -> dict[str, Any]:
         for alias in aliases:
             if alias in params:
                 value = params[alias]
+                if canonical_name == "selected_skills":
+                    value = list(normalize_selected_skills(value))
+                    if not value:
+                        break
                 if canonical_name == "document_context" and isinstance(value, dict):
                     value = {
                         "document_id": value.get("documentId", value.get("document_id")),

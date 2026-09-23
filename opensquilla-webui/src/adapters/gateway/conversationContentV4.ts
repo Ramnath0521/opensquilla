@@ -1,3 +1,5 @@
+import { skillLoadReceipt } from '@/types/skillLoads'
+import { normalizeTaskProgress } from '@/utils/chat/taskProgress'
 import type { ConversationCronResult, ConversationEventData, ConversationEventContext, ConversationRoutingSnapshot, ConversationUsage } from '@/modules/conversationEventContent'
 import type { ConversationEventProjection, ConversationSemanticEventKind } from '@/modules/conversationEvents'
 import { normalizeToolName, normalizeToolPresentation, toolResultIsError } from '@/utils/chat/toolDisplay'
@@ -13,7 +15,7 @@ const STRING_FIELDS = `reason status run_status terminal_message terminal_reason
   recovery tier routed_tier routed_model baseline_model decision_id rollout_phase accepted_routing_mode
   source proposer_label proposer_model proposer_provider detail skip_reason
   compaction_id stage durability intent kind sha256 mime created_at store download_url thumbnail_url
-  input_mode run_kind coverage_status authoritative_text_snapshot authoritative_reasoning_snapshot replay_gap_reason`.split(/\s+/)
+  input_mode run_kind coverage_status authoritative_text_snapshot authoritative_reasoning_snapshot replay_gap_reason execution_log_handle`.split(/\s+/)
 const NUMBER_FIELDS = `epoch stream_seq generation_epoch started_at emitted_at input_tokens output_tokens
   cached_tokens cache_write cost_usd unknown_usage_events old_generation_epoch new_generation_epoch sequence
   retry_attempt retry_limit retry_after_ms finished_at iteration block_index ended_at applied_iteration
@@ -26,16 +28,28 @@ function object(value: unknown): Record<string, unknown> {
   return value && typeof value === 'object' && !Array.isArray(value) ? value as Record<string, unknown> : {}
 }
 
+// Only the fixed field names in this module enter this cache, never keys or
+// values from the wire. High-frequency deltas reuse their schema spellings.
+const camelFields = new Map<string, string>()
 function camel(key: string): string {
-  return key.replace(/_([a-z])/g, (_, letter: string) => letter.toUpperCase())
+  let name = camelFields.get(key)
+  if (name === undefined) {
+    name = key.replace(/_([a-z])/g, (_, letter: string) => letter.toUpperCase())
+    camelFields.set(key, name)
+  }
+  return name
 }
 
 function alias(source: Record<string, unknown>, key: string, ...alternatives: string[]): unknown {
-  for (const name of [key, camel(key), ...alternatives]) {
+  const canonical = source[key]
+  if (canonical != null) return canonical
+  const legacy = source[camel(key)]
+  if (legacy != null) return legacy
+  for (const name of alternatives) {
     const value = source[name]
     if (value !== undefined && value !== null) return value
   }
-  return source[key] ?? source[camel(key)]
+  return canonical ?? legacy
 }
 
 function eventTaskIdentity(source: Record<string, unknown>): string | undefined {
@@ -81,13 +95,30 @@ function modelCallSegments(value: unknown): ConversationEventData['model_call_se
   })
 }
 
+function executionLegs(value: unknown): ConversationUsage['execution_legs'] {
+  if (!Array.isArray(value)) return undefined
+  return value.flatMap(item => {
+    if (!item || typeof item !== 'object' || Array.isArray(item)) return []
+    const source = object(item)
+    const result: NonNullable<ConversationUsage['execution_legs']>[number] = {}
+    for (const key of ['kind', 'provider', 'model', 'plan_id', 'execution_id', 'call_kind', 'reason'] as const) {
+      const value = alias(source, key)
+      if (typeof value === 'string') result[key] = value
+    }
+    if (typeof source.index === 'number' && Number.isSafeInteger(source.index) && source.index >= 0) {
+      result.index = source.index
+    }
+    return [result]
+  })
+}
+
 function terminalUsage(source: Record<string, unknown>): ConversationUsage {
   const nested = object(source.usage)
   const raw = { ...(source.usage ? nested : source) }
   // Preserve the established merge before collapsing spellings: an outer
   // canonical field can outrank a nested camel-only field, but never replaces
   // an already-present nested field of the same spelling.
-  for (const key of ['model_usage_breakdown', 'modelUsageBreakdown', 'ensemble_trace', 'ensembleTrace', 'coverage_status', 'coverageStatus', 'usage_unknown', 'usageUnknown', 'unknown_usage_events', 'unknownUsageEvents']) {
+  for (const key of ['model_usage_breakdown', 'modelUsageBreakdown', 'ensemble_trace', 'ensembleTrace', 'execution_legs', 'executionLegs', 'coverage_status', 'coverageStatus', 'usage_unknown', 'usageUnknown', 'unknown_usage_events', 'unknownUsageEvents']) {
     if (source[key] != null && raw[key] == null) raw[key] = source[key]
   }
   const result: Record<string, unknown> = {}
@@ -109,6 +140,8 @@ function terminalUsage(source: Record<string, unknown>): ConversationUsage {
       ? Array.isArray(item) : item && typeof item === 'object' && !Array.isArray(item))
     if (value !== undefined) result[key] = value
   }
+  const legs = executionLegs([raw.execution_legs, raw.executionLegs].find(Array.isArray))
+  if (legs) result.execution_legs = legs
   // The outer persisted route plan overrides the smaller nested usage receipt.
   const route = alias(source, 'route_plan') ?? alias(raw, 'route_plan')
   if (route && typeof route === 'object' && !Array.isArray(route)) result.route_plan = route
@@ -162,6 +195,10 @@ export function projectConversationRoutingSnapshot(value: unknown): Conversation
 export function projectConversationContent(payload: unknown, kind?: ConversationSemanticEventKind): ConversationEventData {
   const source = object(payload)
   const result: Record<string, unknown> = {}
+  if (kind === 'skill-load') {
+    const receipt = skillLoadReceipt(source.content)
+    if (receipt) result.skillLoad = receipt
+  }
   for (const key of STRING_FIELDS) {
     const value = alias(source, key)
     if (typeof value === 'string') result[key] = value
@@ -303,7 +340,23 @@ export function projectConversationContent(payload: unknown, kind?: Conversation
     if (typeof turnId === 'string') result.completedTurnId = turnId.trim()
   }
   if (kind === 'turn-failed' || kind === 'task-failed' || kind === 'task-timed-out' || kind === 'task-abandoned') {
-    result.terminalOutcome = normalizeTurnOutcome({ ...source, turn_id: taskId, status: 'failed' })
+    const capacity = object(source.model_capacity)
+    if (typeof capacity.provider === 'string' && capacity.provider.trim() && capacity.provider.length <= 1024
+      && typeof capacity.model === 'string' && capacity.model.trim() && capacity.model.length <= 1024
+      && Number.isSafeInteger(capacity.contextWindow) && Number(capacity.contextWindow) > 0
+      && ['default', 'catalog', 'config', 'override'].includes(String(capacity.source))) {
+      result.modelCapacity = { provider: capacity.provider, model: capacity.model,
+        contextWindow: Number(capacity.contextWindow), source: capacity.source as import('@/modules/providerConfiguration').ModelCapacitySource }
+    }
+    result.terminalOutcome = normalizeTurnOutcome({
+      ...source,
+      turn_id: source.turn_id ?? source.turnId ?? taskId,
+      status: kind === 'task-timed-out' ? 'timeout' : kind === 'task-abandoned' ? 'abandoned' : 'failed',
+      ...(kind !== 'turn-failed' ? {
+        statusSource: 'task',
+        reason: source.terminal_reason ?? source.terminalReason ?? source.reason,
+      } : {}),
+    })
     const errorCode = usageAccountingErrorCode(source)
     if (errorCode) result.error_class = errorCode
   }
@@ -347,6 +400,26 @@ function projectKnownConversationContent(
   semanticKind: Exclude<ConversationSemanticEventKind, 'unknown'>,
   rawPayload: unknown,
 ): ConversationContentProjection {
+  if (semanticKind === 'process-completed') {
+    const raw = object(rawPayload)
+    if (typeof raw.execution_id !== 'string' || !raw.execution_id
+      || typeof raw.session_id !== 'string' || !raw.session_id
+      || typeof raw.session_epoch !== 'number' || !Number.isInteger(raw.session_epoch) || raw.session_epoch < 0
+      || !['done', 'killed', 'timed_out'].includes(String(raw.status))
+      || (raw.returncode !== null && (typeof raw.returncode !== 'number' || !Number.isInteger(raw.returncode)))) {
+      throw new ConversationEventContractError('Invalid process completion receipt')
+    }
+    return { kind: 'known', semanticKind, payload: { executionId: raw.execution_id,
+      status: raw.status as 'done' | 'killed' | 'timed_out', returncode: raw.returncode as number | null,
+      sessionId: raw.session_id, sessionEpoch: raw.session_epoch } }
+  }
+  if (semanticKind === 'execution-progress') {
+    const progress = normalizeTaskProgress(object(rawPayload).progress)
+    return { kind: 'known', semanticKind, payload: {
+      ...projectConversationContent(rawPayload, semanticKind),
+      ...(progress ? { progress } : {}),
+    } }
+  }
   if (semanticKind === 'turn-committed') {
     const raw = object(rawPayload)
     const optionalText = ['session_id', 'client_message_id', 'user_message_id', 'surface_id', 'stream_generation']

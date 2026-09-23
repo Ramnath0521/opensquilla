@@ -3,8 +3,8 @@
     ref="statusRef"
     class="chat-session-recovery-status"
     :class="`chat-session-recovery-status--${state}`"
-    :role="isFailure ? 'alert' : 'status'"
-    :aria-live="isFailure ? 'assertive' : 'polite'"
+    :role="isFailure && actionKey ? 'alert' : 'status'"
+    :aria-live="isFailure && actionKey ? 'assertive' : 'polite'"
     aria-atomic="true"
     :data-recovery-state="state"
     data-testid="chat-session-recovery-status"
@@ -26,13 +26,18 @@
       <span v-if="description">{{ description }}</span>
     </span>
     <button
-      v-if="isRetryableFailure"
+      v-if="isFailure && actionKey"
       type="button"
       class="chat-session-recovery-status__retry btn btn--ghost"
       data-testid="chat-session-recovery-retry"
+      :disabled="busy"
+      :aria-busy="busy || undefined"
       @click="requestRetry"
     >
       {{ action }}
+    </button>
+    <button v-if="isFailure" type="button" class="btn btn--icon btn--ghost" data-testid="chat-session-recovery-dismiss" :aria-label="t('common.close')" @click="emit('dismiss')">
+      <Icon name="x" :size="14" />
     </button>
   </div>
 </template>
@@ -43,14 +48,20 @@ import { useI18n } from 'vue-i18n'
 
 import Icon from '@/components/Icon.vue'
 import type { ChatSessionRecoveryState } from '@/utils/chat/sessionLoadState'
+import type { DesktopResumeSource } from '@/platform/types'
 
 const props = defineProps<{
   state: ChatSessionRecoveryState
   transportState?: 'disconnected' | 'connecting' | 'connected'
+  transportPhase?: 'healthy' | 'checking' | 'suspect' | 'reconnecting'
+  resumeSource?: DesktopResumeSource | null
+  action?: 'retry-history' | 'retry-live'
+  busy?: boolean
 }>()
 
 const emit = defineEmits<{
   retry: []
+  dismiss: []
 }>()
 
 const { t } = useI18n()
@@ -60,9 +71,7 @@ const isFailure = computed(() => (
   || props.state === 'live-degraded'
   || props.state === 'session-missing'
 ))
-const isRetryableFailure = computed(() => (
-  props.state === 'history-error' || props.state === 'live-degraded'
-))
+const actionKey = computed(() => props.action)
 const isBusy = computed(() => !isFailure.value)
 const title = computed(() => {
   switch (props.state) {
@@ -73,8 +82,12 @@ const title = computed(() => {
     case 'history-error':
       return t('chat.loadSessionFailed')
     case 'live-connecting':
+      if (props.transportPhase && props.transportPhase !== 'healthy') {
+        return t(`chrome.connectionState.${props.transportPhase}`)
+      }
       return t(
         props.transportState === 'connected'
+          && !props.resumeSource
           ? 'chat.liveConnectingConnected'
           : 'chat.gatewayReconnecting',
       )
@@ -104,11 +117,9 @@ const description = computed(() => {
       return ''
     }
   })
-const action = computed(() => (
-  props.state === 'live-degraded'
-    ? t('chat.reconnectLive')
-    : t('chat.reloadSession')
-))
+const action = computed(() => props.action === 'retry-live'
+  ? t('chat.reconnectLive')
+  : t('chat.reloadSession'))
 
 function requestRetry() {
   emit('retry')

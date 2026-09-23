@@ -1,6 +1,9 @@
 import type { InjectionKey } from 'vue'
+import type { DesktopResumeSource } from '@/platform/types'
 
 export type GatewayAvailability = 'unavailable' | 'preparing' | 'available'
+export type GatewayConnectionHealth = 'healthy' | 'suspect'
+export type GatewayConnectionPhase = 'healthy' | 'checking' | 'suspect' | 'reconnecting'
 
 export interface GatewayRunModePolicy {
   readonly allowedRunModes?: unknown
@@ -22,15 +25,32 @@ export interface GatewayConnectionSettings {
  */
 export interface GatewayAccess {
   readonly availability: GatewayAvailability
+  /** Transport health of the current connection; suspect is never user-visible as connected. */
+  readonly connectionHealth: GatewayConnectionHealth
+  readonly connectionPhase?: GatewayConnectionPhase
+  /** Native resume is pending a liveness confirmation for the current socket. */
+  readonly isResuming?: boolean
+  readonly resumeSource?: DesktopResumeSource | null
+  /** The local supervisor is preparing the runtime; no connection has failed. */
+  readonly isRuntimeStarting: boolean
   readonly connectionError: string | null
+  readonly requiresCredential: boolean
   readonly isAvailable: boolean
   readonly isLocalOwner: boolean
   readonly isAuthenticated: boolean
+  /** Current anonymous session namespace, verified from this connection's Hello. */
+  readonly guestSessionOwnerId: string | null
+  /** Proven delivery authority; retained only while the same connection intent retries. */
+  readonly deliveryIdentity: string | null
   readonly canManageProjectWorkspaces: boolean
   readonly canChooseProject: boolean
   readonly runModePolicy: GatewayRunModePolicy | null
   readonly streamIdleTimeoutMs: number | null
   readonly concurrentHistoryReads: boolean
+  /** Gateway understands model/provider pins on the first atomic chat.send. */
+  readonly chatSendInitialModel: boolean
+  /** Gateway can atomically update model/provider and routing for an idle session. */
+  readonly sessionsRoutingModelSelection: boolean
   readonly detachedSessionHydration: boolean
   readonly turnCommittedEvents: boolean
   readonly subscriptionEpoch: number

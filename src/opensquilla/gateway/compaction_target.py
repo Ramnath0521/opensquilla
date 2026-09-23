@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-import hashlib
-import json
 from collections.abc import Callable
 from dataclasses import dataclass, field, replace
 from types import SimpleNamespace
@@ -20,11 +18,18 @@ from opensquilla.provider.model_catalog import (
 )
 from opensquilla.provider.protocol import (
     project_provider_final_request,
+    provider_connection_config,
     provider_metadata,
 )
-from opensquilla.provider.registry import get_provider_spec
+from opensquilla.provider.registry import LOCAL_RUNTIME_PROVIDERS, get_provider_spec
+from opensquilla.provider.request_proof import projected_generation_budget
 from opensquilla.provider.selector import ProviderConfig, build_provider_from_config
 from opensquilla.provider.types import ChatConfig, Message
+from opensquilla.session.compaction_budget import (
+    CompactionBudget,
+    named_auth_profile_fingerprint,
+    resolve_compaction_budget,
+)
 from opensquilla.session.compaction_deployment import (
     DEFAULT_COMPACTION_OUTPUT_TOKENS,
     CompactionExecutionPlan,
@@ -56,8 +61,12 @@ class GatewayConsumerBudget:
     provider_id: str = ""
     model: str = ""
     context_window_tokens: int = 1
+    # The history target is an input cap, not a replacement for the model's
+    # physical context window. Generation is reserved against this window.
+    physical_context_window_tokens: int | None = None
     max_output_tokens: int = 1
     provider_request_max_chars: int = 1
+    provider_request_max_chars_explicit_cap: int | None = None
     # Manual compaction runs between turns, so the next active prompt/media are
     # not known yet.  Keep a fixed/proportional part of the physical input
     # budget unavailable to durable history; canonical instructions, tools,
@@ -67,6 +76,7 @@ class GatewayConsumerBudget:
     deployment_fingerprint: str = ""
     source: str = "unavailable"
     blocked_reason: str = ""
+    context_window_known: bool = True
 
 
 @dataclass(frozen=True, slots=True)
@@ -201,22 +211,30 @@ def resolve_gateway_consumer_budget(
             )
         (
             context_window_tokens,
+            physical_context_window_tokens,
             max_output_tokens,
             provider_request_max_chars,
             next_request_reserve_tokens,
             next_request_reserve_chars,
+            context_window_known,
         ) = _consumer_execution_budget(
             ctx,
             named.provider_id,
             named.model,
+            provider=named_provider,
         )
         return GatewayConsumerBudget(
             provider=named_provider,
             provider_id=named.provider_id,
             model=named.model,
             context_window_tokens=context_window_tokens,
+            physical_context_window_tokens=physical_context_window_tokens,
+            context_window_known=context_window_known,
             max_output_tokens=max_output_tokens,
             provider_request_max_chars=provider_request_max_chars,
+            provider_request_max_chars_explicit_cap=_configured_request_char_cap(
+                ctx, named.provider_id,
+            ),
             next_request_reserve_tokens=next_request_reserve_tokens,
             next_request_reserve_chars=next_request_reserve_chars,
             deployment_fingerprint=named.profile_fingerprint,
@@ -287,93 +305,107 @@ def resolve_gateway_consumer_budget(
 
     (
         context_window_tokens,
+        physical_context_window_tokens,
         max_output_tokens,
         provider_request_max_chars,
         next_request_reserve_tokens,
         next_request_reserve_chars,
-    ) = _consumer_execution_budget(ctx, provider_id, model)
+        context_window_known,
+    ) = _consumer_execution_budget(ctx, provider_id, model, provider=provider)
     return GatewayConsumerBudget(
         provider=provider,
         provider_id=provider_id,
         model=model,
         context_window_tokens=context_window_tokens,
+        physical_context_window_tokens=physical_context_window_tokens,
+        context_window_known=context_window_known,
         max_output_tokens=max_output_tokens,
         provider_request_max_chars=provider_request_max_chars,
+        provider_request_max_chars_explicit_cap=_configured_request_char_cap(ctx, provider_id),
         next_request_reserve_tokens=next_request_reserve_tokens,
         next_request_reserve_chars=next_request_reserve_chars,
         source=source if provider is not None else "unavailable",
     )
 
 
-def build_gateway_consumer_admission(
+def build_gateway_compaction_budget(
     budget: GatewayConsumerBudget,
-) -> tuple[Callable[[str, list[dict[str, Any]]], bool], str]:
-    """Build an exact, fail-closed proof for checkpoint plus durable raw tail."""
+    *,
+    consumer_agent: Any | None = None,
+    trigger_ratio: float = 0.85,
+    retained_tail_messages: int = 0,
+    summary_output_tokens: int = DEFAULT_COMPACTION_OUTPUT_TOKENS,
+) -> CompactionBudget:
+    """Use the shared resolver for an idle consumer with next-request headroom."""
 
-    fingerprint = hashlib.sha256(
-        json.dumps(
-            {
-                "schema": "gateway_manual_durable_consumer_v2",
-                "provider": budget.provider_id,
-                "model": budget.model,
-                "context_window_tokens": budget.context_window_tokens,
-                "max_output_tokens": budget.max_output_tokens,
-                "provider_request_max_chars": budget.provider_request_max_chars,
-                "next_request_reserve_tokens": budget.next_request_reserve_tokens,
-                "next_request_reserve_chars": budget.next_request_reserve_chars,
-                "deployment_fingerprint": budget.deployment_fingerprint,
-                "source": budget.source,
-                "blocked_reason": budget.blocked_reason,
-            },
-            sort_keys=True,
-            separators=(",", ":"),
-        ).encode("utf-8")
-    ).hexdigest()
+    if consumer_agent is not None and not budget.blocked_reason and budget.provider is not None:
+        resolved = consumer_agent.resolve_compaction_budget(
+            consumer_provider=budget.provider,
+            active_user_message="",
+            active_user_in_history=False,
+            bound_user_message_id=None,
+            attachment_messages=None,
+            context_window_tokens=(
+                budget.physical_context_window_tokens or budget.context_window_tokens
+            ),
+            max_output_tokens=budget.max_output_tokens,
+            consumer_model_id=budget.model,
+            consumer_deployment_fingerprint=budget.deployment_fingerprint,
+            consumer_provider_request_max_chars=budget.provider_request_max_chars_explicit_cap,
+            history_limit_tokens=budget.context_window_tokens,
+            envelope_reserve_tokens=budget.next_request_reserve_tokens,
+            envelope_reserve_chars=budget.next_request_reserve_chars,
+            trigger_ratio=trigger_ratio,
+            retained_tail_messages=retained_tail_messages,
+            summary_output_tokens=summary_output_tokens,
+        )
+        if not isinstance(resolved, CompactionBudget):
+            raise TypeError("manual consumer must resolve a CompactionBudget")
+        return resolved
 
-    def _admit(
-        replay_summary: str,
-        kept_entries: list[dict[str, Any]],
-    ) -> bool:
+    def project(summary: str, kept: list[dict[str, Any]]) -> Any:
         if budget.blocked_reason or budget.provider is None:
-            return False
-        messages = _manual_consumer_messages(replay_summary, kept_entries)
+            return None
+        messages = _manual_consumer_messages(summary, kept)
         if messages is None:
-            return False
-        projection = project_provider_final_request(
-            budget.provider,
-            messages,
-            [],
-            ChatConfig(
+            return None
+        return project_provider_final_request(
+            budget.provider, messages, [], ChatConfig(
                 max_tokens=max(1, budget.max_output_tokens),
-                thinking=False,
-                thinking_budget_tokens=0,
-                provider_request_max_chars=max(
-                    1,
-                    budget.provider_request_max_chars,
+                provider_context_window_tokens=(
+                    (budget.physical_context_window_tokens or budget.context_window_tokens)
+                    if budget.context_window_known else 0
+                ),
+                thinking=False, thinking_budget_tokens=0,
+                provider_request_max_chars=max(1, budget.provider_request_max_chars),
+                provider_request_max_chars_explicit_cap=(
+                    budget.provider_request_max_chars_explicit_cap
                 ),
             ),
         )
-        if projection is None or not projection.fits:
-            return False
-        proof = projection.proof
-        estimated_tokens = max(0, int(proof.get("estimated_tokens", 0) or 0))
-        estimated_chars = max(0, int(proof.get("estimated_chars", 0) or 0))
-        effective_token_budget = max(
-            0,
-            int(proof.get("effective_proof_token_budget", 0) or 0),
-        )
-        effective_char_budget = max(
-            0,
-            int(proof.get("effective_proof_budget", 0) or 0),
-        )
-        return bool(
-            estimated_tokens + max(1, budget.next_request_reserve_tokens)
-            <= effective_token_budget
-            and estimated_chars + max(4, budget.next_request_reserve_chars)
-            <= effective_char_budget
-        )
 
-    return _admit, fingerprint
+    return resolve_compaction_budget(
+        project=project,
+        physical_context_window_tokens=(
+            budget.physical_context_window_tokens or budget.context_window_tokens
+        ),
+        generation_reserve_tokens=budget.max_output_tokens,
+        provider_identity=f"{budget.provider_id}/{budget.model}:{budget.deployment_fingerprint}",
+        history_limit_tokens=budget.context_window_tokens,
+        envelope_reserve_tokens=budget.next_request_reserve_tokens,
+        envelope_reserve_chars=budget.next_request_reserve_chars,
+        trigger_ratio=trigger_ratio,
+        retained_tail_messages=retained_tail_messages,
+        summary_output_tokens=summary_output_tokens,
+    )
+
+
+def build_gateway_consumer_admission(
+    budget: GatewayConsumerBudget,
+) -> tuple[Callable[[str, list[dict[str, Any]]], bool], str]:
+    """Compatibility projection of the common consumer budget."""
+    resolved = build_gateway_compaction_budget(budget)
+    return resolved.consumer_admission, resolved.consumer_admission_fingerprint
 
 
 def limit_gateway_consumer_budget(
@@ -386,28 +418,15 @@ def limit_gateway_consumer_budget(
         budget.context_window_tokens,
         max(1, int(context_window_tokens)),
     )
-    output_tokens = min(
-        budget.max_output_tokens,
-        max(1, window - 1),
-    )
-    derived_cap = ContextBudgetGovernor.from_values(
-        context_window_tokens=window,
-        max_output_tokens=output_tokens,
-        thinking_budget_tokens=0,
-        context_overflow_threshold=0.85,
-    ).snapshot().provider_request_max_chars
+    # A tighter history target does not shrink the physical model window or
+    # reduce the output cap that the next request will actually use.
+    physical_window = budget.physical_context_window_tokens or budget.context_window_tokens
+    output_tokens = budget.max_output_tokens
     return replace(
         budget,
         context_window_tokens=window,
+        physical_context_window_tokens=physical_window,
         max_output_tokens=output_tokens,
-        provider_request_max_chars=min(
-            budget.provider_request_max_chars,
-            max(1, derived_cap),
-        ),
-        next_request_reserve_tokens=_manual_next_request_reserve_tokens(window),
-        next_request_reserve_chars=(
-            _manual_next_request_reserve_tokens(window) * 4
-        ),
     )
 
 
@@ -834,16 +853,18 @@ def resolve_gateway_compaction_target(
     physical_model = _text(metadata.model) or preferred_model
     compat_plan = None
     try:
-        context_window, output_tokens, request_max_chars = _execution_budget(
+        context_window, output_tokens, generation_tokens, request_max_chars = _execution_budget(
             ctx,
             physical_provider,
             physical_model,
+            provider=provider,
         )
         compat_plan = build_compaction_execution_plan_from_provider(
             provider,
             model=physical_model,
             context_window_tokens=context_window,
             max_output_tokens=output_tokens,
+            max_generation_tokens=generation_tokens,
             provider_request_max_chars=request_max_chars,
             source="selected_provider_compat",
         )
@@ -871,6 +892,7 @@ def _resolve_named_auth_profile_deployment(
     model: str,
     session_key: str,
     credential_pool_acquirer: Callable[[str, list[str], str], Any | None] | None = None,
+    turn_metadata: dict[str, Any] | None = None,
 ) -> _NamedAuthProfileDeployment:
     """Resolve exactly one named profile without ambient credential fallback.
 
@@ -883,9 +905,7 @@ def _resolve_named_auth_profile_deployment(
     """
 
     normalized_profile_id = _text(profile_id).casefold()
-    fallback_fingerprint = hashlib.sha256(
-        normalized_profile_id.encode("utf-8")
-    ).hexdigest()[:16]
+    fallback_fingerprint = named_auth_profile_fingerprint(profile_id)
     profiles = getattr(gateway_config, "llm_profiles", None) or {}
     matches = [
         (str(key), profile)
@@ -908,9 +928,7 @@ def _resolve_named_auth_profile_deployment(
         )
 
     matched_profile_id, profile = matches[0]
-    profile_fingerprint = hashlib.sha256(
-        _text(matched_profile_id).casefold().encode("utf-8")
-    ).hexdigest()[:16]
+    profile_fingerprint = named_auth_profile_fingerprint(matched_profile_id)
     profile_provider = ""
     prefix, separator, suffix = _text(matched_profile_id).partition(":")
     if separator:
@@ -1008,6 +1026,7 @@ def _resolve_named_auth_profile_deployment(
         model_id,
         inherited_provider_config=None,
         session_key=pool_session_key,
+        turn_metadata=turn_metadata,
         replay_provider_state=False,
         credential_pool_acquirer=credential_pool_acquirer,
         environment_reader=read_named_profile_environment,
@@ -1033,6 +1052,62 @@ def _resolve_named_auth_profile_deployment(
         model=model_id,
         profile_fingerprint=profile_fingerprint,
     )
+
+
+def resolve_gateway_session_turn_deployment(
+    gateway_config: object | None,
+    session: object,
+    inherited: ProviderConfig | None,
+    turn_metadata: dict[str, Any] | None = None,
+) -> ProviderConfig | None:
+    """Resolve an explicit session pin before any turn pipeline provider call.
+
+    No pin leaves the engine's normal provider path unchanged. A selected
+    deployment cannot borrow credentials or fall back to the gateway default.
+    """
+    provider = _text(getattr(session, "provider_override", None)).lower()
+    model = _text(getattr(session, "model", None))
+    auth_profile = _text(getattr(session, "auth_profile_override", None))
+    if not provider and not auth_profile:
+        # Legacy model-only pins use the normal selector/model-override path,
+        # preserving configured fallbacks and provider-state continuity.
+        return None
+    session_key = _text(getattr(session, "session_key", None))
+    if auth_profile:
+        named = _resolve_named_auth_profile_deployment(
+            gateway_config, auth_profile, expected_provider=provider,
+            model=model, session_key=session_key, turn_metadata=turn_metadata,
+        )
+        if named.blocked_reason or named.provider_config is None:
+            raise ValueError(
+                "Session deployment unavailable: "
+                + (named.blocked_reason or "named_auth_profile_unavailable")
+            )
+        return named.provider_config
+    from opensquilla.engine.selector_override import acquire_profile_credential
+
+    resolution = resolve_provider_deployment(
+        gateway_config, provider, model,
+        inherited_provider_config=inherited,
+        session_key=session_key,
+        turn_metadata=turn_metadata,
+        replay_provider_state=False,
+        credential_pool_acquirer=acquire_profile_credential,
+    )
+    if not resolution.ready or resolution.provider_config is None:
+        raise ValueError(
+            "Session deployment unavailable: " + (resolution.reason or "deployment_unresolved")
+        )
+    if provider == _text(getattr(inherited, "provider", None)).lower():
+        # A model pin on the active deployment retains its explicit request
+        # options; credentials/endpoints still come from the shared resolver.
+        from copy import deepcopy
+
+        return replace(
+            resolution.provider_config,
+            extra_body=deepcopy(getattr(inherited, "extra_body", {}) or {}),
+        )
+    return resolution.provider_config
 
 
 def validate_gateway_session_deployment_override(
@@ -1090,15 +1165,17 @@ def _build_plan(
 ) -> CompactionExecutionPlan:
     provider_id = _text(provider_config.provider).lower()
     model = _text(provider_config.model)
-    context_window, output_tokens, request_max_chars = _execution_budget(
+    context_window, output_tokens, generation_tokens, request_max_chars = _execution_budget(
         ctx,
         provider_id,
         model,
+        deployment=provider_config,
     )
     return build_compaction_execution_plan_from_provider_config(
         provider_config,
         context_window_tokens=context_window,
         max_output_tokens=output_tokens,
+        max_generation_tokens=generation_tokens,
         provider_request_max_chars=request_max_chars,
         source=source,
     )
@@ -1108,7 +1185,11 @@ def _execution_budget(
     ctx: object,
     provider_id: str,
     model: str,
-) -> tuple[int, int, int]:
+    *,
+    provider: object | None = None,
+    deployment: ProviderConfig | None = None,
+) -> tuple[int, int, int, int]:
+    """Resolve the physical writer's window, body cap and generation allowance."""
     catalog = shared_catalog()
     gateway_config = getattr(ctx, "config", None)
     llm_config = getattr(gateway_config, "llm", None)
@@ -1118,7 +1199,7 @@ def _execution_budget(
         if configured_provider == provider_id
         else 0
     )
-    context_window, _ = resolve_effective_context_window(
+    context_window, context_window_source = resolve_effective_context_window(
         catalog,
         model,
         provider=provider_id,
@@ -1127,30 +1208,57 @@ def _execution_budget(
     provider_output_limit = int(
         catalog.resolve_max_tokens(model, user_override=0, provider=provider_id) or 0
     )
+    resolve_limits = getattr(catalog, "resolve_deployment_limits", None)
+    if (provider is not None or deployment is not None) and callable(resolve_limits):
+        connection = deployment or provider_connection_config(provider)
+        limits = resolve_limits(
+            model, provider=provider_id, api_key=connection.api_key,
+            base_url=connection.base_url,
+        )
+        provider_output_limit = limits.max_output_tokens
+        if context_window_source not in {"override", "config"}:
+            context_window = limits.context_window
+            context_window_source = (
+                "catalog" if getattr(limits, "context_window_known", True) else "default"
+            )
     output_tokens = min(
         DEFAULT_COMPACTION_OUTPUT_TOKENS,
         provider_output_limit or DEFAULT_COMPACTION_OUTPUT_TOKENS,
     )
-    derived_cap = ContextBudgetGovernor.from_values(
-        context_window_tokens=context_window,
-        max_output_tokens=output_tokens,
-        thinking_budget_tokens=0,
-        context_overflow_threshold=0.85,
-    ).snapshot().provider_request_max_chars
-    explicit_cap = (
-        int(getattr(llm_config, "provider_request_proof_max_chars", 0) or 0)
-        if configured_provider == provider_id
-        else 0
+    configured_output = (
+        int(getattr(llm_config, "max_tokens", 0) or 0)
+        if configured_provider == provider_id else 0
     )
-    request_max_chars = min(explicit_cap, derived_cap) if explicit_cap > 0 else derived_cap
-    return int(context_window), max(1, output_tokens), max(1, request_max_chars)
+    generation_tokens = (
+        catalog.resolve_max_tokens(model, user_override=configured_output, provider=provider_id)
+        if configured_output > 0 else provider_output_limit
+    )
+    return (
+        (
+            int(context_window)
+            if context_window_source != "default" or provider_id in LOCAL_RUNTIME_PROVIDERS
+            else 0
+        ),
+        max(1, output_tokens),
+        max(1, int(generation_tokens or output_tokens)),
+        _configured_request_char_cap(ctx, provider_id),
+    )
+
+
+def _configured_request_char_cap(ctx: object, provider_id: str) -> int:
+    llm_config = getattr(getattr(ctx, "config", None), "llm", None)
+    if _text(getattr(llm_config, "provider", None)).lower() != provider_id:
+        return 0
+    return max(0, int(getattr(llm_config, "provider_request_proof_max_chars", 0) or 0))
 
 
 def _consumer_execution_budget(
     ctx: object,
     provider_id: str,
     model: str,
-) -> tuple[int, int, int, int, int]:
+    *,
+    provider: object | None = None,
+) -> tuple[int, int, int, int, int, int, bool]:
     """Bind the durable consumer's window, output reserve, and wire cap."""
 
     catalog = shared_catalog()
@@ -1163,17 +1271,34 @@ def _consumer_execution_budget(
         if same_configured_provider
         else 0
     )
-    context_window, _ = resolve_effective_context_window(
+    context_window, context_window_source = resolve_effective_context_window(
         catalog,
         model,
         provider=provider_id,
         global_override=global_window,
     )
-    application_cap = int(
-        getattr(gateway_config, "context_budget_tokens", 0) or 0
+    deployment_output_limit: int | None = None
+    resolve_limits = getattr(catalog, "resolve_deployment_limits", None)
+    if provider is not None and callable(resolve_limits):
+        connection = provider_connection_config(provider)
+        limits = resolve_limits(
+            model, provider=provider_id, api_key=connection.api_key,
+            base_url=connection.base_url,
+        )
+        deployment_output_limit = limits.max_output_tokens
+        if context_window_source not in {"override", "config"}:
+            context_window = limits.context_window
+            context_window_source = (
+                "catalog" if getattr(limits, "context_window_known", True) else "default"
+            )
+    context_window_known = (
+        context_window_source != "default" or provider_id in LOCAL_RUNTIME_PROVIDERS
     )
-    if application_cap > 0:
-        context_window = min(int(context_window), application_cap)
+    # The retired context_budget_tokens never overrides physical capacity.
+    # An omitted contextWindowTokens follows the exact consumer deployment.
+    # The application may still pass an explicit smaller history target through
+    # ``limit_gateway_consumer_budget``.
+    history_window = int(context_window)
 
     configured_output = (
         int(getattr(llm_config, "max_tokens", 0) or 0)
@@ -1188,29 +1313,45 @@ def _consumer_execution_budget(
         )
         or 0
     )
-    output_tokens = max(1, min(output_tokens or 1, max(1, int(context_window) - 1)))
+    output_tokens = max(1, output_tokens)
+    if configured_output <= 0 and deployment_output_limit is not None:
+        output_tokens = max(1, deployment_output_limit)
     thinking_budget_tokens = _configured_thinking_reserve_tokens(llm_config)
+    explicit_cap = _configured_request_char_cap(ctx, provider_id)
+    config = ChatConfig(
+        max_tokens=output_tokens,
+        provider_context_window_tokens=(
+            max(1, int(context_window)) if context_window_known else 0
+        ),
+        thinking=thinking_budget_tokens > 0,
+        thinking_budget_tokens=thinking_budget_tokens,
+        thinking_level=getattr(llm_config, "thinking", None),
+        provider_request_max_chars=explicit_cap,
+        provider_request_max_chars_explicit_cap=explicit_cap,
+    )
+    projection = project_provider_final_request(provider, [], [], config)
+    output_tokens = (
+        projected_generation_budget(projection.payload, config.max_tokens)
+        if projection is not None else output_tokens + thinking_budget_tokens
+    )
     derived_cap = ContextBudgetGovernor.from_values(
         context_window_tokens=context_window,
         max_output_tokens=output_tokens,
-        thinking_budget_tokens=thinking_budget_tokens,
+        thinking_budget_tokens=0,
         context_overflow_threshold=0.85,
     ).snapshot().provider_request_max_chars
-    explicit_cap = (
-        int(getattr(llm_config, "provider_request_proof_max_chars", 0) or 0)
-        if same_configured_provider
-        else 0
-    )
-    request_max_chars = min(explicit_cap, derived_cap) if explicit_cap > 0 else derived_cap
+    request_max_chars = min(explicit_cap or derived_cap, history_window * 4)
     next_request_reserve_tokens = _manual_next_request_reserve_tokens(
-        int(context_window)
+        history_window
     )
     return (
+        max(1, history_window),
         max(1, int(context_window)),
         output_tokens,
         max(1, int(request_max_chars)),
         next_request_reserve_tokens,
         next_request_reserve_tokens * 4,
+        context_window_known,
     )
 
 
@@ -1246,6 +1387,7 @@ def _manual_consumer_messages(
     """Rebuild the provider-visible durable portion of the next request."""
 
     from opensquilla.engine.history import (
+        AssistantReplayError,
         reconstruct_messages_from_entry,
         repair_tool_pairing,
     )
@@ -1259,19 +1401,24 @@ def _manual_consumer_messages(
     for entry in kept_entries:
         if not isinstance(entry, dict):
             return None
-        history.extend(
-            reconstruct_messages_from_entry(
+        try:
+            replay_messages = reconstruct_messages_from_entry(
                 _text(entry.get("role")),
                 entry.get("content") or "",
                 entry.get("tool_calls"),
                 entry.get("reasoning_content"),
+                assistant_replay=entry.get("assistant_replay"),
                 turn_context=(
                     entry.get("turn_context")
                     if isinstance(entry.get("turn_context"), dict)
                     else None
                 ),
             )
-        )
+        except AssistantReplayError:
+            # Unknown or malformed native state cannot be proved by falling
+            # back to a smaller display aggregate. No private payload is logged.
+            return None
+        history.extend(replay_messages)
     history, _ = sanitize_session_messages(history)
     history, _ = project_historical_tool_payloads(
         history,

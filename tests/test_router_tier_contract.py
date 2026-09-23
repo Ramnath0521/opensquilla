@@ -10,13 +10,17 @@ from types import SimpleNamespace
 
 import pytest
 
-from opensquilla.context_budget import CHARS_PER_TOKEN, ContextBudgetGovernor
+from opensquilla.context_budget import ContextBudgetGovernor
 from opensquilla.engine.capacity_admission import (
     LargeContextCapacityError,
+    assess_model_request_capacity,
     model_has_request_capacity,
 )
 from opensquilla.engine.routing import RoutingDecision
-from opensquilla.engine.selector_override import apply_model_override
+from opensquilla.engine.selector_override import (
+    apply_model_override,
+    require_current_selector_capacity,
+)
 from opensquilla.engine.steps.squilla_router import (
     _apply_provider_mismatch_veto,
     _flag_tier_provider_mismatch,
@@ -24,10 +28,14 @@ from opensquilla.engine.steps.squilla_router import (
 from opensquilla.gateway.config import GatewayConfig
 from opensquilla.onboarding.mutations import (
     _cross_provider_tier_warnings,
-    _router_provider_conflicts,
     upsert_router,
 )
+from opensquilla.onboarding.router_policy import router_provider_conflicts
 from opensquilla.provider.model_catalog import DeploymentModelLimits, ModelCatalog
+from opensquilla.provider.request_proof import (
+    effective_proof_token_budget,
+    project_provider_payload,
+)
 from opensquilla.provider.selector import ModelSelector, ProviderConfig, SelectorConfig
 from opensquilla.router_tiers import (
     STATIC_B5_PROFILES,
@@ -54,6 +62,15 @@ def test_selection_mode_metadata_has_one_canonical_profile_owner() -> None:
     assert tokenrhythm is STATIC_B5_PROFILES["static_tokenrhythm_b5"]
     assert openrouter is not None and openrouter.provider_id == "openrouter"
     assert tokenrhythm is not None and tokenrhythm.provider_id == "tokenrhythm"
+    assert tokenrhythm.proposer_models == (
+        "deepseek-flash",
+        "glm-5.3-flash",
+        "qwen3.8-flash",
+        "qwen3.8-max",
+    )
+    assert tokenrhythm.aggregator_model == "deepseek-flash"
+    assert openrouter.thinking_level == "high"
+    assert tokenrhythm.thinking_level == "high"
     assert openrouter.ownership_role == "static_profile"
     assert tokenrhythm.api_key_env == "TOKENRHYTHM_API_KEY"
 
@@ -494,16 +511,14 @@ def test_global_fixed_lineup_suppresses_provider_switch_conflicts_and_warnings()
         },
     )
 
-    assert _router_provider_conflicts(config, "tokenrhythm") == ("openai",)
+    assert router_provider_conflicts(config, "tokenrhythm") == ()
     warnings = _cross_provider_tier_warnings(
         tiers,
         "deepseek",
         shared_selection_mode="static_openrouter_b5",
         ensemble_globally_enabled=True,
     )
-    assert len(warnings) == 1
-    assert "image_model" in warnings[0]
-    assert "openai" in warnings[0]
+    assert warnings == []
 
 
 # ---------------------------------------------------------------------------
@@ -808,13 +823,13 @@ def test_capacity_admission_reserves_actual_high_thinking_budget(monkeypatch) ->
     assert model_has_request_capacity(
         provider="openai",
         model="reasoning-model",
-        material_tokens=60_000,
+        material_tokens=75_000,
         thinking_budget_tokens=4_096,
     )
     assert not model_has_request_capacity(
         provider="openai",
         model="reasoning-model",
-        material_tokens=60_000,
+        material_tokens=75_000,
         thinking_budget_tokens=20_000,
     )
 
@@ -832,14 +847,13 @@ def test_complete_request_capacity_boundary_and_unknown_model_fail_closed(
         }
     )
     monkeypatch.setattr("opensquilla.provider.model_catalog._shared_catalog", catalog)
-    safe_input_tokens = (
+    safe_input_tokens, _headroom = effective_proof_token_budget(
         ContextBudgetGovernor.from_values(
             context_window_tokens=32_000,
             max_output_tokens=4_000,
             thinking_budget_tokens=0,
             context_overflow_threshold=0.85,
-        ).snapshot().provider_request_max_chars
-        // CHARS_PER_TOKEN
+        ).snapshot().usable_tokens
     )
 
     assert model_has_request_capacity(
@@ -863,6 +877,87 @@ def test_complete_request_capacity_boundary_and_unknown_model_fail_closed(
         request_input_tokens=1,
         thinking_budget_tokens=0,
     )
+
+
+def test_capacity_assessment_distinguishes_unknown_from_recoverable_pressure(monkeypatch) -> None:
+    catalog = ModelCatalog()
+    catalog.set_user_overrides({
+        "openai/known": {"context_window": 32_000, "max_output_tokens": 4_000},
+    })
+    monkeypatch.setattr("opensquilla.provider.model_catalog._shared_catalog", catalog)
+    known = assess_model_request_capacity(
+        provider="openai", model="known", material_tokens=1,
+        request_input_tokens=100_000, thinking_budget_tokens=0,
+        provider_request_proof_max_chars=10,
+    )
+    unknown = assess_model_request_capacity(
+        provider="custom", model="not-catalogued", material_tokens=1,
+        request_input_tokens=100_000, thinking_budget_tokens=0,
+    )
+    assert known.status == "known_capacity_request_too_large"
+    assert known.safe_input_tokens is not None and known.safe_input_tokens > 10_000
+    assert unknown.status == "capacity_unknown"
+    assert unknown.safe_input_tokens is None
+
+
+@pytest.mark.parametrize("changed_field", [None, "model", "base_url", "api_key", "extra_body"])
+@pytest.mark.parametrize("explicit_override", [False, True])
+def test_attachment_capacity_retry_pins_deployment_and_blocks_execution_until_readmitted(
+    monkeypatch, changed_field: str | None, explicit_override: bool,
+) -> None:
+    catalog = ModelCatalog()
+    catalog.set_user_overrides({
+        "openai/known": {"context_window": 32_000, "max_output_tokens": 4_000},
+        "openai/other": {"context_window": 128_000, "max_output_tokens": 4_000},
+    })
+    monkeypatch.setattr("opensquilla.provider.model_catalog._shared_catalog", catalog)
+    selector = ModelSelector(SelectorConfig(
+        primary=ProviderConfig("openai", "known", api_key="synthetic-key"),
+        fallbacks=[ProviderConfig("openai", "other", api_key="synthetic-key")],
+    ))
+    metadata = {
+        "routing_applied": True,
+        "routed_model": "known",
+        "router_fallback_chain": [{"tier": "c1", "model": "other"}],
+        "large_context_capacity_required": True,
+        "large_context_request_input_tokens": 50_000,
+        "large_context_history_tokens": 49_000,
+        "large_context_thinking_budget_tokens": 0,
+        "large_context_capacity_retry_pending": True,
+        "large_context_capacity_provisional_provider": "openai",
+        "large_context_capacity_provisional_model": "known",
+    }
+    apply_model_override(selector, "known", turn_metadata=metadata, realign_routed_model=False)
+    assert metadata["large_context_capacity_provisional_bound"] is True
+    assert len(selector.remaining_chain()) == 1
+    pending_metadata = dict(metadata)
+    with pytest.raises(LargeContextCapacityError):
+        require_current_selector_capacity(selector, pending_metadata, reason="Still pending.")
+
+    metadata["large_context_capacity_retry_pending"] = False
+    metadata["large_context_capacity_retry_attempted"] = True
+    metadata["large_context_request_input_tokens"] = 1_000
+
+    def readmit() -> None:
+        if explicit_override:
+            apply_model_override(
+                selector, selector.current_config.model, turn_metadata=metadata,
+                realign_routed_model=True, explicit_capacity_override=True,
+            )
+        else:
+            require_current_selector_capacity(
+                selector, metadata, reason="Must fit after compaction.",
+            )
+
+    if changed_field is not None:
+        setattr(selector.current_config, changed_field, {
+            "model": "other", "base_url": "https://other.example/v1",
+            "api_key": "different-synthetic-key", "extra_body": {"deployment": "other"},
+        }[changed_field])
+        with pytest.raises(LargeContextCapacityError):
+            readmit()
+    else:
+        readmit()
 
 
 def test_complete_attachment_request_filters_every_fallback_without_large_floor(
@@ -944,7 +1039,7 @@ def test_capacity_admission_honors_global_context_and_output_overrides(
     )
 
 
-def test_capacity_admission_honors_endpoint_and_explicit_proof_caps(
+def test_capacity_admission_honors_endpoint_and_defers_character_cap_to_final_proof(
     monkeypatch,
 ) -> None:
     catalog = ModelCatalog()
@@ -974,13 +1069,19 @@ def test_capacity_admission_honors_endpoint_and_explicit_proof_caps(
         thinking_budget_tokens=0,
         base_url="https://deployment.example/v1",
     )
-    assert not model_has_request_capacity(
+    assert model_has_request_capacity(
         provider="openai",
         model="endpoint-model",
         material_tokens=50_000,
         thinking_budget_tokens=0,
         provider_request_proof_max_chars=160_000,
     )
+    proof = project_provider_payload(
+        {"messages": [{"role": "user", "content": "x" * 160_001}]},
+        projection_adapter="openai", proof_budget=160_000, token_budget=170_000,
+    )
+    assert proof["fits_char_budget"] is False
+    assert proof["fits"] is False
 
 
 def test_large_context_fallback_rejects_model_at_high_thinking_budget(
@@ -1011,7 +1112,7 @@ def test_large_context_fallback_rejects_model_at_high_thinking_budget(
             {"tier": "c3", "model": "router-borderline"},
         ],
         "large_context_floor_min_tier": "c3",
-        "large_context_material_tokens": 60_000,
+        "large_context_material_tokens": 75_000,
         "large_context_thinking_budget_tokens": 20_000,
         "routed_model": "routed-at-floor",
     }
@@ -1613,26 +1714,93 @@ def test_cross_provider_warning_accepts_case_variant_profile_keys(monkeypatch) -
     assert warnings == []
 
 
-def test_upsert_router_surfaces_cross_provider_warning() -> None:
-    cfg = GatewayConfig()  # defaults: openrouter provider + openrouter tiers
+def test_upsert_router_surfaces_existing_cross_provider_warning() -> None:
+    # Maintaining an already-executable legacy ladder still reports its
+    # mismatch; newly introducing a foreign dependency requires consent.
+    tiers = {"c2": {"provider": "openai", "model": "gpt-5.5"}}
+    cfg = GatewayConfig(llm={"provider": "openrouter"})
+    cfg.squilla_router.tiers.update(tiers)
     res = upsert_router(
         cfg,
         mode="recommended",
-        tiers={"c2": {"provider": "openai", "model": "gpt-5.5"}},
+        tiers=tiers,
     )
     assert any("cross-provider" in w.lower() for w in res.warnings)
 
 
-def test_upsert_router_no_warning_for_matching_tiers() -> None:
+def test_upsert_router_no_cross_provider_warning_for_matching_tiers() -> None:
     cfg = GatewayConfig()
     res = upsert_router(cfg, mode="recommended")
-    assert res.warnings == []
+    assert len(res.warnings) == 1
+    assert "legacy image_model" in res.warnings[0]
+    assert "preserved for compatibility" in res.warnings[0]
+    assert "not used for image input" in res.warnings[0]
+    assert not any("cross-provider" in warning.lower() for warning in res.warnings)
+
+
+def test_upsert_router_model_override_keeps_omitted_vision_support_unknown() -> None:
+    cfg = GatewayConfig(llm={"provider": "openai", "model": "gpt-5.4-mini"})
+
+    res = upsert_router(
+        cfg,
+        mode="recommended",
+        tiers={"c2": {"provider": "openai", "model": "operator/custom-model"}},
+    )
+
+    tier = res.config.squilla_router.tiers["c2"]
+    assert tier["model"] == "operator/custom-model"
+    assert "supports_image" not in tier
+    assert res.config.squilla_router.preset_binding == "custom"
+
+    persisted = res.config.to_toml_dict()
+    persisted_tier = persisted["squilla_router"]["tiers"]["c2"]
+    assert "supports_image" not in persisted_tier
+    reloaded = GatewayConfig(**persisted)
+    assert "supports_image" not in reloaded.squilla_router.tiers["c2"]
+
+
+def test_upsert_router_explicit_false_vision_support_remains_authoritative() -> None:
+    cfg = GatewayConfig(llm={"provider": "openai", "model": "gpt-5.4-mini"})
+
+    res = upsert_router(
+        cfg,
+        mode="recommended",
+        tiers={
+            "c2": {
+                "provider": "openai",
+                "model": "operator/custom-model",
+                "supportsImage": False,
+            }
+        },
+    )
+
+    assert res.config.squilla_router.tiers["c2"]["supports_image"] is False
+    persisted = res.config.to_toml_dict()
+    assert persisted["squilla_router"]["tiers"]["c2"]["supports_image"] is False
+    reloaded = GatewayConfig(**persisted)
+    assert reloaded.squilla_router.tiers["c2"]["supports_image"] is False
+
+
+def test_synthesized_managed_preset_does_not_generate_negative_vision_claims() -> None:
+    cfg = GatewayConfig(
+        llm={"provider": "groq", "model": "llama-3.3-70b-versatile"}
+    )
+
+    res = upsert_router(cfg, mode="recommended")
+
+    for tier_name in ("c0", "c1", "c2", "c3"):
+        tier = res.config.squilla_router.tiers[tier_name]
+        assert tier["model"] == "llama-3.3-70b-versatile"
+        assert "supports_image" not in tier
+    persisted = res.config.to_toml_dict()
+    for tier_name in ("c0", "c1", "c2", "c3"):
+        assert "supports_image" not in persisted["squilla_router"]["tiers"][tier_name]
 
 
 def test_upsert_router_redacts_secret_like_tier_fields() -> None:
     # Tiers are untyped dicts: a hand-written api_key must not be echoed
     # back through the router-configure RPC response.
-    cfg = GatewayConfig()
+    cfg = GatewayConfig(llm={"provider": "openrouter"})
     res = upsert_router(
         cfg,
         mode="recommended",
@@ -1649,7 +1817,7 @@ def test_upsert_router_redacts_camel_and_kebab_tier_secrets() -> None:
     # Only three known display aliases are canonicalized on write, so an
     # apiKey/accessToken passes into the stored tier verbatim — the echo
     # redaction must match secret-shaped keys in any spelling.
-    cfg = GatewayConfig()
+    cfg = GatewayConfig(llm={"provider": "openrouter"})
     res = upsert_router(
         cfg,
         mode="recommended",
@@ -1676,7 +1844,7 @@ def test_upsert_router_redacts_camel_and_kebab_tier_secrets() -> None:
 def test_upsert_router_redacts_acronym_style_tier_secrets() -> None:
     # Acronym runs have no lowercase->uppercase boundary (APIKey, APIKEY):
     # the acronym rule and the separator-free fallback must still match.
-    cfg = GatewayConfig()
+    cfg = GatewayConfig(llm={"provider": "openrouter"})
     res = upsert_router(
         cfg,
         mode="recommended",

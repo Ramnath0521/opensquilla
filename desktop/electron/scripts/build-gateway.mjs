@@ -2,6 +2,7 @@ import { copyFileSync, cpSync, existsSync, mkdirSync, readdirSync, readFileSync,
 import { dirname, join, resolve, sep } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { spawnSync } from 'node:child_process'
+import { assertRouterIntegrity, gatewayInputs, writeGatewayBuildRecord } from './gateway-integrity.mjs'
 
 const scriptDir = dirname(fileURLToPath(import.meta.url))
 const packageRoot = resolve(scriptDir, '..')
@@ -18,6 +19,18 @@ const controlUiVerifier = join(repoRoot, 'opensquilla-webui', 'scripts', 'verify
 const routerBundleDir = join(repoRoot, 'src', 'opensquilla', 'squilla_router', 'models', 'v4.2_phase3_inference')
 const addDataSeparator = process.platform === 'win32' ? ';' : ':'
 const gitLfsPointerHeader = 'version https://git-lfs.github.com/spec/v1'
+const gatewayUvArgs = [
+  'run', '--locked', '--group', 'desktop-build',
+  '--extra', 'recommended', '--extra', 'mcp', '--extra', 'msg',
+  '--extra', 'matrix', '--extra', 'document-extras',
+]
+// PTY backends are imported lazily by the managed execution path, so
+// PyInstaller cannot discover them from the Python source graph.  Collect only
+// the backend for the current build platform: ptyprocess is pure Python on
+// POSIX, while winpty includes the pywinpty ConPTY extension on Windows.
+const ptyCollectionArgs = process.platform === 'win32'
+  ? ['--collect-all', 'winpty']
+  : ['--collect-all', 'ptyprocess']
 
 function findFilesByName(root, fileName) {
   const matches = []
@@ -117,7 +130,7 @@ function pythonPackageFile(packageName, relativePath) {
   ].join('\n')
   const result = spawnSync(
     'uv',
-    ['run', '--extra', 'recommended', 'python', '-c', code],
+    [...gatewayUvArgs, 'python', '-c', code],
     {
       cwd: repoRoot,
       env: {
@@ -286,10 +299,22 @@ function externalizeControlUiArtifact() {
 
 assertControlUiArtifactReady()
 assertRouterAssetsReady()
+assertRouterIntegrity(routerBundleDir)
+const buildInputs = gatewayInputs(repoRoot)
 
 rmSync(runtimeGatewayDir, { recursive: true, force: true })
 mkdirSync(runtimeGatewayDir, { recursive: true })
 mkdirSync(pyinstallerWorkDir, { recursive: true })
+
+const migrationRegistry = join(pyinstallerWorkDir, 'migration-registry', 'registry.json')
+const freezeRegistry = spawnSync('uv', [
+  ...gatewayUvArgs, 'python', join(repoRoot, 'scripts', 'freeze_migration_registry.py'),
+  '--migrations', join(repoRoot, 'migrations'), '--output', migrationRegistry,
+], { cwd: repoRoot, encoding: 'utf8', windowsHide: true })
+if (freezeRegistry.error) throw freezeRegistry.error
+if (freezeRegistry.status !== 0) {
+  throw new Error(`Migration registry build failed: ${freezeRegistry.stderr || freezeRegistry.stdout}`)
+}
 
 const lightgbmBinaryArgs = addBinaryArg(
   pythonPackageFile('lightgbm', platformLightgbmLibraryPath()),
@@ -300,19 +325,7 @@ const macOpenMpBinaryArgs = process.platform === 'darwin'
   : []
 
 const args = [
-  'run',
-  '--extra',
-  'recommended',
-  '--extra',
-  'mcp',
-  '--extra',
-  'msg',
-  '--extra',
-  'matrix',
-  '--extra',
-  'document-extras',
-  '--with',
-  'pyinstaller',
+  ...gatewayUvArgs,
   'pyinstaller',
   '--noconfirm',
   '--clean',
@@ -325,10 +338,21 @@ const args = [
   pyinstallerWorkDir,
   '--specpath',
   pyinstallerWorkDir,
+  ...ptyCollectionArgs,
   '--collect-all',
   'opensquilla',
   '--collect-all',
   'sqlite_vec',
+  // Tool search loads Unicode blocks through importlib.resources, outside
+  // PyInstaller's static import discovery of the anyascii._data subpackage.
+  '--collect-all',
+  'anyascii',
+  // Generic authoring code imports these at runtime. Retired model tools no
+  // longer provide static imports for PyInstaller to discover.
+  '--collect-all',
+  'openpyxl',
+  '--collect-all',
+  'reportlab',
   '--collect-data',
   'certifi',
   '--hidden-import',
@@ -343,6 +367,17 @@ const args = [
   'lightgbm',
   '--copy-metadata',
   'yoyo-migrations',
+  // Preserve upstream LICENSE/AUTHORS files in the frozen runtime too.
+  '--copy-metadata',
+  'sqlalchemy',
+  '--copy-metadata',
+  'websockets',
+  // The MCP SDK's HTTP stack reads distribution versions during import.
+  // OTel entry points are collected by the locked upstream opentelemetry hook.
+  '--copy-metadata',
+  'httpx2',
+  '--copy-metadata',
+  'httpcore2',
   '--hidden-import',
   'joblib',
   '--hidden-import',
@@ -371,6 +406,8 @@ const args = [
   caRuntimeHookPath,
   '--add-data',
   `${join(repoRoot, 'migrations')}${addDataSeparator}opensquilla/_migrations`,
+  '--add-data',
+  `${migrationRegistry}${addDataSeparator}opensquilla/_migrations`,
   ...lightgbmBinaryArgs,
   ...macOpenMpBinaryArgs,
   entryPath,
@@ -396,3 +433,12 @@ if (result.status !== 0) {
 
 patchMacLightgbmRuntime()
 externalizeControlUiArtifact()
+const dependencyInventory = spawnSync('uv', [
+  ...gatewayUvArgs, 'python', join(repoRoot, 'scripts', 'release_dependency_inventory.py'),
+  '--repo', repoRoot, '--kind', 'pyinstaller',
+  '--analysis', join(pyinstallerWorkDir, 'opensquilla-gateway', 'Analysis-00.toc'),
+  '--output', join(runtimeGatewayDir, 'dependency-inventory.json'),
+], { cwd: repoRoot, stdio: 'inherit', windowsHide: true })
+if (dependencyInventory.error) throw dependencyInventory.error
+if (dependencyInventory.status !== 0) process.exit(dependencyInventory.status ?? 1)
+writeGatewayBuildRecord(repoRoot, runtimeGatewayDir, buildInputs)

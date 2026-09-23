@@ -452,6 +452,98 @@ def test_live_turn_snapshot_is_replaced_by_the_next_task_and_cleared_on_terminal
     assert terminal_snapshot.current_stream_seq == registry.current_seq(session_key)
 
 
+def test_standalone_compaction_does_not_enter_next_turn_activity(monkeypatch) -> None:
+    registry = SessionStreamRegistry()
+    session_key = "agent:main:standalone-compaction"
+    clock = iter((1_000, 1_100, 240_000, 260_157))
+    monkeypatch.setattr(session_streams, "_epoch_time_ms", lambda: next(clock))
+
+    for status in ("started", "completed"):
+        registry.record(
+            session_key,
+            "session.event.compaction",
+            {"compaction_id": "manual-1", "status": status, "source": "manual"},
+        )
+    assert registry.live_snapshot(session_key).events == []
+
+    registry.record(
+        session_key,
+        "session.event.provider_activity",
+        {"task_id": "task-next", "turn_id": "task-next", "phase": "requesting"},
+    )
+    live = registry.live_snapshot(session_key)
+    assert live.task_id == "task-next"
+    assert [event.event_name for event in live.events] == ["session.event.provider_activity"]
+
+    registry.record(
+        session_key,
+        "session.event.done",
+        {"task_id": "task-next", "turn_id": "task-next"},
+    )
+    snapshot = registry.take_terminal_activity_snapshot(
+        session_key, "task-next", turn_id="task-next"
+    )
+    assert snapshot is not None
+    assert [entry["type"] for entry in snapshot["entries"]] == ["phase"]
+    assert snapshot["entries"][0]["at"] == 240_000
+    assert snapshot["entries"][0]["ended_at"] == 260_157
+    assert len(registry.replay(session_key, 0).events) == 4
+
+
+def test_compaction_during_a_turn_remains_in_its_activity() -> None:
+    registry = SessionStreamRegistry()
+    session_key = "agent:main:in-turn-compaction"
+    registry.record(
+        session_key,
+        "session.event.provider_activity",
+        {"task_id": "task-active", "turn_id": "task-active", "phase": "requesting"},
+    )
+    registry.record(
+        session_key,
+        "session.event.compaction",
+        {"compaction_id": "automatic-1", "status": "completed", "source": "automatic"},
+    )
+    registry.record(
+        session_key,
+        "session.event.done",
+        {"task_id": "task-active", "turn_id": "task-active"},
+    )
+
+    snapshot = registry.take_terminal_activity_snapshot(
+        session_key, "task-active", turn_id="task-active"
+    )
+    assert snapshot is not None
+    assert [entry["type"] for entry in snapshot["entries"]] == [
+        "phase", "maintenance",
+    ]
+
+
+def test_manual_compaction_queued_behind_turn_is_not_its_durable_activity() -> None:
+    registry = SessionStreamRegistry()
+    key = "agent:main:manual-during-turn"
+    registry.record(key, "session.event.provider_activity", {
+        "task_id": "active", "turn_id": "active", "phase": "requesting",
+    })
+    registry.record(key, "session.event.compaction", {
+        "compaction_id": "manual-queued", "source": "manual", "status": "started",
+    })
+    registry.record(key, "session.event.done", {"task_id": "active", "turn_id": "active"})
+
+    terminal = registry.take_terminal_activity_snapshot(key, "active", turn_id="active")
+
+    assert terminal is not None
+    assert [entry["type"] for entry in terminal["entries"]] == ["phase"]
+    maintenance = registry.live_snapshot(key)
+    assert maintenance.task_id is None
+    assert [event.payload["compaction_id"] for event in maintenance.events] == ["manual-queued"]
+    registry.record(key, "session.event.compaction", {
+        "compaction_id": "manual-queued", "source": "manual", "status": "failed",
+    })
+    assert registry.live_snapshot(key).events == []
+    assert [event.payload["status"] for event in registry.replay(key, 0).events
+            if event.event_name == "session.event.compaction"] == ["started", "failed"]
+
+
 def test_turn_committed_replays_without_reopening_or_clearing_successors() -> None:
     session_key = "agent:main:durable-terminal"
     registry = SessionStreamRegistry(max_events_per_session=10)
@@ -846,7 +938,11 @@ def test_live_turn_snapshot_preserves_active_compaction_state() -> None:
 def test_provider_activity_pulses_are_lossy_in_replay_but_keep_phase_boundaries() -> None:
     registry = SessionStreamRegistry(max_events_per_session=2)
     session_key = "agent:main:provider-activity"
-    common = {"task_id": "task-live", "activity_id": "activity-1"}
+    common = {
+        "task_id": "task-live",
+        "activity_id": "activity-1",
+        "model": "deepseek-v4-pro",
+    }
     registry.record(
         session_key,
         "session.event.provider_activity",
@@ -872,6 +968,10 @@ def test_provider_activity_pulses_are_lossy_in_replay_but_keep_phase_boundaries(
     assert [event.payload["phase"] for event in replay.events] == [
         "requesting",
         "reasoning",
+    ]
+    assert [event.payload["model"] for event in replay.events] == [
+        "deepseek-v4-pro",
+        "deepseek-v4-pro",
     ]
     assert all(event.payload.get("heartbeat") is not True for event in replay.events)
 
@@ -908,6 +1008,61 @@ def test_reset_session_streams_starts_a_fresh_embedded_gateway_generation() -> N
         assert first.current_seq("agent:main:test") == 1
     finally:
         reset_session_streams()
+
+
+def test_restart_does_not_restore_old_manual_compaction_progress() -> None:
+    try:
+        first = reset_session_streams(stream_generation="maintenance-generation-a")
+        key = "agent:main:manual-restart"
+        first.record(key, "session.event.compaction", {
+            "source": "manual", "status": "started", "compaction_id": "interrupted",
+        })
+        second = reset_session_streams(stream_generation="maintenance-generation-b")
+
+        replay = second.replay(key, first.current_seq(key), first.stream_generation)
+
+        assert replay.replay_complete is False
+        assert replay.gap_reason == "stream_generation_changed"
+        assert replay.events == []
+        assert second.live_snapshot(key).events == []
+        assert second.live_snapshot(key).task_id is None
+    finally:
+        reset_session_streams()
+
+
+def test_reset_epoch_retires_manual_snapshots_and_rejects_late_old_progress() -> None:
+    registry = SessionStreamRegistry()
+    key = "agent:main:manual-epoch"
+    old = {"source": "manual", "compaction_id": "old", "epoch": 2}
+    registry.record(key, "session.event.compaction", {**old, "status": "started"})
+
+    registry.advance_session_epoch(key, 3)
+    registry.record(key, "session.event.compaction", {**old, "status": "observed"})
+
+    assert registry.live_snapshot(key).events == []
+    current = {"source": "manual", "compaction_id": "new", "epoch": 3}
+    registry.record(key, "session.event.compaction", {**current, "status": "started"})
+    registry.record(key, "session.event.compaction", {**old, "status": "failed"})
+    assert [event.payload["compaction_id"]
+            for event in registry.live_snapshot(key).events] == ["new"]
+    registry.evict(key)
+    assert registry.live_snapshot(key).events == []
+
+
+def test_manual_snapshot_is_bounded_across_ids_and_repeated_heartbeats() -> None:
+    registry = SessionStreamRegistry(max_events_per_session=2)
+    key = "agent:main:manual-bounded"
+    for operation in range(3):
+        payload = {"source": "manual", "compaction_id": str(operation)}
+        registry.record(key, "session.event.compaction", {**payload, "status": "started"})
+        for _ in range(20):
+            registry.record(key, "session.event.compaction", {
+                **payload, "status": "observed", "heartbeat": True,
+            })
+
+    events = registry.live_snapshot(key).events
+    assert len(events) == 4
+    assert {event.payload["compaction_id"] for event in events} == {"1", "2"}
 
 
 def test_terminal_handoff_retains_only_sanitized_v2_and_is_single_use() -> None:

@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import base64
 import json
+import logging
 import os
 import re
 import subprocess
@@ -20,6 +21,8 @@ from pathlib import Path, PureWindowsPath
 from typing import Any
 
 from opensquilla.sandbox.runtime_launcher import ChildRole, internal_child_argv
+
+log = logging.getLogger(__name__)
 
 HELPER_MODULE = "opensquilla.sandbox.backend.windows_default_runner"
 _LOCK_ACQUIRE_TIMEOUT_S = 30.0
@@ -77,6 +80,7 @@ SEM_NOOPENFILEERRORBOX = 0x8000
 OFFLINE_PAYLOAD_ENV = "OPENSQUILLA_WINDOWS_DEFAULT_PAYLOAD"
 OFFLINE_PAYLOAD_STDIN_ARG = "--payload-stdin"
 HELPER_ERROR_PREFIX = "OPENSQUILLA_WINDOWS_DEFAULT_HELPER_ERROR "
+HELPER_TIMEOUT_PREFIX = b"\nOPENSQUILLA_WINDOWS_DEFAULT_HELPER_TIMEOUT "
 _ICMP_TOOL_NAMES = frozenset(
     {
         "ping",
@@ -170,6 +174,18 @@ def _emit_helper_error(payload: HelperPayload | None, message: str) -> None:
         print(f"{HELPER_ERROR_PREFIX}{encoded}", file=sys.stderr)
         return
     print(message, file=sys.stderr)
+
+
+def _emit_helper_timeout(payload: HelperPayload) -> None:
+    if not payload.helper_nonce:
+        return
+    encoded = json.dumps(
+        {"nonce": payload.helper_nonce, "timed_out": True},
+        ensure_ascii=True,
+        separators=(",", ":"),
+    ).encode("ascii")
+    sys.stderr.buffer.write(HELPER_TIMEOUT_PREFIX + encoded + b"\n")
+    sys.stderr.buffer.flush()
 
 
 def _parse_payload(args: Sequence[str]) -> HelperPayload:
@@ -451,9 +467,7 @@ def _windows_acl_plan(policy: dict[str, Any]) -> dict[str, Any]:
         raise SystemExit("invalid windows_default policy: grantCurrentUserAccess must be boolean")
     revalidate_deny_acl = plan.get("revalidateDenyAcl", True)
     if not isinstance(revalidate_deny_acl, bool):
-        raise SystemExit(
-            "invalid windows_default policy: revalidateDenyAcl must be boolean"
-        )
+        raise SystemExit("invalid windows_default policy: revalidateDenyAcl must be boolean")
     state_path = _trusted_deny_acl_state_path(plan)
     return {
         **plan,
@@ -633,11 +647,7 @@ def _deny_ace_entries_match_expected(
 ) -> bool:
     managed_mask = _canonical_acl_mask(MANAGED_DENY_MASK)
     expected = _canonical_acl_mask(expected_mask) & managed_mask
-    inheritance_bits = (
-        OBJECT_INHERIT_ACE_FLAG
-        | CONTAINER_INHERIT_ACE_FLAG
-        | INHERIT_ONLY_ACE_FLAG
-    )
+    inheritance_bits = OBJECT_INHERIT_ACE_FLAG | CONTAINER_INHERIT_ACE_FLAG | INHERIT_ONLY_ACE_FLAG
     actual_flags: list[int] = []
     for mask, flags in ace_entries:
         managed = _canonical_acl_mask(mask) & managed_mask
@@ -1391,6 +1401,7 @@ def _deny_path_to_sid_native(
     TRUSTEE_IS_UNKNOWN = 0
     ACCESS_DENIED_ACE_TYPE = 1
     INHERITED_ACE = 0x10
+
     def win32_error(label: str, code: int | None = None) -> OSError:
         error_code = ctypes.get_last_error() if code is None else code
         return OSError(error_code, f"{label} failed: {ctypes.FormatError(error_code)}")
@@ -1461,9 +1472,7 @@ def _deny_path_to_sid_native(
             explicit = EXPLICIT_ACCESS_W()
             explicit.grfAccessPermissions = mask
             explicit.grfAccessMode = DENY_ACCESS
-            explicit.grfInheritance = (
-                OBJECT_INHERIT_ACE_FLAG | CONTAINER_INHERIT_ACE_FLAG
-            )
+            explicit.grfInheritance = OBJECT_INHERIT_ACE_FLAG | CONTAINER_INHERIT_ACE_FLAG
             explicit.Trustee.pMultipleTrustee = None
             explicit.Trustee.MultipleTrusteeOperation = 0
             explicit.Trustee.TrusteeForm = TRUSTEE_IS_SID
@@ -1529,12 +1538,61 @@ def _payload_to_json(payload: HelperPayload) -> str:
 
 
 def _helper_import_root() -> Path:
-    path = Path(__file__).resolve()
-    package_root = path.parents[2]
-    import_root = package_root.parent
-    if (import_root / "opensquilla").exists():
-        return import_root
-    return Path.cwd()
+    """Return an existing runtime root suitable for the offline helper.
+
+    The Gateway can outlive the checkout or unpacked runtime that launched it.
+    Passing that vanished directory as ``lpCurrentDirectory`` makes
+    ``CreateProcessWithLogonW`` fail with Win32 error 267.  Never fall back to
+    the inherited process cwd; it is not an owned runtime location.
+    """
+
+    candidates: list[Path] = []
+    meipass = getattr(sys, "_MEIPASS", None)
+    if isinstance(meipass, str) and meipass.strip():
+        candidates.append(Path(meipass))
+
+    try:
+        path = Path(__file__).resolve(strict=True)
+    except (OSError, RuntimeError, ValueError):
+        path = Path(__file__)
+    if len(path.parents) >= 3:
+        # Source checkouts expose ``opensquilla`` below ``src``; one-dir
+        # frozen builds expose it below ``_internal``.  Keep both the package
+        # import root and its parent as candidates, but validate each one.
+        candidates.extend((path.parents[2], path.parents[2].parent))
+
+    try:
+        executable_parent = Path(sys.executable).resolve(strict=True).parent
+    except (OSError, RuntimeError, ValueError):
+        executable_parent = Path(sys.executable).parent
+    candidates.extend((executable_parent, executable_parent / "_internal"))
+
+    seen: set[str] = set()
+    rejected: list[str] = []
+    for candidate in candidates:
+        try:
+            resolved = candidate.expanduser().resolve(strict=True)
+        except (OSError, RuntimeError, ValueError) as exc:
+            rejected.append(f"{candidate}: {exc}")
+            continue
+        key = str(resolved).casefold()
+        if key in seen:
+            continue
+        seen.add(key)
+        if not resolved.is_dir():
+            rejected.append(f"{resolved}: not a directory")
+            continue
+        if not (resolved / "opensquilla").is_dir():
+            rejected.append(f"{resolved}: opensquilla package is missing")
+            continue
+        log.debug(
+            "sandbox.windows_default_helper_root: root=%s provenance=validated_package_root",
+            resolved,
+        )
+        return resolved
+
+    detail = "; ".join(rejected[-4:]) or "no runtime candidates were discovered"
+    raise RuntimeError(f"helper_root_unavailable: {detail}")
 
 
 def _helper_child_env() -> dict[str, str]:
@@ -1616,9 +1674,7 @@ def _sync_allow_acl_state(
             Path(item["path"]).expanduser().absolute(): item["access"]
             for item in principals.get(sid, [])
         }
-        previous_by_key = {
-            _acl_path_key(path): (path, access) for path, access in previous.items()
-        }
+        previous_by_key = {_acl_path_key(path): (path, access) for path, access in previous.items()}
         desired_by_key = {
             _acl_path_key(path): (path, access) for path, access in normalized.items()
         }
@@ -1635,9 +1691,7 @@ def _sync_allow_acl_state(
         # RWX is still revoked so the trusted offline bootstrap process never
         # accumulates write authority.
         effective_by_key = {**retained_read, **desired_by_key}
-        if {
-            key: access for key, (_path, access) in previous_by_key.items()
-        } == {
+        if {key: access for key, (_path, access) in previous_by_key.items()} == {
             key: access for key, (_path, access) in effective_by_key.items()
         }:
             return
@@ -1655,16 +1709,11 @@ def _sync_allow_acl_state(
                 if old is None or old[1] != access:
                     _grant_path_to_sid(path, access, sid)
             for key, (path, _access) in previous_by_key.items():
-                if (
-                    key not in desired_by_key
-                    and previous_by_key[key][1] == "RWX"
-                    and path.exists()
-                ):
+                if key not in desired_by_key and previous_by_key[key][1] == "RWX" and path.exists():
                     _revoke_allow_path_for_sid(path, sid)
             updated = dict(principals)
             updated[sid] = [
-                {"access": access, "path": str(path)}
-                for path, access in effective_by_key.values()
+                {"access": access, "path": str(path)} for path, access in effective_by_key.values()
             ]
             _write_deny_acl_state(state_path, {"version": 1, "principals": updated})
             _clear_acl_state_taint(state_path)
@@ -1772,9 +1821,7 @@ def _sync_deny_acl_state_locked(
     principals: dict[str, list[dict[str, object]]] = {}
     for principal_sid, entries in stored_principals.items():
         live_entries = [
-            item
-            for item in entries
-            if Path(str(item["path"])).expanduser().absolute().exists()
+            item for item in entries if Path(str(item["path"])).expanduser().absolute().exists()
         ]
         if live_entries:
             principals[principal_sid] = live_entries
@@ -1784,9 +1831,9 @@ def _sync_deny_acl_state_locked(
     desired_by_key = {
         _acl_path_key(path): (path, mask) for path, mask in normalized_desired.items()
     }
-    if {
-        key: mask for key, (_path, mask) in previous_by_key.items()
-    } == {key: mask for key, (_path, mask) in desired_by_key.items()}:
+    if {key: mask for key, (_path, mask) in previous_by_key.items()} == {
+        key: mask for key, (_path, mask) in desired_by_key.items()
+    }:
         if revalidate_live:
             for path, mask in normalized_desired.items():
                 _deny_path_to_sid(
@@ -2524,9 +2571,7 @@ def _run_payload_as_offline_identity_native(
         ):
             raise win_error("SetInformationJobObject")
 
-        command_line = ctypes.create_unicode_buffer(
-            subprocess.list2cmdline(_offline_helper_argv())
-        )
+        command_line = ctypes.create_unicode_buffer(subprocess.list2cmdline(_offline_helper_argv()))
         child_env = _helper_child_env()
         env_block = ctypes.create_unicode_buffer(_environment_block(child_env))
         previous_error_mode = kernel32.SetErrorMode(_runner_error_mode_flags())
@@ -2620,6 +2665,8 @@ def _run_payload_as_offline_identity_native(
             raise wait_error
         sys.stdout.buffer.write(outputs["stdout"])
         sys.stderr.buffer.write(outputs["stderr"])
+        if wait_result == WAIT_TIMEOUT:
+            _emit_helper_timeout(payload)
         return exit_code
     finally:
         if process_info.hProcess and not job_assigned:
@@ -3363,6 +3410,8 @@ def _run_restricted_process_native_impl(
             raise wait_error
         sys.stdout.buffer.write(outputs["stdout"])
         sys.stderr.buffer.write(outputs["stderr"])
+        if wait_result == WAIT_TIMEOUT:
+            _emit_helper_timeout(payload)
         return exit_code
     finally:
         if process_info.hProcess and not job_assigned:

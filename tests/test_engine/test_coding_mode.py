@@ -8,10 +8,10 @@ from types import SimpleNamespace
 
 import pytest
 
+from opensquilla.application.app_settings import _SAFE_WRITE_PATCH_PATHS
 from opensquilla.engine.steps.coding_mode import enforce_coding_mode
-from opensquilla.engine.steps.skills_filter import _eligibility_ctx
+from opensquilla.engine.steps.skill_catalog_projection import _eligibility_ctx
 from opensquilla.gateway.config import GatewayConfig
-from opensquilla.gateway.rpc_config import _SAFE_WRITE_PATCH_PATHS
 from opensquilla.skills.eligibility import (
     CODING_MODE_SKILLS,
     effective_disabled,
@@ -61,9 +61,7 @@ class TestRuntimeToolContextCodingMode:
 
         async def capture_coding_mode() -> str:
             ctx = current_tool_context.get()
-            return json.dumps(
-                {"coding_mode": ctx.coding_mode if ctx is not None else None}
-            )
+            return json.dumps({"coding_mode": ctx.coding_mode if ctx is not None else None})
 
         registry = ToolRegistry()
         registry.register(
@@ -161,11 +159,18 @@ class TestRuntimeToolContextCodingMode:
         web_names = {tool.name for tool in web_defs}
 
         assert channel_names == web_names
-        assert "agents_list" in channel_names
+        assert channel_admin.authorized_tool_names == web_owner.authorized_tool_names
+        assert "agents_list" in (channel_admin.authorized_tool_names or frozenset())
+        assert "agents_list" not in channel_names
         assert "subagents" not in channel_admin.denied_tools
-        assert {"exec_command", "background_process", "process"} <= channel_names
+        authorized_names = set(channel_admin.authorized_tool_names or frozenset())
+        assert {"exec_command", "process"} <= authorized_names
         if coding_mode:
-            assert coding_mode_denied_tools(True).isdisjoint(channel_names)
+            assert coding_mode_denied_tools(True).isdisjoint(authorized_names)
+            assert "process" in channel_names
+        else:
+            assert "background_process" not in channel_names
+            assert "process" in channel_names
 
 
 class TestSkillsFilterGate:
@@ -184,6 +189,7 @@ class TestDirectiveInjection:
         # Deterministic, no subprocess: the directive's command line is the
         # resolved code-task invocation; pin it for these assertions.
         from opensquilla.engine.steps import coding_mode as _cm
+
         monkeypatch.setattr(
             _cm, "resolve_code_task_command", lambda: "/opt/x/opensquilla code-task"
         )
@@ -195,7 +201,7 @@ class TestDirectiveInjection:
             metadata={},
             tool_defs=[
                 SimpleNamespace(name=name)
-                for name in ("background_process", "exec_command", "process")
+                for name in ("exec_command", "process")
             ],
         )
 
@@ -211,7 +217,7 @@ class TestDirectiveInjection:
         assert ctx.metadata["coding_mode"] is True
 
     @pytest.mark.asyncio
-    @pytest.mark.parametrize("missing_tool", ["background_process", "exec_command", "process"])
+    @pytest.mark.parametrize("missing_tool", ["exec_command", "process"])
     async def test_on_skips_directive_and_pin_without_required_launch_tool(self, missing_tool):
         ctx = self._ctx(True)
         ctx.tool_defs = [tool for tool in ctx.tool_defs if tool.name != missing_tool]
@@ -245,26 +251,32 @@ class TestDirectiveInjection:
         assert "platform" in low and "styling" in low
 
     @pytest.mark.asyncio
-    async def test_directive_warns_against_killing_running_code_task(self):
-        """Isolation rule: the source repo stays empty until verified, so don't
-        judge progress by it and don't kill/retry a running code-task."""
+    async def test_directive_preserves_isolation_and_agent_choice(self):
+        """An empty source repo is expected during an isolated run, while the
+        agent still chooses when to wait or hand off and respects cancellation."""
         ctx = await enforce_coding_mode(self._ctx(True))
         _, suffix = ctx.system_prompt
         low = suffix.lower()
         assert "isolated run directory" in low
         assert "stays empty until" in low  # source empty until verified
         assert "do not judge progress by the source" in low
-        assert "do not kill" in low
+        assert "empty source repo alone is not a reason to cancel or restart" in low
+        assert "respect user cancellation" in low
+        assert "when your next step needs the result" in low
+        assert "finish the turn with an accurate pending status" in low
+        assert "will not resume this task automatically" in low
+        assert "do not kill" not in low
+        assert "just wait" not in low
         assert "status.json" in low
 
     @pytest.mark.asyncio
-    async def test_directive_mandates_background_not_blocking_exec(self):
+    async def test_directive_uses_unified_exec_handle(self):
         ctx = await enforce_coding_mode(self._ctx(True))
         _, suffix = ctx.system_prompt
         low = suffix.lower()
-        assert "always launch it with background_process" in low
-        assert "do not run code-task with a" in low and "blocking exec_command" in low
-        assert "600s" in suffix
+        assert "exec_command(yield_time_ms=0" in low
+        assert "execution_id" in low
+        assert "background_process" not in low
 
     @pytest.mark.asyncio
     async def test_directive_mandates_task_file_staging(self):
@@ -296,7 +308,7 @@ class TestDirectiveInjection:
         # exec_command(stdin=...) escape hatch that bypasses cmd.exe.
         assert "exec_command" in suffix
         assert "stdin=" in suffix
-        assert "background_process" in suffix
+        assert "background_process" not in suffix
         assert "code-task stage-task-file" in suffix
         # Packaged desktop gateways are not Python interpreters. The staging
         # recipe must therefore be a code-task subcommand, never
@@ -319,9 +331,7 @@ class TestDirectiveInjection:
         assert "del " in suffix and "rm " in suffix  # Windows + POSIX
 
     @pytest.mark.asyncio
-    async def test_directive_uses_codetask_stage_task_file_not_python_dash_c(
-        self, monkeypatch
-    ):
+    async def test_directive_uses_codetask_stage_task_file_not_python_dash_c(self, monkeypatch):
         """Packaged gateways are CLI binaries, not Python interpreters.
 
         A desktop build previously rendered the staging recipe as
@@ -330,6 +340,7 @@ class TestDirectiveInjection:
         verified code-task command prefix instead.
         """
         from opensquilla.engine.steps import coding_mode as _cm
+
         packaged_code_task = (
             "/Applications/OpenSquilla.app/Contents/Resources/runtime/"
             "gateway/opensquilla-gateway code-task"
@@ -376,10 +387,17 @@ class TestWriteToolDeny:
         assert coding_mode_denied_tools(False) == frozenset()
 
     def test_shell_and_read_tools_kept(self):
-        # shell stays so the agent can still LAUNCH code-task; reads stay.
+        # The unified exec surface stays so the agent can still LAUNCH
+        # code-task; reads stay.
         denied = coding_mode_denied_tools(True)
-        for t in ("exec_command", "background_process", "process",
-                  "read_file", "list_dir", "grep_search", "git_diff"):
+        for t in (
+            "exec_command",
+            "process",
+            "read_file",
+            "list_dir",
+            "grep_search",
+            "git_diff",
+        ):
             assert t not in denied
 
 
@@ -412,11 +430,17 @@ class TestWriteToolDenyEnforcement:
         }.isdisjoint(names)
 
     def test_on_keeps_codetask_launch_and_read_tools(self):
-        # shell stays so the agent can still LAUNCH `opensquilla code-task solve`;
+        # The unified exec surface stays so the agent can still LAUNCH
+        # `opensquilla code-task solve`;
         # read-only tools stay so it can understand the repo.
         names = self._surface(coding_mode_denied_tools(True))
-        for keep in ("exec_command", "background_process", "process",
-                     "read_file", "list_dir", "grep_search"):
+        for keep in (
+            "exec_command",
+            "process",
+            "read_file",
+            "list_dir",
+            "grep_search",
+        ):
             assert keep in names, keep
 
     def test_off_is_noop_keeps_write_tools(self):
@@ -485,6 +509,7 @@ class TestCodeTaskResolution:
 
     def test_prefers_adjacent_cli(self, monkeypatch, tmp_path):
         from opensquilla.engine.steps import coding_mode as cm
+
         cm._reset_resolution_cache()
         cli = tmp_path / "opensquilla"
         cli.write_text("")
@@ -496,6 +521,7 @@ class TestCodeTaskResolution:
 
     def test_falls_back_to_module_invocation(self, monkeypatch, tmp_path):
         from opensquilla.engine.steps import coding_mode as cm
+
         cm._reset_resolution_cache()
         py = str(tmp_path / "python")  # no adjacent opensquilla file exists
         monkeypatch.setattr(cm.sys, "executable", py)
@@ -509,6 +535,7 @@ class TestCodeTaskResolution:
 
     def test_adjacent_exists_but_preflight_fails_falls_through(self, monkeypatch, tmp_path):
         from opensquilla.engine.steps import coding_mode as cm
+
         cm._reset_resolution_cache()
         cli = tmp_path / "opensquilla"
         cli.write_text("")
@@ -526,21 +553,25 @@ class TestCodeTaskResolution:
 
     def test_failure_is_not_cached_retries(self, monkeypatch, tmp_path):
         from opensquilla.engine.steps import coding_mode as cm
+
         cm._reset_resolution_cache()
         py = str(tmp_path / "python")
         monkeypatch.setattr(cm.sys, "executable", py)
         monkeypatch.setattr(cm.shutil, "which", lambda name: None)
         available = {"ok": False}
+
         def flaky(argv):
             return available["ok"] and argv[:2] == [py, "-P"]
+
         monkeypatch.setattr(cm, "_runs_code_task", flaky)
-        assert cm.resolve_code_task_command() is None      # transient failure, NOT cached
+        assert cm.resolve_code_task_command() is None  # transient failure, NOT cached
         available["ok"] = True
         assert cm.resolve_code_task_command() is not None  # retried, resolves
         cm._reset_resolution_cache()
 
     def test_falls_back_to_path_which(self, monkeypatch, tmp_path):
         from opensquilla.engine.steps import coding_mode as cm
+
         cm._reset_resolution_cache()
         monkeypatch.setattr(cm.sys, "executable", str(tmp_path / "python"))
         monkeypatch.setattr(cm.shutil, "which", lambda name: "/usr/bin/opensquilla")
@@ -550,6 +581,7 @@ class TestCodeTaskResolution:
 
     def test_none_when_nothing_runs(self, monkeypatch, tmp_path):
         from opensquilla.engine.steps import coding_mode as cm
+
         cm._reset_resolution_cache()
         monkeypatch.setattr(cm.sys, "executable", str(tmp_path / "python"))
         monkeypatch.setattr(cm.shutil, "which", lambda name: None)
@@ -559,8 +591,10 @@ class TestCodeTaskResolution:
 
     def test_directive_uses_resolved_command_not_bare(self, monkeypatch):
         from opensquilla.engine.steps import coding_mode as cm
+
         monkeypatch.setattr(
-            cm, "resolve_code_task_command",
+            cm,
+            "resolve_code_task_command",
             lambda: "/opt/env/bin/python -P -m opensquilla.cli.main code-task",
         )
         d = cm._build_coding_mode_directive()
@@ -571,6 +605,7 @@ class TestCodeTaskResolution:
 
     def test_directive_fail_loud_when_unavailable(self, monkeypatch):
         from opensquilla.engine.steps import coding_mode as cm
+
         monkeypatch.setattr(cm, "resolve_code_task_command", lambda: None)
         d = cm._build_coding_mode_directive()
         assert "UNAVAILABLE" in d

@@ -113,7 +113,7 @@ async def open_stack(db_path: Path) -> AsyncIterator[WorkspaceStack]:
         principal=OWNER,
         config=GatewayConfig(
             workspace_dir=str(db_path.parent / "default-workspace"),
-            memory={"flush_enabled": False},
+            memory={},
             naming={"enabled": False},
         ),
         session_manager=manager,
@@ -172,6 +172,73 @@ def create_windows_junction(link: Path, target: Path) -> subprocess.CompletedPro
         text=True,
         check=False,
     )
+
+
+async def test_unicode_project_executes_tools_in_the_selected_directory(tmp_path: Path) -> None:
+    selected = tmp_path / "Cafe\u0301"
+    sibling = tmp_path / "Caf\u00e9"
+    selected.mkdir()
+    sibling.mkdir(exist_ok=True)
+    if selected.samefile(sibling):
+        pytest.skip("filesystem treats Unicode normalization variants as the same directory")
+    (selected / "marker.txt").write_text("selected directory", encoding="utf-8")
+    (sibling / "marker.txt").write_text("other directory", encoding="utf-8")
+    outcomes: dict[str, Any] = {}
+    completed = asyncio.Event()
+
+    class Runner:
+        async def run(
+            self, message: str, session_key: str, *,
+            expected_session_id: str | None = None,
+            expected_session_epoch: int | None = None,
+            **kwargs: Any,
+        ):
+            context = kwargs["tool_context"]
+            token = current_tool_context.set(context)
+            try:
+                outcomes["workspace"] = context.workspace_dir
+                outcomes["read"] = await fs.read_file("marker.txt")
+                await fs.write_file("result.txt", "written in selected directory")
+                yield DoneEvent()
+            except BaseException as exc:
+                outcomes["error"] = exc
+            finally:
+                current_tool_context.reset(token)
+                completed.set()
+
+    async with open_stack(tmp_path / "unicode-execution.db") as stack:
+        opened = await get_dispatcher().dispatch(
+            "open-unicode-project", "workspaces.open",
+            {"path": str(selected), "trusted": True}, stack.context,
+        )
+        assert opened.ok is True
+        stack.context.task_runtime = None
+        stack.context.turn_runner = Runner()
+        response = await get_dispatcher().dispatch(
+            "send-unicode-project", "sessions.send",
+            {
+                "key": "agent:main:webchat:unicode-project",
+                "message": "read and write in the selected project",
+                "intent": "new_chat",
+                "workspaceId": opened.payload["workspace"]["id"],
+                "clientRequestId": "unicode-project-request",
+                "_source": {
+                    "caller_kind": "web", "channel_kind": "webchat", "runMode": "full",
+                },
+            },
+            stack.context,
+        )
+        assert response.ok is True
+        await asyncio.wait_for(completed.wait(), timeout=10.0)
+        await await_direct_task("agent:main:webchat:unicode-project")
+        if "error" in outcomes:
+            raise outcomes["error"]
+
+    assert outcomes["workspace"] == str(selected.resolve())
+    assert "selected directory" in outcomes["read"]
+    assert (selected / "result.txt").read_text() == "written in selected directory"
+    assert not (sibling / "result.txt").exists()
+    assert (sibling / "marker.txt").read_text() == "other directory"
 
 
 @pytest.mark.asyncio
@@ -323,7 +390,17 @@ async def test_turn_tool_context_uses_project_directory(tmp_path: Path) -> None:
         ran = asyncio.Event()
 
         class Runner:
-            async def run(self, message: str, session_key: str, **kwargs: Any):
+            async def run(
+                self,
+                message: str,
+                session_key: str,
+                *,
+                expected_session_id: str | None = None,
+                expected_session_epoch: int | None = None,
+                **kwargs: Any,
+            ):
+                captured["expected_session_id"] = expected_session_id
+                captured["expected_session_epoch"] = expected_session_epoch
                 captured.update(kwargs)
                 ran.set()
                 yield DoneEvent()
@@ -345,6 +422,10 @@ async def test_turn_tool_context_uses_project_directory(tmp_path: Path) -> None:
 
         assert response.ok is True
         assert captured["tool_context"].workspace_dir == project.path
+        session = await stack.storage.get_session("agent:main:webchat:project-tool-context")
+        assert session is not None
+        assert captured["expected_session_id"] == session.session_id
+        assert captured["expected_session_epoch"] == int(session.epoch or 0)
 
 
 @pytest.mark.asyncio
@@ -407,7 +488,15 @@ async def test_non_owner_can_continue_an_existing_project_session(
         ran = asyncio.Event()
 
         class Runner:
-            async def run(self, message: str, session_key: str, **kwargs: Any):
+            async def run(
+                self,
+                message: str,
+                session_key: str,
+                *,
+                expected_session_id: str | None = None,
+                expected_session_epoch: int | None = None,
+                **kwargs: Any,
+            ):
                 captured.update(kwargs)
                 ran.set()
                 yield DoneEvent()
@@ -664,7 +753,15 @@ async def test_project_first_send_without_task_runtime_is_atomic(
         run_count = 0
 
         class Runner:
-            async def run(self, message: str, session_key: str, **kwargs: Any):
+            async def run(
+                self,
+                message: str,
+                session_key: str,
+                *,
+                expected_session_id: str | None = None,
+                expected_session_epoch: int | None = None,
+                **kwargs: Any,
+            ):
                 nonlocal run_count
                 run_count += 1
                 ran.set()
@@ -859,7 +956,15 @@ async def test_origin_workspace_tamper_cannot_change_project_tool_context(
         ran = asyncio.Event()
 
         class Runner:
-            async def run(self, message: str, session_key: str, **kwargs: Any):
+            async def run(
+                self,
+                message: str,
+                session_key: str,
+                *,
+                expected_session_id: str | None = None,
+                expected_session_epoch: int | None = None,
+                **kwargs: Any,
+            ):
                 captured.update(kwargs)
                 ran.set()
                 yield DoneEvent()
@@ -901,7 +1006,15 @@ async def test_legacy_implicit_full_project_context_uses_global_default(
         ran = asyncio.Event()
 
         class Runner:
-            async def run(self, message: str, session_key: str, **kwargs: Any):
+            async def run(
+                self,
+                message: str,
+                session_key: str,
+                *,
+                expected_session_id: str | None = None,
+                expected_session_epoch: int | None = None,
+                **kwargs: Any,
+            ):
                 captured.update(kwargs)
                 ran.set()
                 yield DoneEvent()
@@ -949,7 +1062,15 @@ async def test_saved_user_full_project_context_uses_global_default_provenance(
         ran = asyncio.Event()
 
         class Runner:
-            async def run(self, message: str, session_key: str, **kwargs: Any):
+            async def run(
+                self,
+                message: str,
+                session_key: str,
+                *,
+                expected_session_id: str | None = None,
+                expected_session_epoch: int | None = None,
+                **kwargs: Any,
+            ):
                 captured.update(kwargs)
                 ran.set()
                 yield DoneEvent()
@@ -1008,7 +1129,15 @@ async def test_direct_web_project_turn_preserves_authorized_request_mode_at_exec
         captured: dict[str, Any] = {}
 
         class Runner:
-            async def run(self, message: str, session_key: str, **kwargs: Any):
+            async def run(
+                self,
+                message: str,
+                session_key: str,
+                *,
+                expected_session_id: str | None = None,
+                expected_session_epoch: int | None = None,
+                **kwargs: Any,
+            ):
                 captured.update(kwargs)
                 yield DoneEvent()
 
@@ -1117,7 +1246,15 @@ async def test_direct_web_unbound_turn_refreshes_durable_context_before_typed_ov
         captured: dict[str, Any] = {}
 
         class Runner:
-            async def run(self, message: str, session_key: str, **kwargs: Any):
+            async def run(
+                self,
+                message: str,
+                session_key: str,
+                *,
+                expected_session_id: str | None = None,
+                expected_session_epoch: int | None = None,
+                **kwargs: Any,
+            ):
                 captured.update(kwargs)
                 yield DoneEvent()
 
@@ -1234,7 +1371,15 @@ async def test_direct_web_unbound_workspace_revocation_uses_configured_base(
         captured: dict[str, Any] = {}
 
         class Runner:
-            async def run(self, message: str, session_key: str, **kwargs: Any):
+            async def run(
+                self,
+                message: str,
+                session_key: str,
+                *,
+                expected_session_id: str | None = None,
+                expected_session_epoch: int | None = None,
+                **kwargs: Any,
+            ):
                 captured.update(kwargs)
                 yield DoneEvent()
 
@@ -1606,7 +1751,15 @@ async def test_project_turn_fresh_mode_controls_real_filesystem_and_network_enfo
         target = Path(project.path) / "guarded.txt"
 
         class Runner:
-            async def run(self, message: str, session_key: str, **kwargs: Any):
+            async def run(
+                self,
+                message: str,
+                session_key: str,
+                *,
+                expected_session_id: str | None = None,
+                expected_session_epoch: int | None = None,
+                **kwargs: Any,
+            ):
                 tool_context = kwargs["tool_context"]
                 token = current_tool_context.set(tool_context)
                 try:
@@ -1770,14 +1923,11 @@ async def test_runtime_send_rehydrates_unbound_session_before_real_enforcement(
                 )
             finally:
                 current_tool_context.reset(token)
-            if index == 0:
-                first_started.set()
-                await release_first.wait()
             yield DoneEvent()
 
     config = GatewayConfig(
         workspace_dir=str(workspace),
-        memory={"flush_enabled": False},
+        memory={},
         naming={"enabled": False},
         agent_stream_heartbeat_interval_seconds=0.0,
         agent_stream_idle_timeout_seconds=1.0,
@@ -1791,6 +1941,12 @@ async def test_runtime_send_rehydrates_unbound_session_before_real_enforcement(
             turn_runner=Runner(),
             event_emitter=AsyncMock(),
         )
+        if run.message == "first":
+            # Keep the runtime task and its session lane occupied while the
+            # test updates SQLite and queues a follow-up. This fixture wait
+            # is outside the event stream, whose idle watchdog remains real.
+            first_started.set()
+            await release_first.wait()
 
     runtime = TaskRuntime(
         storage=storage,
@@ -1810,12 +1966,17 @@ async def test_runtime_send_rehydrates_unbound_session_before_real_enforcement(
     try:
         first = await runtime.enqueue(envelope, "first")
         await asyncio.wait_for(first_started.wait(), timeout=2.0)
+        assert (await runtime.status(first.task_id)).status == "running"
+        assert len(observations) == 1
         cached_after_first = runtime._last_envelope_by_session[key]
         await manager.update(
             key,
             origin={RUN_CONTEXT_ORIGIN_KEY: standard_context.to_origin_payload()},
         )
         followup = await runtime.send(key, "followup")
+        assert (await runtime.status(first.task_id)).status == "running"
+        assert (await runtime.status(followup.task_id)).status == "queued"
+        assert len(observations) == 1
         release_first.set()
         assert (await runtime.wait(first.task_id, timeout=2.0)).status == "succeeded"
         assert (await runtime.wait(followup.task_id, timeout=2.0)).status == "succeeded"
@@ -2391,7 +2552,15 @@ async def test_direct_project_cancellation_after_commit_still_starts_once(
         run_count = 0
 
         class Runner:
-            async def run(self, message: str, session_key: str, **kwargs: Any):
+            async def run(
+                self,
+                message: str,
+                session_key: str,
+                *,
+                expected_session_id: str | None = None,
+                expected_session_epoch: int | None = None,
+                **kwargs: Any,
+            ):
                 nonlocal run_count
                 run_count += 1
                 ran.set()
@@ -2589,6 +2758,9 @@ async def test_explicit_standard_project_drives_real_sandbox_filesystem_runtime(
                     self,
                     message: str,
                     session_key: str,
+                    *,
+                    expected_session_id: str | None = None,
+                    expected_session_epoch: int | None = None,
                     **kwargs: Any,
                 ):
                     project_ctx = kwargs["tool_context"]
@@ -2655,6 +2827,9 @@ async def test_explicit_standard_project_drives_real_sandbox_filesystem_runtime(
                     self,
                     message: str,
                     session_key: str,
+                    *,
+                    expected_session_id: str | None = None,
+                    expected_session_epoch: int | None = None,
                     **kwargs: Any,
                 ):
                     full_ctx = kwargs["tool_context"]
@@ -2729,6 +2904,9 @@ async def test_explicit_full_project_bypasses_unavailable_sandbox_backend(
                     self,
                     message: str,
                     session_key: str,
+                    *,
+                    expected_session_id: str | None = None,
+                    expected_session_epoch: int | None = None,
                     **kwargs: Any,
                 ):
                     project_ctx = kwargs["tool_context"]

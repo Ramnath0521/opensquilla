@@ -7,6 +7,7 @@ import pytest
 
 from opensquilla.session.models import AgentTaskStatus
 from opensquilla.session.terminal_reply import (
+    CONTEXT_PAYLOAD_TOO_LARGE_MESSAGES,
     build_terminal_reply,
     safe_provider_failure_code,
     safe_provider_failure_message,
@@ -24,6 +25,32 @@ RAW_INTERNAL_STRINGS = (
     "current_turn_context_exhausted",
     "Provider output limit reached before completion",
 )
+
+
+@pytest.mark.parametrize("message", CONTEXT_PAYLOAD_TOO_LARGE_MESSAGES.values())
+def test_specific_context_budget_message_survives_terminal_sanitization(message: str) -> None:
+    payload = {
+        "status": "failed", "error_class": "provider_request_too_large",
+        "error_message": message,
+    }
+
+    code, rendered = sanitize_agent_error(payload)
+
+    assert code == "provider_request_too_large"
+    assert rendered == message
+    assert build_terminal_reply({**payload, "error_message": rendered}) == message
+
+
+@pytest.mark.parametrize("message", CONTEXT_PAYLOAD_TOO_LARGE_MESSAGES.values())
+def test_context_budget_message_allowlist_does_not_preserve_upstream_suffix(message: str) -> None:
+    code, rendered = sanitize_agent_error({
+        "status": "failed", "error_class": "provider_request_too_large",
+        "error_message": message + " Synthetic untrusted upstream detail.",
+    })
+
+    assert code == "provider_request_too_large"
+    assert "untrusted upstream" not in rendered
+    assert "automatic context compaction" in rendered
 
 
 @pytest.mark.parametrize(
@@ -206,6 +233,26 @@ def test_image_input_unsupported_reply_is_actionable_and_stable() -> None:
         "The selected model cannot process image input. Choose an image-capable "
         "model or remove the image and try again."
     )
+
+
+@pytest.mark.parametrize(
+    ("code", "action"),
+    [
+        ("attachment_capacity_too_large", "/compact"),
+        ("attachment_capacity_unknown", "verified context limit"),
+        ("attachment_capacity_unavailable", "model configuration"),
+    ],
+)
+def test_attachment_capacity_failure_preserves_action_without_private_details(
+    code: str, action: str,
+) -> None:
+    reply = build_terminal_reply({
+        "status": "failed", "terminal_reason": "error", "error_class": code,
+        "error_message": "synthetic-private-deployment-detail",
+    })
+    assert action in reply
+    assert "synthetic-private" not in reply
+    assert "task failed" not in reply
 
 
 def test_reasoning_only_output_budget_empty_response_reply_is_actionable_and_stable() -> None:

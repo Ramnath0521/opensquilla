@@ -3,10 +3,14 @@
 The `opensquilla` CLI is the fastest way to configure, run, inspect, and
 automate OpenSquilla.
 
-Install the current release with the recommended integrations:
+This document describes the separate Python/uv CLI installation. The Windows
+Desktop installer does not install a global `opensquilla` command; Desktop
+users should launch OpenSquilla from the Start menu or taskbar.
+
+To install the command-line interface separately from OpenSquilla Desktop:
 
 ```sh
-uv tool install --python 3.12 "opensquilla[recommended] @ https://github.com/TokenRhythm/opensquilla/releases/download/v0.5.4/opensquilla-0.5.4-py3-none-any.whl"
+uv tool install --python 3.12 "opensquilla[recommended] @ https://github.com/TokenRhythm/opensquilla/releases/download/v0.5.5/opensquilla-0.5.5-py3-none-any.whl"
 ```
 
 Run:
@@ -45,7 +49,7 @@ opensquilla <command> --help
 | `opensquilla agents` | Manage durable agents. |
 | `opensquilla mcp-server` | Run the OpenSquilla MCP server bridge. |
 | `opensquilla dist` | Emit a reproducible workspace-state inventory. |
-| `opensquilla reset` | Reset a session and flush memory synchronously. |
+| `opensquilla reset` | Archive the transcript and summaries, then reset the session. |
 
 ## Run Surfaces
 
@@ -262,8 +266,8 @@ opensquilla skills list
 opensquilla skills search pdf
 opensquilla skills search pdf --json --include-diagnostics
 opensquilla skills view pdf-toolkit
-opensquilla skills install <install-reference> --source <clawhub|github>
-opensquilla skills install <install-reference> --source <clawhub|github> \
+opensquilla skills install <install-reference> --source <clawhub|skillhub|github>
+opensquilla skills install <install-reference> --source <clawhub|skillhub|github> \
   --force --risk-confirmation <token>
 opensquilla skills update --install-id <install-id>
 opensquilla skills update --all
@@ -318,9 +322,6 @@ opensquilla memory list
 opensquilla memory search "preference"
 opensquilla memory show <path>
 opensquilla memory dream
-opensquilla memory flush-session <session-key>
-opensquilla memory repair list
-opensquilla memory raw-fallbacks list
 ```
 
 Read: [`features/memory.md`](features/memory.md)
@@ -361,6 +362,11 @@ Read:
 - [`diagnostics-and-replay.md`](diagnostics-and-replay.md)
 
 ## MCP Server Bridge
+
+MCP support is included in the current source's base installation. See the
+[MCP installation requirements](mcp-server.md#requirements) for SDK 2.x source
+and release installation options. Start the gateway before launching the stdio
+bridge from an MCP-capable client:
 
 ```sh
 opensquilla mcp-server run

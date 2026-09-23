@@ -51,7 +51,7 @@ async def test_build_services_wires_media_root_into_session_manager(
 
     media = tmp_path / "media"
     config = GatewayConfig(
-        memory={"flush_enabled": False},
+        memory={},
         attachments={"media_root": str(media)},
     )
 
@@ -63,6 +63,36 @@ async def test_build_services_wires_media_root_into_session_manager(
         media_root = services.session_manager._media_root
         assert media_root is not None
         assert media_root == media_root_from_config(config)
+        resolver = services.session_manager._attachment_fork_context_resolver
+        assert callable(resolver)
+        from opensquilla.session.models import SessionNode
+        from opensquilla.tools.types import ToolContext, current_tool_context
+
+        workspace = tmp_path / "workspace"
+        workspace.mkdir()
+        from uuid import uuid4
+
+        node = SessionNode(
+            session_key="agent:main:direct:fork-policy",
+            execution_workspace={
+                "version": 1, "id": str(uuid4()), "kind": "configured", "root": str(workspace),
+            },
+        )
+        active = ToolContext(
+            run_mode="safe", guest_safe=True, workspace_write_deny_globs=["*.secret"],
+        )
+        token = current_tool_context.set(active)
+        try:
+            current = await resolver(node)
+        finally:
+            current_tool_context.reset(token)
+        assert current.run_mode == "safe"
+        assert current.guest_safe
+        assert current.workspace_write_deny_globs == ["*.secret"]
+        assert current.workspace_dir == str(workspace)
+        assert current.artifact_session_id == node.session_id
+        assert current.sandbox_gateway_config is config
+        assert current.sandbox_policy is not None
     finally:
         await services.close()
 
@@ -105,7 +135,7 @@ async def test_build_services_continues_when_optional_sandbox_migration_fails(
     services = await build_services(
         config=GatewayConfig(
             config_path=str(config_path),
-            memory={"flush_enabled": False},
+            memory={},
         ),
         session_db_path=":memory:",
         seed_agent_workspaces=False,
@@ -123,7 +153,7 @@ async def test_build_services_reconciles_artifact_mutations_before_ready(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setenv("OPENSQUILLA_STATE_DIR", str(tmp_path / "state"))
-    calls: list[tuple[object, Path]] = []
+    calls: list[tuple[str, object]] = []
 
     def reject_background_task(coro):
         close = getattr(coro, "close", None)
@@ -131,39 +161,32 @@ async def test_build_services_reconciles_artifact_mutations_before_ready(
             close()
         raise AssertionError("unit tests must not schedule real sandbox setup")
 
-    async def fake_reconcile(service, store):
-        calls.append((service, store.media_root))
-        return type(
-            "Summary",
-            (),
-            {
-                "examined": 0,
-                "applied": 0,
-                "failed": 0,
-                "ambiguous": 0,
-                "deleted_candidates": 0,
-            },
-        )()
+    async def retire(service):
+        calls.append(("retire", service))
 
+    async def recover(service, store, **_kwargs):
+        calls.append(("recover", service))
+        return type("Summary", (), {"examined": 0})()
+
+    monkeypatch.setattr("opensquilla.gateway.boot.create_background_task", reject_background_task)
     monkeypatch.setattr(
-        "opensquilla.gateway.boot.create_background_task",
-        reject_background_task,
+        "opensquilla.artifact_session.ArtifactSessionService.retire_legacy_html_state", retire
     )
     monkeypatch.setattr(
-        "opensquilla.gateway.artifact_mutation_recovery.reconcile_pending_artifact_mutations",
-        fake_reconcile,
+        "opensquilla.gateway.document_resource_recovery.reconcile_pending_document_resources",
+        recover,
     )
     media = tmp_path / "media"
     services = await build_services(
         config=GatewayConfig(
-            memory={"flush_enabled": False},
+            memory={},
             attachments={"media_root": str(media)},
         ),
         session_db_path=":memory:",
         seed_agent_workspaces=False,
     )
     try:
-        assert len(calls) == 1
-        assert calls[0][1] == media
+        assert [item[0] for item in calls] == ["retire", "recover"]
+        assert calls[0][1] is calls[1][1]
     finally:
         await services.close()

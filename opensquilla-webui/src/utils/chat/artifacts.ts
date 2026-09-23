@@ -1,5 +1,6 @@
 import type { ArtifactPayload } from '@/types/artifacts'
 import type { IconName } from '@/utils/icons'
+import { fileTypeLabel } from '@/utils/fileType'
 
 const ARTIFACT_MIME_CATEGORIES: Record<string, string> = {
   'application/json': 'data', 'application/ndjson': 'data', 'application/pdf': 'document',
@@ -17,7 +18,6 @@ const ARTIFACT_EXTENSION_CATEGORIES: Record<string, string> = {
   ndjson: 'data', pdf: 'document', sql: 'code', tsv: 'data', txt: 'document',
 }
 
-const VIDEO_EXTENSIONS = new Set(['m4v', 'mov', 'mp4', 'ogv', 'webm'])
 const OFFICE_EXTENSIONS = new Set([
   'doc', 'docm', 'docx', 'dot', 'dotm', 'dotx', 'odt', 'ott', 'rtf',
   'csv', 'fods', 'ods', 'ots', 'xls', 'xlsb', 'xlsm', 'xlsx', 'xlt', 'xltm', 'xltx',
@@ -43,13 +43,6 @@ export function artifactExtension(name: string): string {
 
 export function isOfficeArtifact(artifact: ArtifactPayload): boolean {
   return OFFICE_EXTENSIONS.has(artifactExtension(artifactName(artifact)))
-}
-
-export function isVideoArtifact(artifact: ArtifactPayload): boolean {
-  const mime = artifactMime(artifact)
-  if (mime.startsWith('video/')) return true
-  if (mime && mime !== 'application/octet-stream') return false
-  return VIDEO_EXTENSIONS.has(artifactExtension(artifactName(artifact)))
 }
 
 export function artifactCategory(artifact: ArtifactPayload): string {
@@ -99,12 +92,7 @@ export function artifactFileTitle(artifact: ArtifactPayload): string {
 
 /** Short uppercase type badge, e.g. PNG, CSV, PDF, SQL. */
 export function artifactKindPill(artifact: ArtifactPayload): string {
-  const ext = artifactExtension(artifactName(artifact))
-  if (ext) return ext.toUpperCase()
-  const mime = artifactMime(artifact)
-  const subtype = mime.includes('/') ? mime.slice(mime.indexOf('/') + 1) : mime
-  const cleaned = subtype.replace(/^x[-.]/, '').replace(/[+.].*$/, '')
-  return cleaned ? cleaned.toUpperCase() : artifactCategoryLabel(artifact).toUpperCase()
+  return fileTypeLabel(artifact, artifactCategoryLabel(artifact).toUpperCase())
 }
 
 /** Human-readable byte size, e.g. "727 KB". Empty when size is unknown. */
@@ -128,10 +116,6 @@ export function artifactFileSubtitle(artifact: ArtifactPayload): string {
 export function canPreview(artifact: ArtifactPayload): boolean {
   const cat = artifactCategory(artifact)
   return cat === 'visual' || cat === 'document'
-}
-
-export function artifactActionLabel(artifact: ArtifactPayload): string {
-  return canPreview(artifact) ? 'Open' : 'Download'
 }
 
 export function artifactMeta(artifact: ArtifactPayload): string {

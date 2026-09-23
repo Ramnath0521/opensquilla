@@ -1,7 +1,8 @@
-import { contextBridge, ipcRenderer } from 'electron'
+import { contextBridge, ipcRenderer, webUtils } from 'electron'
 
 if (process.isMainFrame) contextBridge.exposeInMainWorld('opensquillaDesktop', {
   getOsLocale: () => ipcRenderer.invoke('desktop:os-locale'),
+  getPendingSessionDeepLink: () => ipcRenderer.invoke('desktop:deep-link-session:get'),
   isAutoUpdateEnabled: () => ipcRenderer.invoke('desktop:update:supported'),
   isDesktopUpdateManaged: () => ipcRenderer.invoke('desktop:update:managed'),
   getUpdateState: () => ipcRenderer.invoke('desktop:update:state'),
@@ -20,13 +21,24 @@ if (process.isMainFrame) contextBridge.exposeInMainWorld('opensquillaDesktop', {
   saveDesktopPreferences: (payload: unknown) => ipcRenderer.invoke('desktop:preferences:save', payload),
   setNativeTheme: (payload: unknown) => ipcRenderer.invoke('desktop:theme:set', payload),
   openArtifact: (payload: unknown) => ipcRenderer.invoke('desktop:artifact:open', payload),
+  saveArtifact: (payload: unknown) => ipcRenderer.invoke('desktop:artifact:save', payload),
+  sourceFileAction: (payload: unknown) => ipcRenderer.invoke('desktop:source-file:action', payload),
+  workspaceFileAction: (payload: unknown) => ipcRenderer.invoke('desktop:workspace-file:action', payload),
+  chooseAttachments: (request: unknown) => ipcRenderer.invoke('desktop:attachments:choose', request),
+  selectAttachmentFile: (request: unknown, file: File) => {
+    // Electron validates the actual browser File backing store. Constructed
+    // Files (screenshots/paste blobs) have no path and use ordinary uploads.
+    const path = webUtils.getPathForFile(file)
+    return path ? ipcRenderer.invoke('desktop:attachments:select-file', request, path) : Promise.resolve(null)
+  },
+  importAttachmentSelection: (request: unknown, token: string) => (
+    ipcRenderer.invoke('desktop:attachments:import', request, token)
+  ),
+  cancelAttachmentSelections: () => ipcRenderer.invoke('desktop:attachments:cancel'),
   chooseProjectDirectory: (payload: unknown) => (
     ipcRenderer.invoke('desktop:workspace:choose-directory', payload)
   ),
   getWorkbenchCapabilities: () => ipcRenderer.invoke('desktop:workbench:capabilities'),
-  getArtifactBridgeCapabilities: () => (
-    ipcRenderer.invoke('desktop:workbench:artifact:capabilities')
-  ),
   getArtifactAnnotationCapabilities: () => (
     ipcRenderer.invoke('desktop:workbench:annotation:capabilities')
   ),
@@ -39,24 +51,9 @@ if (process.isMainFrame) contextBridge.exposeInMainWorld('opensquillaDesktop', {
   closeArtifactAnnotationOverlay: (payload: unknown) => (
     ipcRenderer.invoke('desktop:workbench:annotation:close-overlay', payload)
   ),
-  captureSelection: (payload: unknown) => (
-    ipcRenderer.invoke('desktop:workbench:artifact:capture-selection', payload)
-  ),
-  browserInspect: (payload: unknown) => (
-    ipcRenderer.invoke('desktop:workbench:artifact:browser-inspect', payload)
-  ),
-  browserAct: (payload: unknown) => (
-    ipcRenderer.invoke('desktop:workbench:artifact:browser-act', payload)
-  ),
-  screenshot: (payload: unknown) => (
-    ipcRenderer.invoke('desktop:workbench:artifact:screenshot', payload)
-  ),
-  officeFlush: (payload: unknown) => (
-    ipcRenderer.invoke('desktop:workbench:artifact:office-flush', payload)
-  ),
-  reloadSurface: (payload: unknown) => (
-    ipcRenderer.invoke('desktop:workbench:artifact:reload-surface', payload)
-  ),
+  getWorkbenchBrowserTarget: (payload: unknown) => ipcRenderer.invoke('desktop:workbench:browser:target', payload),
+  focusWorkbenchAnnotation: (payload: unknown) => ipcRenderer.invoke('desktop:workbench:annotation:focus', payload),
+  captureWorkbenchScreenshot: (payload: unknown) => ipcRenderer.invoke('desktop:workbench:browser:screenshot', payload),
   createArtifactPreviewLease: (payload: unknown) => (
     ipcRenderer.invoke('desktop:workbench:preview-lease:create', payload)
   ),
@@ -87,6 +84,7 @@ if (process.isMainFrame) contextBridge.exposeInMainWorld('opensquillaDesktop', {
   getOnboardingDefaults: () => ipcRenderer.invoke('desktop:onboarding:defaults'),
   probeOnboarding: (payload: unknown) => ipcRenderer.invoke('desktop:onboarding:probe', payload),
   saveOnboarding: (payload: unknown) => ipcRenderer.invoke('desktop:onboarding:save', payload),
+  skipOnboarding: () => ipcRenderer.invoke('desktop:onboarding:skip'),
   cancelOnboarding: () => ipcRenderer.invoke('desktop:onboarding:cancel'),
   getBootState: () => ipcRenderer.invoke('desktop:boot:state'),
   openKeychainAccess: () => ipcRenderer.invoke('desktop:boot:open-keychain'),
@@ -126,6 +124,11 @@ if (process.isMainFrame) contextBridge.exposeInMainWorld('opensquillaDesktop', {
     ipcRenderer.on('gateway:connection-changed', listener)
     return () => ipcRenderer.removeListener('gateway:connection-changed', listener)
   },
+  onSystemResume: (callback: (payload: unknown) => void) => {
+    const listener = (_event: Electron.IpcRendererEvent, payload: unknown) => callback(payload)
+    ipcRenderer.on('desktop:system:resume', listener)
+    return () => ipcRenderer.removeListener('desktop:system:resume', listener)
+  },
   onRecoveryState: (callback: (payload: unknown) => void) => {
     const listener = (_event: Electron.IpcRendererEvent, payload: unknown) => callback(payload)
     ipcRenderer.on('desktop:recovery:state-changed', listener)
@@ -145,6 +148,13 @@ if (process.isMainFrame) contextBridge.exposeInMainWorld('opensquillaDesktop', {
     const listener = () => callback()
     ipcRenderer.on('desktop:window:hidden', listener)
     return () => ipcRenderer.removeListener('desktop:window:hidden', listener)
+  },
+  onSessionDeepLink: (callback: (sessionKey: string) => void) => {
+    const listener = (_event: Electron.IpcRendererEvent, payload: unknown) => {
+      if (typeof payload === 'string') callback(payload)
+    }
+    ipcRenderer.on('desktop:deep-link-session', listener)
+    return () => ipcRenderer.removeListener('desktop:deep-link-session', listener)
   },
   onWorkbenchSurfaceEvent: (callback: (payload: unknown) => void) => {
     const listener = (_event: Electron.IpcRendererEvent, payload: unknown) => callback(payload)

@@ -135,25 +135,31 @@ class GatewayAdmissionStorage:
             )
         return result if isinstance(result, MetaControlIntent) else None
 
-    async def update_agent_task(
+    async def get_agent_task(self, task_id: str) -> AgentTaskRecord | None:
+        with translate_admission_failure():
+            result = await getattr(self.raw, "get_agent_task")(task_id)
+        if result is None or isinstance(result, AgentTaskRecord):
+            return result
+        raise TypeError("Task lookup did not return a durable task")
+
+    async def fail_queued_agent_task_activation(
         self,
         task_id: str,
         *,
-        status: str,
-        finished_at: int,
-        terminal_reason: str,
+        session_key: str,
         error_class: str,
         error_message: str,
-    ) -> None:
+    ) -> AgentTaskRecord | None:
         with translate_admission_failure():
-            await getattr(self.raw, "update_agent_task")(
+            result = await getattr(self.raw, "fail_queued_agent_task_activation")(
                 task_id,
-                status=status,
-                finished_at=finished_at,
-                terminal_reason=terminal_reason,
+                session_key=session_key,
                 error_class=error_class,
                 error_message=error_message,
             )
+        if result is None or isinstance(result, AgentTaskRecord):
+            return result
+        raise TypeError("Activation compensation did not return a durable task")
 
     @staticmethod
     def new_plan_run(
@@ -226,10 +232,10 @@ class GatewayAdmissionStorage:
         )
 
     @staticmethod
-    def failed_acceptance(result: AdmissionAcceptance) -> AdmissionAcceptance:
+    def with_task_status(result: AdmissionAcceptance, status: str | None) -> AdmissionAcceptance:
         if not isinstance(result, TurnAcceptanceResult):
             raise TypeError("Failure projection requires durable turn acceptance")
-        return replace(result, task_status=AgentTaskStatus.FAILED)
+        return replace(result, task_status=AgentTaskStatus(status) if status is not None else None)
 
     async def accept_turn(self, command: AdmissionCommit) -> AdmissionAcceptance:
         with translate_admission_failure():
@@ -258,8 +264,6 @@ class GatewayAdmissionStorage:
                     command.require_idle_for_current_plan_implementation
                 ),
                 goal_mutation=ClaimCurrentGoalMutation() if command.claim_current_goal else None,
-                prepared_prompt_annotation_targets=command.prepared_prompt_annotation_targets,
-                prompt_annotation_turn_id=command.prompt_annotation_turn_id,
                 pending_input_id=command.pending_input_id,
                 pending_input_fingerprint=command.pending_input_fingerprint,
                 pending_input_revision=command.pending_input_revision,
@@ -291,6 +295,8 @@ class GatewayAdmissionSessions:
         workspace_id: str | None,
         origin: AdmissionProjectOrigin | None,
         model_routing_mode: str | None,
+        model: str | None,
+        provider_override: str | None,
     ) -> dict[str, Any]:
         result: dict[str, Any] = {}
         if display_name is not None:
@@ -308,6 +314,10 @@ class GatewayAdmissionSessions:
             }
         if model_routing_mode is not None:
             result["model_routing_mode"] = model_routing_mode
+        if model is not None:
+            result["model"] = model
+        if provider_override is not None:
+            result["provider_override"] = provider_override
         return result
 
     async def get_or_create(
@@ -337,13 +347,17 @@ class GatewayAdmissionSessions:
         workspace_id: str | None = None,
         origin: AdmissionProjectOrigin | None = None,
         model_routing_mode: str | None = None,
+        model: str | None = None,
+        provider_override: str | None = None,
     ) -> PreparedAdmissionIntent:
         with translate_admission_failure():
             result = await getattr(self.raw, "prepare_intent")(
                 key,
                 SessionIntent(intent),
                 agent_id=agent_id,
-                **self._creation(display_name, workspace_id, origin, model_routing_mode),
+                **self._creation(
+                    display_name, workspace_id, origin, model_routing_mode, model, provider_override
+                ),
             )
         if isinstance(result, PreparedAdmissionIntent):
             return result
@@ -359,13 +373,17 @@ class GatewayAdmissionSessions:
         workspace_id: str | None = None,
         origin: AdmissionProjectOrigin | None = None,
         model_routing_mode: str | None = None,
+        model: str | None = None,
+        provider_override: str | None = None,
     ) -> tuple[SessionIdentity, bool]:
         with translate_admission_failure():
             result = await getattr(self.raw, "apply_intent")(
                 key,
                 SessionIntent(intent),
                 agent_id=agent_id,
-                **self._creation(display_name, workspace_id, origin, model_routing_mode),
+                **self._creation(
+                    display_name, workspace_id, origin, model_routing_mode, model, provider_override
+                ),
             )
         node, fresh = result
         if isinstance(node, SessionIdentity) and isinstance(fresh, bool):

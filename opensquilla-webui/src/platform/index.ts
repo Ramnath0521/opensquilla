@@ -24,6 +24,8 @@ export type {
   CliInvocation,
   DesktopMainWindowCloseBehavior,
   DesktopGatewayConnection,
+  DesktopResumeEvent,
+  DesktopResumeSource,
   DesktopPreferences,
   DesktopSettings,
   DesktopSettingsPayload,
@@ -48,4 +50,5 @@ export type {
   PlatformSettingsApi,
   SearchProviderOption,
   WorkbenchPreviewMode,
+  SandboxUpgradeReport,
 } from './types'

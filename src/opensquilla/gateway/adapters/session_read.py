@@ -141,13 +141,14 @@ def build_v4_session_read_application(
     storage: SessionStorage | None,
     ports: GatewaySessionReadPorts,
     clock: Clock | None = None,
+    channel_types: dict[str, str] | None = None,
 ) -> SessionReadApplication:
     """Compose the complete Session read Module behind one production seam."""
 
     snapshots = build_v4_conversation_snapshot_application(streams)
     history = build_session_history_application(session_manager)
     transcript = (
-        build_session_preview_application(storage, clock=clock)
+        build_session_preview_application(storage, clock=clock, channel_types=channel_types)
         if storage is not None
         else _unavailable_preview_application(clock=clock)
     )
@@ -185,7 +186,7 @@ _DEFERRED_FIELDS_BY_FACET: dict[SessionMetadataFacet, tuple[str, ...]] = {
     SessionMetadataFacet.PENDING_INPUTS: ("pendingUserInputs",),
     SessionMetadataFacet.COLLABORATION: ("collaboration",),
     SessionMetadataFacet.ROUTING: ("routing",),
-    SessionMetadataFacet.PLAN: ("currentPlan", "activePlanRun"),
+    SessionMetadataFacet.PLAN: ("currentPlan", "activePlanRun", "planPresentations"),
     SessionMetadataFacet.GOAL: ("goal", "goalSnapshotStreamSeq"),
     SessionMetadataFacet.EPOCH: ("epoch",),
 }
@@ -231,6 +232,7 @@ def session_read_metadata_to_v4(
             dict(metadata.collaboration) if metadata.collaboration is not None else None
         ),
         "routing": dict(metadata.routing) if metadata.routing is not None else None,
+        "planPresentations": [dict(item) for item in metadata.plan_presentations],
         "currentPlan": (
             dict(metadata.current_plan) if metadata.current_plan is not None else None
         ),

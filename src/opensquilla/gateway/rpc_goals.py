@@ -183,7 +183,9 @@ async def _handle_goals_capabilities(params: dict | None, ctx: RpcContext) -> di
     # The key is accepted so callers can use a uniform session-scoped request;
     # capabilities themselves are process/config scoped and have no side effects.
     if params is not None:
-        _session_key(params)
+        values = _require_params(params)
+        if values:
+            _session_key(values)
     service = _goal_service(ctx)
     config = getattr(service, "config", None)
     return {
@@ -255,9 +257,21 @@ def _objective_param(params: dict | None) -> str:
         ) from exc
 
 
+def _reject_retired_goal_options(params: dict | None) -> None:
+    values = _require_params(params)
+    if any(field in values for field in ("tokenBudget", "executionPolicy")):
+        raise RpcHandlerError(
+            "UNSUPPORTED_GOAL_OPTIONS",
+            "Goal tokenBudget and executionPolicy options are no longer supported",
+            retryable=False,
+            accepted=False,
+        )
+
+
 async def _handle_goals_set(params: dict | None, ctx: RpcContext) -> dict:
     service = _goal_service(ctx)
     objective = _objective_param(params)
+    _reject_retired_goal_options(params)
     client_request_id = _uuid_v4_param(
         params,
         "clientRequestId",
@@ -308,6 +322,7 @@ def _mutation_params(params: dict | None) -> tuple[str, str, int, str]:
 
 
 async def _handle_goals_edit(params: dict | None, ctx: RpcContext) -> dict:
+    _reject_retired_goal_options(params)
     service = _goal_service(ctx)
     key, goal_id, revision, request_id = _mutation_params(params)
     objective = _objective_param(params)

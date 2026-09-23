@@ -5,6 +5,7 @@ import composerSource from './ChatComposer.vue?raw'
 import viewSource from '../../views/ChatView.vue?raw'
 import appearanceSource from '../settings/SettingsAppearancePanel.vue?raw'
 import slashSource from '../../composables/chat/useChatSlashCommands.ts?raw'
+import { allowedComposerRunModes } from '../../composables/chat/composerRunMode'
 import en from '../../locales/en.json'
 import zhHans from '../../locales/zh-Hans.json'
 
@@ -65,8 +66,12 @@ describe('ChatComposer control hierarchy', () => {
   })
 
   it('offers Safe from the composer only after sandbox setup is ready', () => {
-    expect(viewSource).toContain("status.state !== 'ready'")
-    expect(viewSource).toContain("allowedRunModes.value.filter((mode) => mode !== 'safe')")
+    expect(viewSource).toContain('allowedComposerRunModes(')
+    const ready = { state: 'ready', platform: 'darwin', message: '', requiresAdmin: false } as const
+    expect(allowedComposerRunModes(['safe', 'full'], null, true)).toEqual(['full'])
+    expect(allowedComposerRunModes(['safe', 'full'], ready, false)).toEqual(['full'])
+    expect(allowedComposerRunModes(['safe', 'full'], ready, true)).toEqual(['safe', 'full'])
+    expect(allowedComposerRunModes(['full'], ready, true)).toEqual(['full'])
   })
 
   it('moves visual effects to Appearance settings', () => {
@@ -89,7 +94,7 @@ describe('ChatComposer control hierarchy', () => {
   })
 
   it('completes Slash candidates without executing them from the suggestion menu', () => {
-    expect(viewSource).toContain('@click="completeSlashCmd(cmd)"')
+    expect(viewSource).toContain('@choose="completeSlashCmd"')
     expect(viewSource).not.toContain('@click="selectSlashCmd(cmd)"')
     expect(slashSource).toContain('function completeSlashCmd')
     expect(slashSource).toContain('function activateSlashCmd')
@@ -106,9 +111,9 @@ describe('ChatComposer model routing contract', () => {
 
   it('threads the independent model-routing control through ChatComposer and ChatView', () => {
     expect(composerSource).toContain('ChatComposerModelRouting')
-    expect(composerSource).toContain('<Icon name="router"')
+    expect(composerSource).toContain('<Icon v-if="sessionRoutingMode === \'squilla_router\'" name="router"')
     expect(composerSource).toContain('chat-model-routing-btn--${sessionRoutingMode}')
-    expect(composerSource).toContain("'is-active': modelRoutingOpen || sessionRoutingMode !== 'off'")
+    expect(composerSource).toContain("'is-open': modelRoutingOpen")
     expect(composerSource).toContain(':model-routing-mode="sessionRoutingMode"')
     expect(composerSource).toContain(':busy="sessionRoutingBusy || sessionRoutingControlBlocked"')
     expect(composerSource).toContain('@set-session-routing-mode="emit(\'setSessionRoutingMode\', $event)"')
@@ -116,16 +121,16 @@ describe('ChatComposer model routing contract', () => {
     expect(composerSource).toContain('setSessionRoutingMode: [mode: ModelRoutingMode]')
 
     expect(viewSource).toContain(':session-routing-mode="modelRoutingMode"')
-    expect(viewSource).toContain(':session-routing-busy="modelRoutingSettingsBusy"')
-    expect(viewSource).toContain(':session-routing-control-blocked="goalBusy"')
+    expect(viewSource).toContain(':session-routing-busy="modelRoutingMutationBusy"')
+    expect(viewSource).toContain(':session-routing-control-blocked="goalBusy || modelRoutingSettingsBusy"')
     expect(viewSource).toContain(':session-routing-available="sessionRoutingAvailable"')
     expect(viewSource).toContain('gatewayAccess.isAuthenticated')
     expect(viewSource).toContain('sessionRouting.available()')
-    expect(composerSource).toContain('v-if="sessionRoutingAvailable"')
+    expect(composerSource).toContain('v-if="modelRoutingVisible"')
     expect(viewSource).toContain('@set-session-routing-mode="setComposerSessionRoutingMode"')
     expect(viewSource).toContain('async function setComposerSessionRoutingMode(mode: ModelRoutingMode)')
     expect(viewSource).toContain('if (goalBusy.value) return')
-    expect(viewSource).toContain('await chatSessionRouting.setMode(mode)')
+    expect(viewSource).toContain('await newTaskModel.selectRoutingMode(mode, chatSessionRouting.setMode)')
     expect(viewSource).toContain('useChatSessionRouting')
     expect(viewSource).toContain('isDraft: isDraftSurface')
     expect(viewSource).toContain("return pendingSessionIntent.value === 'new_chat'")
@@ -149,7 +154,7 @@ describe('ChatComposer model routing contract', () => {
     const end = viewSource.indexOf('\nsendCurrentInput = onComposerSend', start)
     const sendSource = viewSource.slice(start, end)
     const routingBusyGate = sendSource.indexOf(
-      'if (modelRoutingSettingsBusy.value || planModeBusy.value) return',
+      'if (modelRoutingMutationBusy.value || planModeBusy.value) return',
     )
     const ordinarySend = sendSource.indexOf('onSend()')
 
@@ -165,7 +170,7 @@ describe('ChatComposer model routing contract', () => {
     )
     expect(viewSource).not.toContain('\n  || sessionRoutingSendBlockedReason.value\n')
     expect(composerSource).toContain('|| sessionRoutingBusy || inputDisabled')
-    expect(composerSource).toContain(":aria-busy=\"sessionRoutingBusy ? 'true' : 'false'\"")
+    expect(composerSource).toContain(":aria-busy=\"sendPending || sessionRoutingBusy ? 'true' : 'false'\"")
     expect(composerSource).toContain(".chat-send-btn[aria-busy='true']:disabled")
     expect(composerSource).toContain("'is-ready': hasSendContent && !sendBlockedMessage && !inputDisabled")
     expect(en.chat.composer.routingUpdateBlocked)
@@ -179,15 +184,7 @@ describe('ChatComposer model routing contract', () => {
     expect(modelRoutingSource).not.toContain('setRouterEnabled')
     expect(modelRoutingSource).not.toContain('setLlmEnsembleEnabled')
     expect(modelRoutingSource).not.toContain(':disabled="busy"')
-    expect(modelRoutingSource).toContain(":aria-disabled=\"busy ? 'true' : 'false'\"")
-    const disabledStart = modelRoutingSource.indexOf(
-      '.composer-model-routing__option[aria-disabled="true"] {',
-    )
-    const disabledEnd = modelRoutingSource.indexOf(
-      '.composer-model-routing__option-main',
-      disabledStart,
-    )
-    expect(modelRoutingSource.slice(disabledStart, disabledEnd)).not.toContain('opacity:')
+    expect(modelRoutingSource).toContain('if (props.busy || !props.routingAvailable) return')
     expect(modelRoutingSource).not.toContain(':disabled:hover')
   })
 })

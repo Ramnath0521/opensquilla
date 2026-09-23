@@ -214,10 +214,10 @@
 .chat-thread {
   flex: 1;
   overflow-y: auto;
-  /* ChatMessageList owns variable-row anchor correction. Native scroll
+  /* TanStack Virtual owns variable-row anchor correction. Native scroll
      anchoring would apply the same height delta a second time. */
   overflow-anchor: none;
-  padding: 0.25rem 0 1.5rem;
+  padding: 0.25rem 0 0;
   display: flex;
   flex-direction: column;
   gap: 0.25rem;
@@ -226,20 +226,6 @@
      content's left edge) does not shift when the conversation grows a
      scrollbar mid-stream. */
   scrollbar-gutter: stable;
-}
-
-/* Native anchoring preserves a non-virtualized reader's visible paragraph
-   across width reflow. Live following and virtualized history keep their
-   existing application-owned pin/correction so the two systems never stack. */
-.chat-thread--reading-history:has(.chat-message-list[data-virtualized="false"]) {
-  overflow-anchor: auto;
-}
-
-/* Vue-owned fallback for WebViews without :has(): ChatView mirrors the
-   virtualizer state on the thread element so historical reflow keeps the
-   browser's native anchor in the same cases. */
-.chat-thread--reading-history.chat-thread--nonvirtualized {
-  overflow-anchor: auto;
 }
 
 /* Floating composer (existing conversation, toggle on): reserve the dock's
@@ -254,6 +240,17 @@
 .chat-thread:focus-visible {
   box-shadow: inset 0 0 0 2px var(--border-focus);
   outline: none;
+}
+
+.chat-thread__header {
+  display: flex;
+  flex: 0 0 auto;
+  flex-direction: column;
+  gap: 0.25rem;
+}
+
+.chat-thread__header:empty {
+  display: none;
 }
 
 .chat-message-surface {
@@ -672,96 +669,6 @@
 @media (max-width: 640px) {
   .plan-questionnaire-dock {
     width: calc(100% - 24px);
-  }
-}
-
-/* Slash menu */
-.chat-slash {
-  position: absolute;
-  /* Anchored to the top of the composer dock so it floats directly above the
-     composer in every layout, instead of the chat container's bottom edge —
-     which detaches it on the centered new-chat landing. */
-  bottom: calc(100% + 0.5rem);
-  /* Match the input panel it floats above — the composer column, not the
-     full panel width. */
-  left: 0;
-  right: 0;
-  width: min(calc(100% - 2rem), var(--composer-col));
-  margin-inline: auto;
-  background: var(--bg-surface);
-  border: 1px solid var(--border);
-  border-radius: var(--radius-md);
-  box-shadow: var(--shadow-md);
-  z-index: 30;
-  max-height: 200px;
-  overflow-y: auto;
-}
-
-.chat-slash-item {
-  display: flex;
-  align-items: center;
-  gap: 0.5rem;
-  padding: 0.5rem 0.75rem;
-  cursor: pointer;
-  font-size: 0.875rem;
-}
-
-.chat-slash-item:hover,
-.chat-slash-item--active {
-  background: var(--bg-hover);
-}
-
-.chat-slash-cmd {
-  flex: 0 0 210px;
-  font-family: var(--font-mono);
-  font-weight: 600;
-  color: var(--accent);
-  flex-shrink: 0;
-  white-space: nowrap;
-}
-
-.chat-slash-status {
-  flex-shrink: 0;
-  padding: 0.125rem 0.375rem;
-  border: 1px solid color-mix(in srgb, var(--warn) 45%, var(--border));
-  border-radius: var(--radius-sm);
-  color: var(--warn);
-  background: color-mix(in srgb, var(--warn) 9%, transparent);
-  font-size: 0.6875rem;
-  font-weight: 650;
-  line-height: 1.2;
-}
-
-.chat-slash-desc {
-  min-width: 0;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-  color: var(--text-muted);
-  flex: 1;
-  font-size: 0.8125rem;
-  min-width: 0;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
-@media (max-width: 600px) {
-  .chat-slash-item {
-    align-items: flex-start;
-    flex-direction: column;
-    gap: 2px;
-  }
-
-  .chat-slash-cmd {
-    flex: none;
-    max-width: 100%;
-    white-space: normal;
-    word-break: break-word;
-  }
-
-  .chat-slash-desc {
-    max-width: 100%;
   }
 }
 

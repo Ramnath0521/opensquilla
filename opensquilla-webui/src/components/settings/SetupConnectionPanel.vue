@@ -1,8 +1,9 @@
 <script setup lang="ts">
-import { computed, inject, onMounted, ref } from 'vue'
+import { computed, inject, onMounted, ref, watch } from 'vue'
 import { useI18n } from 'vue-i18n'
 import { GATEWAY_ACCESS_KEY } from '@/modules/gatewayAccess'
 
+const props = withDefaults(defineProps<{ managed?: boolean }>(), { managed: false })
 const { t } = useI18n()
 
 // Gateway connection editor. This is the one Settings section that must work
@@ -16,15 +17,34 @@ const gatewayAccess = injectedGatewayAccess
 
 const wsUrl = ref('')
 const wsToken = ref('')
+const tokenInput = ref<HTMLInputElement | null>(null)
+const requiresCredential = computed(() => !props.managed && gatewayAccess.requiresCredential)
+
+watch(requiresCredential, required => {
+  if (required) tokenInput.value?.focus()
+}, { flush: 'post' })
 
 onMounted(() => {
-  wsUrl.value = gatewayAccess.loadConnectionEndpoint()
+  if (!props.managed) wsUrl.value = gatewayAccess.loadConnectionEndpoint()
+  if (requiresCredential.value) tokenInput.value?.focus()
 })
 
 const statusState = computed(() => {
   if (gatewayAccess.availability === 'preparing') return 'connecting'
-  if (gatewayAccess.availability === 'available') return 'connected'
+  if (gatewayAccess.availability === 'available') {
+    return gatewayAccess.connectionPhase !== undefined
+      ? gatewayAccess.connectionPhase !== 'healthy' ? 'connecting' : 'connected'
+      : gatewayAccess.connectionHealth === 'suspect' ? 'connecting' : 'connected'
+  }
   return 'disconnected'
+})
+
+const transportPhase = computed(() => {
+  if (gatewayAccess.availability === 'available') {
+    return gatewayAccess.connectionPhase
+      || (gatewayAccess.isResuming || gatewayAccess.connectionHealth === 'suspect' ? 'suspect' : 'healthy')
+  }
+  return gatewayAccess.availability === 'preparing' ? 'checking' : 'disconnected'
 })
 
 const statusPillClass = computed(() => {
@@ -34,24 +54,28 @@ const statusPillClass = computed(() => {
 })
 
 const statusLabel = computed(() => {
+  if (requiresCredential.value) return t('setup.connection.tokenRequired')
+  if (transportPhase.value !== 'healthy' && transportPhase.value !== 'disconnected') {
+    return t(`chrome.connectionState.${transportPhase.value}`)
+  }
   if (statusState.value === 'connected') return t('setup.connection.connected')
   if (statusState.value === 'connecting') return t('setup.connection.connecting')
   return t('setup.connection.disconnected')
 })
 
 const statusReason = computed(() => {
-  if (statusState.value === 'connected') return t('setup.connection.reasonConnected')
-  if (statusState.value === 'connecting') return t('setup.connection.reasonConnecting')
+  if (requiresCredential.value) return t('setup.connection.reasonTokenRequired')
   if (gatewayAccess.connectionError) {
     return t('setup.connection.reasonFailed', { error: gatewayAccess.connectionError })
   }
+  if (statusState.value === 'connected') return t('setup.connection.reasonConnected')
+  if (statusState.value === 'connecting') return t('setup.connection.reasonConnecting')
   return t('setup.connection.reasonDisconnected')
 })
 
 function connect() {
-  const url = wsUrl.value.trim()
-  const token = wsToken.value.trim()
-  gatewayAccess.disconnect()
+  const url = props.managed ? '' : wsUrl.value.trim()
+  const token = props.managed ? '' : wsToken.value.trim()
   void gatewayAccess.connect({ endpoint: url, credential: token || undefined })
 }
 
@@ -64,7 +88,7 @@ function disconnect() {
   <section class="control-section">
     <div class="control-section__head">
       <h3 class="control-section__title">{{ t('setup.connection.title') }}</h3>
-      <p class="control-section__desc">{{ t('setup.connection.desc') }}</p>
+      <p class="control-section__desc">{{ t(managed ? 'setup.runtime.desc' : 'setup.connection.desc') }}</p>
     </div>
 
     <div class="conn-status" :class="statusPillClass" role="status" aria-live="polite">
@@ -72,7 +96,7 @@ function disconnect() {
       <span class="conn-status__reason">{{ statusReason }}</span>
     </div>
 
-    <div class="control-row control-row--stack">
+    <div v-if="!managed" class="control-row control-row--stack">
       <div class="control-row__label-block">
         <label class="control-row__label" for="conn-ws-url">{{ t('setup.connection.wsUrlLabel') }}</label>
         <span class="control-row__desc">{{ t('setup.connection.wsUrlDesc') }} <code>ws://host:port/ws</code></span>
@@ -90,19 +114,22 @@ function disconnect() {
       </div>
     </div>
 
-    <div class="control-row control-row--stack">
+    <div v-if="!managed" class="control-row control-row--stack">
       <div class="control-row__label-block">
-        <label class="control-row__label" for="conn-ws-token">{{ t('setup.connection.tokenLabel') }} <span class="conn-optional">{{ t('setup.connection.optional') }}</span></label>
+        <label class="control-row__label" for="conn-ws-token">{{ t('setup.connection.tokenLabel') }} <span v-if="!requiresCredential" class="conn-optional">{{ t('setup.connection.optional') }}</span></label>
         <span class="control-row__desc">{{ t('setup.connection.tokenDesc') }}</span>
       </div>
       <div class="control-row__control">
         <input
           id="conn-ws-token"
+          ref="tokenInput"
           v-model="wsToken"
+          :data-settings-initial-focus="requiresCredential ? '' : undefined"
           class="control-input"
           type="password"
           placeholder="&mdash;"
           autocomplete="off"
+          @keydown.enter.prevent="connect"
         >
       </div>
     </div>

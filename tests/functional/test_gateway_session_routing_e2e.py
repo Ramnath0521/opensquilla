@@ -65,12 +65,17 @@ async def _serve_gateway() -> None:
     config.memory.retrieval_mode = "fts_only"
     config.memory.auto_capture_enabled = False
     config.memory.capture_mode = "off"
-    config.memory.repair_enabled = False
     config.memory.ttl_sweep_interval_minutes = 0
     config.meta_skill.enabled = False
     config.heartbeat.enabled = False
     config.squilla_router.enabled = False
     config.squilla_router.rollout_phase = "observe"
+    # The fixture's direct and routed modes share its offline deployment.
+    # Replacing llm after construction must not retain the default provider's ladder.
+    config.squilla_router.tiers = {
+        tier: {"provider": config.llm.provider, "model": config.llm.model}
+        for tier in ("c0", "c1", "c2", "c3")
+    }
     config.llm_ensemble.enabled = False
 
     storage = SessionStorage(str(state_dir / "sessions.db"))
@@ -266,6 +271,7 @@ async def test_real_gateway_websocket_session_routing_contract(
             "source": "session",
             "initialized": False,
             "appliesTo": "next_accepted_turn",
+            "modelSelection": None,
         }
 
         changed_global = await client.set_model_routing("router")
@@ -341,6 +347,7 @@ async def test_real_gateway_websocket_session_routing_contract(
                 "source": "session",
                 "initialized": False,
                 "appliesTo": "next_accepted_turn",
+                "modelSelection": None,
             }
             first_turn_routing = _routing(
                 await client.get_session_routing(first_turn_session)

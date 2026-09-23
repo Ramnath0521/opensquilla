@@ -1,4 +1,26 @@
 import type { TransportCallOptions as RpcCallOptions } from './transportTypes'
+import { readTransportFailure } from './transportTypes'
+import {
+  SKILLS_CANDIDATES_METHOD,
+  type Result as SkillsCandidatesResult,
+} from '@/contracts/generated/v4/skillsCandidates'
+import { validateResult as validateSkillsCandidatesResult } from '@/contracts/generated/v4/skillsCandidatesValidators.mjs'
+import {
+  SKILLS_SET_ENABLED_METHOD,
+  type Result as SkillsSetEnabledResult,
+} from '@/contracts/generated/v4/skillsSetEnabled'
+import { validateResult as validateSkillsSetEnabledResult } from '@/contracts/generated/v4/skillsSetEnabledValidators.mjs'
+import {
+  META_LIST_METHOD,
+  type Result as MetaListResult,
+} from '@/contracts/generated/v4/metaList'
+import { validateResult as validateMetaListResult } from '@/contracts/generated/v4/metaListValidators.mjs'
+import {
+  META_INSPECT_METHOD,
+  type Params as MetaInspectParams,
+  type Result as MetaInspectResult,
+} from '@/contracts/generated/v4/metaInspect'
+import { validateResult as validateMetaInspectResult } from '@/contracts/generated/v4/metaInspectValidators.mjs'
 import {
   SKILLS_LIST_METHOD,
   type Params as SkillsListParams,
@@ -34,6 +56,10 @@ import {
   type Result as SkillsInstallCancelResult,
 } from '@/contracts/generated/v4/skillsInstallCancel'
 import { validateResult as validateSkillsInstallCancelResult } from '@/contracts/generated/v4/skillsInstallCancelValidators.mjs'
+import { SKILLS_INSTALL_STATUS_METHOD, type Result as SkillsInstallStatusResult } from '@/contracts/generated/v4/skillsInstallStatus'
+import { validateResult as validateSkillsInstallStatusResult } from '@/contracts/generated/v4/skillsInstallStatusValidators.mjs'
+import type { SkillInstallStatus } from '@/modules/skillCatalog'
+
 import {
   SKILLS_DEPS_INSTALL_METHOD,
   type Params as SkillsDepsInstallParams,
@@ -112,6 +138,7 @@ interface RpcTransport {
   request<T = unknown>(method: string, params?: Record<string, unknown>, options?: RpcCallOptions): Promise<T>
   ready(options?: { signal?: AbortSignal }): Promise<void>
   supports(method: string): boolean
+  markUnsupported(method: string): void
 }
 
 const callOptions = (signal?: AbortSignal): RpcCallOptions => ({
@@ -131,20 +158,197 @@ function invalid(method: string): Error {
   return new Error(`${method} returned an invalid response`)
 }
 
-export function createV4SkillCatalog(rpc: RpcTransport): SkillCatalog {
+function isMeta(skill: Pick<Skill, 'kind'>): boolean {
+  return skill.kind === 'meta' || skill.kind === 'meta_sop'
+}
+
+function isLifecycleOnly(skill: Pick<Skill, 'active' | 'lifecycle'>): boolean {
+  return skill.active === false || Boolean(
+    skill.lifecycle && skill.lifecycle.selection_state !== 'active',
+  )
+}
+
+function matchesIdentity(left: Skill, right: Skill): boolean {
+  if (left.name !== right.name || isMeta(left) !== isMeta(right)) return false
+  if (left.instance_id && right.instance_id) return left.instance_id === right.instance_id
+  if (left.install_id && right.install_id) return left.install_id === right.install_id
+  if (left.instance_id || right.instance_id || left.install_id || right.install_id) return false
+  return Boolean(left.kind === right.kind && left.layer && right.layer && left.layer === right.layer)
+}
+
+type MetaCatalogEntry = MetaListResult['skills'][number]
+
+function projectMeta(entry: MetaCatalogEntry, base?: Skill): Skill {
+  const missingBins = entry.missing_bins || []
+  const missingEnv = entry.missing_env || []
+  const missingEnvAny = entry.missing_env_any || []
+  const summary = base?.dependency_summary
+  // Project only public UI fields. In particular, the wire invocation mode is
+  // a string whereas Skill.invocation is the existing capability object.
   return {
+    ...base,
+    name: entry.name,
+    kind: base?.kind ?? 'meta',
+    description: entry.description ?? base?.description,
+    layer: base?.layer || entry.layer,
+    instance_id: base?.instance_id || entry.instance_id,
+    install_id: base?.install_id || entry.install_id,
+    source: base?.source ?? entry.source,
+    generation: entry.generation ?? base?.generation,
+    digest: entry.digest ?? base?.digest,
+    visibility: entry.visibility ?? base?.visibility,
+    eligible: entry.ready,
+    status: entry.status,
+    status_detail: entry.ready ? '' : (entry.reasons || []).join('; '),
+    lifecycle: base?.lifecycle && !isLifecycleOnly(base)
+      ? { ...base.lifecycle, readiness_state: entry.status }
+      : base?.lifecycle,
+    missing_bins: missingBins,
+    missing_env: missingEnv,
+    missing_env_any: missingEnvAny,
+    dependency_summary: summary ? {
+      ...summary,
+      missing: {
+        binaries: { all: missingBins, any: [] },
+        api_env: { all: missingEnv, any: missingEnvAny },
+        count: missingBins.length + missingEnv.length + missingEnvAny.length,
+      },
+      sub_skill_dependencies: {
+        skills: [],
+        missing_count: (entry.missing_skills || []).length,
+        inferred_count: 0,
+        missing_references: entry.missing_skills || [],
+      },
+    } : undefined,
+    dependency_count: entry.dependency_count ?? base?.dependency_count,
+  }
+}
+
+function combineCatalog(skills: Skill[], metas: MetaListResult): Skill[] {
+  if (metas.disabled) return skills.filter(skill => !isMeta(skill) || isLifecycleOnly(skill))
+  const combined = [...skills]
+  for (const entry of metas.skills) {
+    const meta = projectMeta(entry)
+    const matches = combined.flatMap((skill, index) => matchesIdentity(skill, meta) ? [index] : [])
+    if (matches.length === 1) {
+      const index = matches[0]!
+      combined[index] = projectMeta(entry, combined[index])
+    } else {
+      combined.push(meta)
+    }
+  }
+  return combined
+}
+
+export function createV4SkillCatalog(rpc: RpcTransport): SkillCatalog {
+  const invalidationListeners = new Set<() => void>()
+  function invalidate() {
+    for (const listener of invalidationListeners) {
+      // A view callback must not turn a committed mutation into a failed RPC.
+      try { listener() } catch { /* The next palette open also refreshes. */ }
+    }
+  }
+
+  async function compatibleMetaRead<T>(method: string, read: () => Promise<T>): Promise<T | null> {
+    if (!rpc.supports(method)) return null
+    try {
+      return await read()
+    } catch (error) {
+      if (readTransportFailure(error).code !== 'METHOD_NOT_FOUND') throw error
+      rpc.markUnsupported(method)
+      return null
+    }
+  }
+
+  return {
+    subscribeInvalidation(listener) {
+      invalidationListeners.add(listener)
+      return () => { invalidationListeners.delete(listener) }
+    },
+    supportsCandidates() {
+      return rpc.supports(SKILLS_CANDIDATES_METHOD)
+    },
+    async listCandidates(options) {
+      await rpc.ready({ signal: options?.signal })
+      if (!rpc.supports(SKILLS_CANDIDATES_METHOD)) {
+        throw new Error('Explicit skill selection requires an updated Gateway.')
+      }
+      const result = await rpc.request<SkillsCandidatesResult>(
+        SKILLS_CANDIDATES_METHOD,
+        options?.sessionKey ? { sessionKey: options.sessionKey } : {},
+        callOptions(options?.signal),
+      )
+      if (!validateSkillsCandidatesResult(result)) throw invalid(SKILLS_CANDIDATES_METHOD)
+      return result
+    },
+    supportsSetEnabled() {
+      return rpc.supports(SKILLS_SET_ENABLED_METHOD)
+    },
+    async setEnabled(request) {
+      await rpc.ready({ signal: request.signal })
+      if (!rpc.supports(SKILLS_SET_ENABLED_METHOD)) {
+        throw new Error('Changing skill availability requires an updated Gateway.')
+      }
+      const result = await rpc.request<SkillsSetEnabledResult>(
+        SKILLS_SET_ENABLED_METHOD,
+        { name: request.name, enabled: request.enabled },
+        callOptions(request.signal),
+      )
+      if (!validateSkillsSetEnabledResult(result)) throw invalid(SKILLS_SET_ENABLED_METHOD)
+      if (result.persisted) invalidate()
+      return result
+    },
     async list(options) {
       await rpc.ready({ signal: options?.signal })
       const params: SkillsListParams = { includeLifecycle: true }
-      const result = await rpc.request<SkillsListResult>(
-        SKILLS_LIST_METHOD,
-        { ...params },
-        callOptions(options?.signal),
-      )
+      const [result, metas] = await Promise.all([
+        rpc.request<SkillsListResult>(SKILLS_LIST_METHOD, { ...params }, callOptions(options?.signal)),
+        // meta.list predates the split catalog and lacks exact identity on old
+        // Gateways. Only the inspect capability identifies the new projection.
+        rpc.supports(META_INSPECT_METHOD)
+          ? compatibleMetaRead(META_LIST_METHOD, async () => {
+            const response = await rpc.request<MetaListResult>(
+              META_LIST_METHOD, undefined, callOptions(options?.signal),
+            )
+            if (!validateMetaListResult(response)) throw invalid(META_LIST_METHOD)
+            return response
+          })
+          : null,
+      ])
       if (!validateSkillsListResult(result)) throw invalid(SKILLS_LIST_METHOD)
-      return result.skills as unknown as Skill[]
+      const skills = result.skills as unknown as Skill[]
+      return metas ? combineCatalog(skills, metas) : skills
     },
     async detail(skill, options) {
+      await rpc.ready({ signal: options?.signal })
+      if (isMeta(skill) && !isLifecycleOnly(skill)) {
+        const params: MetaInspectParams = {
+          name: skill.name,
+          ...(skill.instance_id ? { instanceId: skill.instance_id } : {}),
+          ...(skill.install_id ? { installId: skill.install_id } : {}),
+        }
+        const detail = await compatibleMetaRead(META_INSPECT_METHOD, async () => {
+          const response = await rpc.request<MetaInspectResult>(
+            META_INSPECT_METHOD, { ...params }, callOptions(options?.signal),
+          )
+          if (!validateMetaInspectResult(response)) throw invalid(META_INSPECT_METHOD)
+          return response
+        })
+        if (detail) {
+          if ('disabled' in detail && detail.disabled) throw new Error('MetaSkill catalog is disabled.')
+          if (!('name' in detail)) throw invalid(META_INSPECT_METHOD)
+          if (detail.name !== skill.name
+            || (skill.instance_id && detail.instance_id !== skill.instance_id)
+            || (skill.install_id && detail.install_id !== skill.install_id)) {
+            throw new Error('MetaSkill identity changed; refresh the catalog.')
+          }
+          return {
+            ...projectMeta(detail, skill),
+            dependencies: detail.dependencies,
+            sub_skills: (detail.dependencies || []).map(item => item.name),
+          }
+        }
+      }
       const params: SkillsGetParams = {
         name: skill.name,
         includeLifecycle: true,
@@ -184,6 +388,7 @@ export function createV4SkillCatalog(rpc: RpcTransport): SkillCatalog {
         callOptions(options?.signal),
       )
       if (!validateSkillsReloadResult(result)) throw invalid(SKILLS_RELOAD_METHOD)
+      invalidate()
       return result as unknown as SkillReloadResult
     },
     async install(request) {
@@ -201,7 +406,19 @@ export function createV4SkillCatalog(rpc: RpcTransport): SkillCatalog {
         callOptions(request.signal),
       )
       if (!validateSkillsInstallResult(result)) throw invalid(SKILLS_INSTALL_METHOD)
+      if (result.success || result.installed) invalidate()
       return result as unknown as SkillInstallResult
+    },
+    supportsInstallStatus() {
+      return rpc.supports(SKILLS_INSTALL_STATUS_METHOD)
+    },
+    async installStatus(operationId, options) {
+      const result = await rpc.request<SkillsInstallStatusResult>(
+        SKILLS_INSTALL_STATUS_METHOD, { operationId }, callOptions(options?.signal),
+      )
+      if (!validateSkillsInstallStatusResult(result)) throw invalid(SKILLS_INSTALL_STATUS_METHOD)
+      if (result.state === 'succeeded') invalidate()
+      return result as unknown as SkillInstallStatus
     },
     supportsInstallCancellation() {
       return rpc.supports(SKILLS_INSTALL_CANCEL_METHOD)
@@ -231,10 +448,12 @@ export function createV4SkillCatalog(rpc: RpcTransport): SkillCatalog {
         callOptions(request.signal),
       )
       if (!validateSkillsDepsInstallResult(result)) throw invalid(SKILLS_DEPS_INSTALL_METHOD)
+      invalidate()
       return result as unknown as SkillInstallResult
     },
     async uninstall(request) {
-      const params: SkillsUninstallParams = {
+      // Missing identifiers still reach the Gateway's existing error path.
+      const params: Partial<SkillsUninstallParams> = {
         ...(request.name ? { name: request.name } : {}),
         ...(request.installId ? { installId: request.installId } : {}),
       }
@@ -244,6 +463,7 @@ export function createV4SkillCatalog(rpc: RpcTransport): SkillCatalog {
         callOptions(request.signal),
       )
       if (!validateSkillsUninstallResult(result)) throw invalid(SKILLS_UNINSTALL_METHOD)
+      if (result.success) invalidate()
       return result as unknown as SkillInstallResult
     },
     async proposals(options) {

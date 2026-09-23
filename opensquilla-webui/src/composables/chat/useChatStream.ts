@@ -426,7 +426,9 @@ export function useChatStream(options: UseChatStreamOptions) {
       category: 'maintenance',
       state,
       source: String(payload.source || 'automatic'),
-      durability: String(payload.durability || ''),
+      durability: rawStatus === 'emergency_ephemeral'
+        ? 'request_scoped'
+        : String(payload.durability || ''),
       detail: String(payload.detail || payload.phase || ''),
       reason: String(payload.reason || payload.skip_reason || ''),
     })
@@ -1303,6 +1305,7 @@ export function useChatStream(options: UseChatStreamOptions) {
         toolId: tc.toolId,
         name: tc.name,
         result: content,
+        executionLogHandle: payload.execution_log_handle,
         isError,
         input,
         at: Date.now(),
@@ -1347,6 +1350,7 @@ export function useChatStream(options: UseChatStreamOptions) {
       input: tc.inputRaw || tc.inputPreview,
       groupId: tc.groupId,
       result: tc.result,
+      execution_log_handle: tc.executionLogHandle,
       is_error: tc.isError,
       isError: tc.isError,
       execution_status: tc.status ? { status: tc.status } : undefined,

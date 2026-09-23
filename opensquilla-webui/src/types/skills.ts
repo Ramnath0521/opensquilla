@@ -1,4 +1,20 @@
 import type { SkillStatTile } from '@/components/skills/SkillsStats.vue'
+import type { SelectedSkillRef } from '@/types/selectedSkills'
+
+/** Metadata-only slash candidate. Skill instructions remain on the Gateway. */
+export interface SkillCandidate extends SelectedSkillRef {
+  generation: number
+  description: string
+  descriptionZh?: string
+  aliases: readonly string[]
+  kind: 'skill' | 'meta'
+  source: 'extra' | 'bundled' | 'managed' | 'personal' | 'project' | 'workspace'
+  disabled: boolean
+  manualOnly: boolean
+  ready: boolean
+  reason?: string
+  reasonCode?: string
+}
 
 export interface SkillInstall {
   id: string
@@ -149,6 +165,9 @@ export interface SkillDependencyInstallOutcome {
 
 export interface Skill {
   name: string
+  disabled?: boolean
+  user_invocable?: boolean
+  disable_model_invocation?: boolean
   description?: string
   description_zh?: string
   emoji?: string
@@ -176,6 +195,22 @@ export interface Skill {
   lifecycle?: SkillLifecycle
   diagnostics?: SkillDiagnostic[]
   invocation?: SkillInvocationCapability
+  visibility?: 'public' | 'meta' | 'internal' | 'tombstone' | 'experimental' | string
+  invocation_mode?: 'direct' | 'meta_only' | 'coding_only' | 'historical_only' | 'experimental_internal' | string
+  owner_meta_skills?: string[]
+  generation?: number
+  digest?: string
+  source?: string
+  dependency_count?: number
+  dependencies?: Array<{
+    name: string
+    available: boolean
+    visibility?: string
+    invocation?: string
+    owners?: string[]
+    digest?: string
+    source?: string
+  }>
 }
 
 export interface Proposal {
@@ -227,8 +262,15 @@ export interface RegistryResult {
   author?: string
   identifier?: string
   source?: string
+  license?: string
+  homepage?: string
+  upstream_url?: string
+  origin_source?: string
+  signature_status?: string
+  content_hash?: string
   trust_level?: string
   installed?: boolean
+  installId?: string
   install_reference?: string
   installReference?: string
   lifecycle?: SkillLifecycle

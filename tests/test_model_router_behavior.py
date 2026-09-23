@@ -102,9 +102,8 @@ def make_context(
     raw_message: str | None = None,
     attachments: list[dict] | None = None,
 ) -> TurnContext:
-    # Pin the packaged openrouter ladder: these tests assert tier moves by
-    # their distinct per-tier models, which the tokenrhythm default's uniform
-    # synthesized ladder cannot express.
+    # Pin the packaged OpenRouter ladder so tier transitions can be asserted
+    # against its distinct per-tier models.
     config = GatewayConfig(llm={"provider": "openrouter"})
     config.squilla_router.rollout_phase = rollout_phase
     return TurnContext(
@@ -204,11 +203,11 @@ async def test_full_rollout_applies_routed_model_thinking_and_p0_prompt(
 
     routed = await apply_squilla_router(ctx)
 
-    assert routed.model == "deepseek/deepseek-v4-pro"
+    assert routed.model == "deepseek/deepseek-v4-flash-0731"
     assert routed.metadata["routed_tier"] == "c1"
-    assert routed.metadata["routed_model"] == "deepseek/deepseek-v4-pro"
+    assert routed.metadata["routed_model"] == "deepseek/deepseek-v4-flash-0731"
     assert routed.metadata["routing_applied"] is True
-    assert routed.metadata["applied_model"] == "deepseek/deepseek-v4-pro"
+    assert routed.metadata["applied_model"] == "deepseek/deepseek-v4-flash-0731"
     assert routed.metadata["baseline_model"] == baseline_model
     assert routed.metadata["routing_confidence"] == 0.91
     assert routed.metadata["routing_source"] == "v4_phase3"
@@ -246,9 +245,9 @@ async def test_router_records_lower_text_tier_fallback_chain(
         "c0",
     ]
     assert [item["model"] for item in routed.metadata["router_fallback_chain"]] == [
-        "z-ai/glm-5.2",
-        "deepseek/deepseek-v4-pro",
-        "deepseek/deepseek-v4-flash",
+        "deepseek/deepseek-v4-pro-0813",
+        "deepseek/deepseek-v4-flash-0731",
+        "qwen/qwen3.7-flash",
     ]
 
 
@@ -286,7 +285,7 @@ async def test_router_reports_provider_state_loss_without_changing_route(
 
     routed = await apply_squilla_router(ctx)
 
-    assert routed.model == "deepseek/deepseek-v4-pro"
+    assert routed.model == "deepseek/deepseek-v4-flash-0731"
     diagnostic = routed.metadata["provider_state_continuity"]
     assert diagnostic["decision"] == "use_portable_fallback"
     assert diagnostic["provider_state_loss_risk"] is True
@@ -356,7 +355,7 @@ async def test_p2_prompt_hint_is_recorded_but_not_injected(
 
     routed = await apply_squilla_router(ctx)
 
-    assert routed.model == "anthropic/claude-opus-4.8"
+    assert routed.model == "z-ai/glm-5.3"
     assert routed.metadata["routed_tier"] == "c3"
     assert routed.metadata["thinking_level"] == "high"
     assert routed.metadata["prompt_policy"] == "P2"
@@ -408,7 +407,7 @@ async def test_confidence_gate_promotes_low_confidence_t0_to_default_t1_and_reco
     extra = routed.metadata["routing_extra"]
 
     assert routed.metadata["routed_tier"] == "c1"
-    assert routed.model == "deepseek/deepseek-v4-pro"
+    assert routed.model == "deepseek/deepseek-v4-flash-0731"
     assert extra["confidence_gate_applied"] is True
     assert extra["base_tier"] == "c0"
     assert extra["final_tier"] == "c1"
@@ -437,7 +436,7 @@ async def test_confidence_gate_falls_back_low_confidence_non_default_text_tier(
     extra = routed.metadata["routing_extra"]
 
     assert routed.metadata["routed_tier"] == "c1"
-    assert routed.model == "deepseek/deepseek-v4-pro"
+    assert routed.model == "deepseek/deepseek-v4-flash-0731"
     assert extra["confidence_gate_applied"] is True
     assert extra["pre_confidence_tier"] == "c2"
     assert extra["final_tier"] == "c1"
@@ -504,9 +503,41 @@ async def test_plain_text_large_context_floor_boundary_keeps_legacy_parity(
     expected_floor: str | None,
 ) -> None:
     fake_strategy(monkeypatch, "c0", 0.91, {"route_class": "R0"})
+    # Pin a compressed-text token estimate below the material heuristic. The
+    # legacy character boundary must not depend on the local tiktoken cache.
+    monkeypatch.setattr(
+        squilla_router_step, "estimate_tokens", lambda text: (len(text) + 7) // 8,
+    )
     ctx = make_context("a" * character_count)
 
     routed = await apply_squilla_router(ctx)
+
+    assert routed.metadata["routed_tier"] == expected_tier
+    assert routed.metadata.get("large_context_floor_min_tier") == expected_floor
+    assert "large_context_capacity_required" not in routed.metadata
+
+
+@pytest.mark.parametrize(
+    ("character_count", "expected_tier", "expected_floor"),
+    [
+        (49_998, "c0", None),
+        (50_000, "c2", "c2"),
+        (99_996, "c2", "c2"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_plain_text_large_context_floor_uses_conservative_tokenizer_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+    character_count: int,
+    expected_tier: str,
+    expected_floor: str | None,
+) -> None:
+    from opensquilla import token_estimation
+
+    monkeypatch.setattr(token_estimation, "_get_encoding", lambda: None)
+    fake_strategy(monkeypatch, "c0", 0.91, {"route_class": "R0"})
+
+    routed = await apply_squilla_router(make_context("a" * character_count))
 
     assert routed.metadata["routed_tier"] == expected_tier
     assert routed.metadata.get("large_context_floor_min_tier") == expected_floor
@@ -601,8 +632,10 @@ async def test_attachment_below_large_floor_uses_effective_request_capacity(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("legacy_setting", ["on", "trim:800", "sometimes"])
 async def test_complete_estimate_replaces_legacy_fixed_headroom_at_boundary(
     monkeypatch: pytest.MonkeyPatch,
+    legacy_setting: str,
 ) -> None:
     fake_strategy(monkeypatch, "c2", 0.91, {"route_class": "R2"})
     catalog = ModelCatalog()
@@ -615,26 +648,53 @@ async def test_complete_estimate_replaces_legacy_fixed_headroom_at_boundary(
         }
     )
     monkeypatch.setattr("opensquilla.provider.model_catalog._shared_catalog", catalog)
-    ctx = make_context(
-        "Use the attachment.",
-        attachments=[{"type": "text/plain"}],
-    )
-    ctx.config.squilla_router.auto_thinking = False
-    ctx.config.squilla_router.tiers = {
-        "c2": {
-            "provider": "openrouter",
-            "model": "boundary-safe",
-            "thinking_level": "off",
+    async def route() -> TurnContext:
+        ctx = make_context(
+            "Use the attachment.",
+            attachments=[{"type": "text/plain"}],
+        )
+        ctx.config.squilla_router.auto_thinking = False
+        ctx.config.squilla_router.tiers = {
+            "c2": {
+                "provider": "openrouter",
+                "model": "boundary-safe",
+                "thinking_level": "off",
+            }
         }
-    }
-    ctx.metadata["attachment_material_estimated_tokens"] = 40_000
+        ctx.metadata["attachment_material_estimated_tokens"] = 40_000
+        return await finalize_squilla_router_capacity(await apply_squilla_router(ctx))
 
-    routed = await finalize_squilla_router_capacity(
-        await apply_squilla_router(ctx)
-    )
+    monkeypatch.delenv("OPENSQUILLA_TURN_OBJECTIVE_REMINDER", raising=False)
+    baseline = await route()
+    monkeypatch.setenv("OPENSQUILLA_TURN_OBJECTIVE_REMINDER", legacy_setting)
+    routed = await route()
 
     assert routed.metadata["routed_tier"] == "c2"
     assert routed.metadata["large_context_request_input_tokens"] < 47_600
+    assert routed.metadata["large_context_request_input_tokens"] == (
+        baseline.metadata["large_context_request_input_tokens"]
+    )
+    assert routed.metadata["large_context_runtime_context_tokens"] > 0
+    assert "large_context_request_reminder_tokens" not in routed.metadata
+
+
+@pytest.mark.parametrize("dynamic_suffix", [False, True])
+def test_additional_request_context_capacity_is_counted_once(dynamic_suffix: bool) -> None:
+    ctx = make_context("Inspect the attachment.", attachments=[{"type": "text/plain"}])
+    ctx.system_prompt = ("Stable system", "Daily context") if dynamic_suffix else "Stable system"
+    ctx.metadata["attachment_material_estimated_tokens"] = 1_000
+    before = squilla_router_step._complete_request_estimated_tokens(ctx, ctx.message)
+    ctx.metadata["routing_additional_request_context_tokens"] = 8_000
+
+    after = squilla_router_step._complete_request_estimated_tokens(ctx, ctx.message)
+
+    # A dynamic suffix already reserves the one request-context wrapper.
+    # Proposal text extends that same message; repeated admission is not additive.
+    new_wrapper = (
+        0 if dynamic_suffix else ctx.metadata["large_context_request_context_wrapper_tokens"]
+    )
+    assert after == before + 8_000 + new_wrapper
+    assert squilla_router_step._complete_request_estimated_tokens(ctx, ctx.message) == after
 
 
 @pytest.mark.asyncio
@@ -725,6 +785,109 @@ async def test_catalog_unknown_custom_attachment_config_has_actionable_error(
     assert "llm.context_window_tokens" in routed.metadata[
         "large_context_capacity_block_reason"
     ]
+
+
+def _attachment_history_pressure_context(monkeypatch: pytest.MonkeyPatch) -> TurnContext:
+    catalog = ModelCatalog()
+    catalog.set_user_overrides({
+        "openrouter/image-model": {
+            "context_window": 32_000, "max_output_tokens": 4_000,
+        },
+    })
+    monkeypatch.setattr("opensquilla.provider.model_catalog._shared_catalog", catalog)
+    ctx = make_context("Inspect the supplied image.", attachments=[{"type": "image/png"}])
+    ctx.config.squilla_router.auto_thinking = False
+    ctx.config.squilla_router.tiers = {
+        "c1": {
+            "provider": "openrouter", "model": "image-model", "thinking_level": "off",
+        },
+    }
+    ctx.model = "image-model"
+    ctx.metadata.update({
+        "routed_tier": "c1", "routing_applied": True,
+        "router_image_tier_support": {"c1": "supported"},
+        "attachment_material_estimated_tokens": 1_000,
+        "routing_history_capacity_estimated_tokens": 50_000,
+        "routing_history_capacity_message_count": 20,
+        "routing_history_capacity_estimate_complete": True,
+    })
+    return ctx
+
+
+@pytest.mark.asyncio
+async def test_known_attachment_history_pressure_can_readmit_once(monkeypatch) -> None:
+    ctx = _attachment_history_pressure_context(monkeypatch)
+    routed = await finalize_squilla_router_capacity(ctx, allow_compaction_retry=True)
+    assert routed.metadata["large_context_capacity_retry_pending"] is True
+    assert not routed.metadata.get("large_context_capacity_blocked")
+    assert routed.metadata["large_context_capacity_provisional_model"] == "image-model"
+    assert routed.attachments == ctx.attachments
+    await finalize_squilla_router_capacity(routed)
+    assert routed.metadata["large_context_capacity_retry_pending"] is True
+
+    routed.metadata["routing_history_capacity_estimated_tokens"] = 1_000
+    routed.metadata["routing_history_capacity_message_count"] = 2
+    await finalize_squilla_router_capacity(routed, retry_after_compaction=True)
+    assert routed.metadata["large_context_capacity_status"] == "fits"
+    assert routed.metadata["large_context_capacity_retry_attempted"] is True
+    assert routed.metadata["large_context_capacity_retry_pending"] is False
+    assert routed.model == "image-model"
+    await finalize_squilla_router_capacity(routed, retry_after_compaction=True)
+    assert routed.metadata["large_context_capacity_blocked"] is True
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("guard", [
+    "disabled", "unknown", "oversized_current", "no_history", "incomplete_history",
+    "ensemble", "tier_ensemble", "cron", "subagent", "already_attempted",
+])
+async def test_attachment_capacity_retry_requires_removable_known_history(
+    monkeypatch, guard,
+) -> None:
+    ctx = _attachment_history_pressure_context(monkeypatch)
+    if guard == "disabled":
+        ctx.config.compaction.enabled = False
+    elif guard == "unknown":
+        monkeypatch.setattr("opensquilla.provider.model_catalog._shared_catalog", ModelCatalog())
+    elif guard == "oversized_current":
+        ctx.metadata["attachment_material_estimated_tokens"] = 50_000
+    elif guard == "no_history":
+        ctx.metadata["routing_history_capacity_estimated_tokens"] = 0
+        ctx.metadata["attachment_material_estimated_tokens"] = 50_000
+    elif guard == "incomplete_history":
+        ctx.metadata["routing_history_capacity_estimate_complete"] = False
+    elif guard == "ensemble":
+        ctx.config.llm_ensemble.enabled = True
+    elif guard == "tier_ensemble":
+        ctx.config.squilla_router.tiers["c1"]["ensemble_selection_mode"] = "custom_b5"
+    elif guard in {"cron", "subagent"}:
+        ctx.session_key = f"{guard}:synthetic"
+    elif guard == "already_attempted":
+        ctx.metadata["large_context_capacity_retry_attempted"] = True
+    routed = await finalize_squilla_router_capacity(ctx, allow_compaction_retry=True)
+    assert routed.metadata.get("large_context_capacity_retry_pending") is not True
+    assert routed.metadata["large_context_capacity_blocked"] is True
+
+
+@pytest.mark.asyncio
+async def test_attachment_retry_still_too_large_does_not_switch_to_new_tier(monkeypatch) -> None:
+    ctx = _attachment_history_pressure_context(monkeypatch)
+    await finalize_squilla_router_capacity(ctx, allow_compaction_retry=True)
+    ctx.config.squilla_router.tiers["c2"] = {
+        "provider": "openrouter", "model": "larger-model", "thinking_level": "off",
+    }
+    catalog = ModelCatalog()
+    catalog.set_user_overrides({
+        "openrouter/image-model": {"context_window": 32_000, "max_output_tokens": 4_000},
+        "openrouter/larger-model": {"context_window": 200_000, "max_output_tokens": 4_000},
+    })
+    monkeypatch.setattr("opensquilla.provider.model_catalog._shared_catalog", catalog)
+    await finalize_squilla_router_capacity(ctx, retry_after_compaction=True)
+    assert ctx.metadata["large_context_capacity_retry_attempted"] is True
+    assert ctx.metadata["large_context_capacity_blocked"] is True
+    assert "/compact" in ctx.metadata["large_context_capacity_block_reason"]
+    assert "llm.context_window_tokens" not in ctx.metadata["large_context_capacity_block_reason"]
+    assert ctx.model == "image-model"
 
 
 @pytest.mark.asyncio
@@ -905,7 +1068,7 @@ async def test_anti_downgrade_keeps_recent_higher_tier_despite_confidence_gate(
     extra = routed2.metadata["routing_extra"]
 
     assert routed2.metadata["routed_tier"] == "c2"
-    assert routed2.model == "z-ai/glm-5.2"
+    assert routed2.model == "deepseek/deepseek-v4-pro-0813"
     assert extra["confidence_gate_applied"] is True
     assert extra["pre_confidence_tier"] == "c0"
     assert extra["final_tier"] == "c2"
@@ -928,7 +1091,7 @@ async def test_anti_downgrade_keeps_recent_higher_tier_despite_confidence_gate(
     extra3 = routed3.metadata["routing_extra"]
 
     assert routed3.metadata["routed_tier"] == "c2"
-    assert routed3.model == "z-ai/glm-5.2"
+    assert routed3.model == "deepseek/deepseek-v4-pro-0813"
     assert extra3["confidence_gate_applied"] is False
     assert extra3["anti_downgrade_applied"] is True
     assert extra3["previous_tier"] == "c2"
@@ -982,7 +1145,7 @@ async def test_anti_downgrade_uses_previous_turn_not_window_highest(
     extra3 = routed3.metadata["routing_extra"]
 
     assert routed3.metadata["routed_tier"] == "c2"
-    assert routed3.model == "z-ai/glm-5.2"
+    assert routed3.model == "deepseek/deepseek-v4-pro-0813"
     assert extra3["anti_downgrade_applied"] is True
     assert extra3["previous_tier"] == "c2"
 
@@ -1023,7 +1186,7 @@ async def test_anti_downgrade_keeps_previous_high_tier_without_margin_gate(
     extra = routed2.metadata["routing_extra"]
 
     assert routed2.metadata["routed_tier"] == "c3"
-    assert routed2.model == "anthropic/claude-opus-4.8"
+    assert routed2.model == "z-ai/glm-5.3"
     assert extra["anti_downgrade_applied"] is True
     assert extra["previous_tier"] == "c3"
     assert extra["kv_cache_window_seconds"] == 600
@@ -1049,7 +1212,7 @@ async def test_complaint_upgrade_promotes_tier_thinking_and_blocks_compressed_pr
     extra = routed.metadata["routing_extra"]
 
     assert routed.metadata["routed_tier"] == "c2"
-    assert routed.model == "z-ai/glm-5.2"
+    assert routed.model == "deepseek/deepseek-v4-pro-0813"
     assert extra["complaint_detected"] is True
     assert extra["complaint_upgrade_applied"] is True
     assert routed.metadata["thinking_mode"] == "T2"
@@ -1092,7 +1255,7 @@ async def test_complaint_upgrade_starts_from_previous_experienced_tier(
     extra = routed2.metadata["routing_extra"]
 
     assert routed2.metadata["routed_tier"] == "c3"
-    assert routed2.model == "anthropic/claude-opus-4.8"
+    assert routed2.model == "z-ai/glm-5.3"
     assert extra["previous_tier"] == "c2"
     assert extra["complaint_detected"] is True
     assert extra["complaint_upgrade_applied"] is True
@@ -1263,7 +1426,7 @@ def test_v4_request_contains_current_history_assistant_and_route_context() -> No
 
 
 @pytest.mark.asyncio
-async def test_image_input_routes_directly_to_vision_model_without_prompt_injection(
+async def test_catalog_text_only_ladder_projects_image_without_prompt_injection(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(
@@ -1275,23 +1438,38 @@ async def test_image_input_routes_directly_to_vision_model_without_prompt_inject
         "What is in this screenshot?",
         attachments=[{"type": "image", "mime_type": "image/png"}],
     )
+    catalog = ModelCatalog()
+    catalog._populate_from_data(
+        [
+            {"id": tier["model"], "architecture": {"input_modalities": ["text"]}}
+            for name, tier in ctx.config.squilla_router.tiers.items()
+            if name in {"c0", "c1", "c2", "c3"}
+        ]
+    )
+    monkeypatch.setattr("opensquilla.provider.model_catalog._shared_catalog", catalog)
 
     routed = await apply_squilla_router(ctx)
 
-    assert routed.model == "moonshotai/kimi-k2.6"
-    assert routed.metadata["routed_tier"] == "image_model"
-    assert routed.metadata["routed_model"] == "moonshotai/kimi-k2.6"
+    assert routed.model == ctx.config.squilla_router.tiers["c1"]["model"]
+    assert routed.metadata["routed_tier"] == "c1"
+    assert routed.metadata["routed_model"] == routed.model
     assert routed.metadata["routing_applied"] is True
     assert routed.metadata["routing_confidence"] == 1.0
     assert routed.metadata["routing_source"] == "image_route"
-    assert routed.metadata["route_max_history_turns"] == 1
+    assert routed.metadata["image_input_mode"] == "marker"
+    assert routed.metadata["image_input_projection_required"] is True
+    assert routed.metadata["router_fallback_strict"] is True
+    assert routed.metadata["router_fallback_chain"] == []
+    assert "route_max_history_turns" not in routed.metadata
     assert routed.metadata["thinking_requested"] is True
-    assert routed.metadata["thinking_level"] == "medium"
+    assert routed.metadata["thinking_level"] == ctx.config.squilla_router.tiers["c1"][
+        "thinking_level"
+    ]
     assert "[RESPONSE_POLICY:" not in routed.message
 
 
 @pytest.mark.asyncio
-async def test_tokenrhythm_default_image_route_skips_kimi_code_c2(
+async def test_tokenrhythm_default_image_route_uses_configured_catalog_vision(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(
@@ -1300,8 +1478,8 @@ async def test_tokenrhythm_default_image_route_skips_kimi_code_c2(
         lambda _config: pytest.fail("image routing should not invoke text strategy"),
     )
     config = GatewayConfig()
-    assert config.squilla_router.tiers["c2"]["model"] == "kimi-k2.7-code"
-    assert config.squilla_router.tiers["c2"]["supports_image"] is False
+    assert config.squilla_router.tiers["c0"]["model"] == "qwen3.7-flash"
+    config.squilla_router.tiers["c0"]["supports_image"] = False
     ctx = TurnContext(
         message="What is in this screenshot?",
         session_key="test-tokenrhythm-image",
@@ -1315,8 +1493,18 @@ async def test_tokenrhythm_default_image_route_skips_kimi_code_c2(
 
     routed = await apply_squilla_router(ctx)
 
-    assert routed.metadata["routed_tier"] == "image_model"
-    assert routed.model == "kimi-k2.6"
+    assert routed.metadata["routed_tier"] == "c0"
+    assert routed.model == config.squilla_router.tiers["c0"]["model"]
+    assert routed.metadata["image_input_mode"] == "native"
+    assert routed.metadata["routed_model_vision_support"] == "supported"
+    assert routed.metadata["router_fallback_chain"] == [
+        {
+            "tier": "c1",
+            "model": "deepseek-flash",
+            "vision_support": "supported",
+            "provider": "tokenrhythm",
+        }
+    ]
 
 
 @pytest.mark.asyncio
@@ -1328,7 +1516,7 @@ async def test_tokenrhythm_default_image_route_skips_kimi_code_c2(
     ],
     ids=["shared", "legacy"],
 )
-async def test_c3_fusion_prefers_dedicated_image_model(
+async def test_c3_fusion_ignores_legacy_image_model_and_uses_configured_c0(
     monkeypatch: pytest.MonkeyPatch,
     fusion_config: dict[str, object],
 ) -> None:
@@ -1360,8 +1548,12 @@ async def test_c3_fusion_prefers_dedicated_image_model(
 
     routed = await apply_squilla_router(ctx)
 
-    assert routed.metadata["routed_tier"] == "image_model"
-    assert routed.model == "vision/dedicated"
+    assert routed.metadata["routed_tier"] == "c0"
+    assert routed.model == "vision/fast"
+    assert all(
+        entry["tier"] != "image_model"
+        for entry in routed.metadata["router_fallback_chain"]
+    )
 
 
 @pytest.mark.asyncio
@@ -1405,7 +1597,7 @@ async def test_c3_fusion_uses_another_non_c3_image_tier_without_dedicated_model(
 
 
 @pytest.mark.asyncio
-async def test_c3_fusion_rejects_image_input_when_no_independent_image_tier_is_available(
+async def test_c3_fusion_with_no_independent_image_tier_uses_marker(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(
@@ -1427,13 +1619,15 @@ async def test_c3_fusion_rejects_image_input_when_no_independent_image_tier_is_a
 
     result = await apply_squilla_router(ctx)
 
-    assert result.metadata["image_input_forced_rejection_reason"] == (
-        "router_image_route_unavailable"
-    )
+    assert result.metadata["routed_tier"] == "c3"
+    assert result.metadata["image_input_mode"] == "marker"
+    assert result.metadata["image_input_projection_required"] is True
+    assert result.metadata["router_image_capability_exhausted"] is True
+    assert result.metadata["router_fallback_chain"] == []
 
 
 @pytest.mark.asyncio
-async def test_global_fusion_rejects_c3_as_the_only_image_fallback(
+async def test_global_fusion_with_c3_only_uses_marker(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(
@@ -1457,9 +1651,10 @@ async def test_global_fusion_rejects_c3_as_the_only_image_fallback(
 
     result = await apply_squilla_router(ctx)
 
-    assert result.metadata["image_input_forced_rejection_reason"] == (
-        "router_image_route_unavailable"
-    )
+    assert result.metadata["routed_tier"] == "c3"
+    assert result.metadata["image_input_mode"] == "marker"
+    assert result.metadata["router_image_capability_exhausted"] is True
+    assert result.metadata["router_fallback_chain"] == []
 
 
 @pytest.mark.asyncio
@@ -1490,7 +1685,7 @@ async def test_single_c3_remains_available_for_image_routing(
 
 
 @pytest.mark.asyncio
-async def test_image_route_prefers_dedicated_tier_over_declaration_order(
+async def test_image_route_ignores_legacy_dedicated_tier(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(
@@ -1503,7 +1698,7 @@ async def test_image_route_prefers_dedicated_tier_over_declaration_order(
         attachments=[{"type": "image/png", "data": "abc"}],
     )
     ctx.config.squilla_router.tiers = {
-        "vision_primary": {
+        "c0": {
             "model": "vision/primary",
             "supports_image": True,
         },
@@ -1516,12 +1711,13 @@ async def test_image_route_prefers_dedicated_tier_over_declaration_order(
 
     routed = await apply_squilla_router(ctx)
 
-    assert routed.metadata["routed_tier"] == "image_model"
-    assert routed.model == "vision/dedicated"
+    assert routed.metadata["routed_tier"] == "c0"
+    assert routed.model == "vision/primary"
+    assert routed.metadata["router_image_configured_tiers"] == ["c0"]
 
 
 @pytest.mark.asyncio
-async def test_image_route_falls_back_when_dedicated_tier_has_blank_model(
+async def test_image_route_uses_c_tier_when_legacy_image_model_is_blank(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(
@@ -1534,7 +1730,7 @@ async def test_image_route_falls_back_when_dedicated_tier_has_blank_model(
         attachments=[{"type": "image/png", "data": "abc"}],
     )
     ctx.config.squilla_router.tiers = {
-        "vision_primary": {
+        "c0": {
             "model": "vision/primary",
             "supports_image": True,
         },
@@ -1547,12 +1743,12 @@ async def test_image_route_falls_back_when_dedicated_tier_has_blank_model(
 
     routed = await apply_squilla_router(ctx)
 
-    assert routed.metadata["routed_tier"] == "vision_primary"
+    assert routed.metadata["routed_tier"] == "c0"
     assert routed.model == "vision/primary"
 
 
 @pytest.mark.asyncio
-async def test_image_route_rejects_when_every_image_tier_has_blank_model(
+async def test_image_route_with_no_configured_c_tier_degrades_to_marker(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(
@@ -1575,9 +1771,12 @@ async def test_image_route_rejects_when_every_image_tier_has_blank_model(
 
     result = await apply_squilla_router(ctx)
 
-    assert result.metadata["image_input_forced_rejection_reason"] == (
-        "router_image_route_unavailable"
-    )
+    assert result.metadata["image_input_mode"] == "marker"
+    assert result.metadata["image_input_projection_required"] is True
+    assert result.metadata["router_image_capability_exhausted"] is True
+    assert result.metadata["routing_applied"] is True
+    assert result.metadata["router_fallback_strict"] is True
+    assert result.metadata["router_fallback_chain"] == []
 
 
 @pytest.mark.asyncio
@@ -1608,23 +1807,16 @@ async def test_large_image_attachment_bypass_honors_capacity_floor(
         attachments=[{"type": "image", "mime_type": "image/png"}],
     )
     ctx.config.squilla_router.tiers = {
-        "vision_small": {
+        "c0": {
             "provider": "foreign",
             "model": "vision-small",
             "supports_image": True,
-            "image_only": True,
-            "thinking_level": "off",
-        },
-        "vision_large": {
-            "provider": "openrouter",
-            "model": "vision-large",
-            "supports_image": True,
-            "image_only": True,
             "thinking_level": "off",
         },
         "c3": {
             "provider": "openrouter",
             "model": "vision-large",
+            "supports_image": True,
             "thinking_level": "off",
         },
     }
@@ -1634,7 +1826,7 @@ async def test_large_image_attachment_bypass_honors_capacity_floor(
     routed = await apply_squilla_router(ctx)
 
     assert routed.metadata["large_context_floor_min_tier"] == "c3"
-    assert routed.metadata["routed_tier"] == "vision_large"
+    assert routed.metadata["routed_tier"] == "c3"
     assert routed.model == "vision-large"
     assert routed.metadata["router_fallback_chain"] == []
     assert "router_tier_provider_mismatch" not in routed.metadata
@@ -1736,22 +1928,22 @@ async def test_image_route_uses_first_configured_image_tier_without_random_choic
         attachments=[{"type": "image/png", "data": "abc"}],
     )
     ctx.config.squilla_router.tiers = {
-        "vision_primary": {
+        "c0": {
             "model": "vision/primary",
             "supports_image": True,
             "thinking_level": "low",
         },
-        "vision_backup": {
+        "c2": {
             "model": "vision/backup",
             "supports_image": True,
             "thinking_level": "high",
         },
-        "c1": {"model": "text/model"},
+        "c1": {"model": "text/model", "supports_image": False},
     }
 
     routed = await apply_squilla_router(ctx)
 
-    assert routed.metadata["routed_tier"] == "vision_primary"
+    assert routed.metadata["routed_tier"] == "c0"
     assert routed.metadata["routed_model"] == "vision/primary"
     assert routed.model == "vision/primary"
 
@@ -1772,13 +1964,12 @@ async def test_image_route_records_tier_provider_for_cross_provider_execution(
     ctx.config.llm.provider = "anthropic"
     ctx.config.squilla_router.cross_provider_tiers = True
     ctx.config.squilla_router.tiers = {
-        "image_model": {
+        "c0": {
             "model": "vision/model-1",
             "provider": "openai",
             "supports_image": True,
-            "image_only": True,
         },
-        "c1": {"model": "text/model-1"},
+        "c1": {"model": "text/model-1", "supports_image": False},
     }
 
     routed = await apply_squilla_router(ctx)
@@ -1804,13 +1995,12 @@ async def test_image_route_flags_tier_provider_mismatch_when_cross_provider_disa
     ctx.config.llm.provider = "anthropic"
     ctx.config.squilla_router.cross_provider_tiers = False
     ctx.config.squilla_router.tiers = {
-        "image_model": {
+        "c0": {
             "model": "vision/model-1",
             "provider": "openai",
             "supports_image": True,
-            "image_only": True,
         },
-        "c1": {"model": "text/model-1"},
+        "c1": {"model": "text/model-1", "supports_image": False},
     }
 
     routed = await apply_squilla_router(ctx)
@@ -1837,13 +2027,16 @@ async def test_global_fixed_lineup_keeps_image_provider_direct(
     ctx.config.llm_ensemble.selection_mode = "static_openrouter_b5"
     ctx.config.squilla_router.cross_provider_tiers = False
     ctx.config.squilla_router.tiers = {
-        "image_model": {
+        "c0": {
             "model": "vision/model-1",
             "provider": "openai",
             "supports_image": True,
-            "image_only": True,
         },
-        "c1": {"model": "text/model-1", "provider": "openai"},
+        "c1": {
+            "model": "text/model-1",
+            "provider": "openai",
+            "supports_image": False,
+        },
     }
 
     routed = await apply_squilla_router(ctx)
@@ -1855,32 +2048,35 @@ async def test_global_fixed_lineup_keeps_image_provider_direct(
 
 
 @pytest.mark.asyncio
-async def test_gate_needs_image_routes_followup_to_vision_model(
+async def test_image_context_routes_followup_to_vision_model(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(
         squilla_router_step,
         "_get_strategy",
-        lambda _config: pytest.fail("gate image routing should not invoke text strategy"),
+        lambda _config: pytest.fail("image context routing should not invoke text strategy"),
     )
     ctx = make_context("Continue from that image.")
     ctx.metadata["router_history_has_recent_image"] = True
     ctx.metadata["router_history_image_turn_count"] = 2
     ctx.metadata["router_turns_since_last_image"] = 1
-    ctx.metadata["router_vision_followup_gate_decision"] = "needs_image"
-    ctx.metadata["router_vision_followup_needs_image"] = True
+    ctx.metadata["image_context_has_images"] = True
+    ctx.config.squilla_router.tiers = {
+        "c0": {"model": "configured/vision", "supports_image": True},
+        "c1": {"model": "configured/text", "supports_image": False},
+    }
 
     routed = await apply_squilla_router(ctx)
 
-    assert routed.model == "moonshotai/kimi-k2.6"
-    assert routed.metadata["routed_tier"] == "image_model"
+    assert routed.model == "configured/vision"
+    assert routed.metadata["routed_tier"] == "c0"
     assert routed.metadata["routing_source"] == "image_route"
-    assert routed.metadata["image_route_reason"] == "gate_history"
-    assert routed.metadata["route_max_history_turns"] == 8
+    assert routed.metadata["image_route_reason"] == "history_context"
+    assert "route_max_history_turns" not in routed.metadata
 
 
 @pytest.mark.asyncio
-async def test_sticky_without_gate_no_longer_routes_to_vision_model(
+async def test_sticky_without_image_context_does_not_route_to_vision_model(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     strategy = fake_strategy(
@@ -1893,8 +2089,7 @@ async def test_sticky_without_gate_no_longer_routes_to_vision_model(
     ctx.metadata["router_history_has_recent_image"] = True
     ctx.metadata["router_history_image_turn_count"] = 1
     ctx.metadata["router_vision_sticky_remaining"] = 3
-    ctx.metadata["router_vision_followup_gate_decision"] = "text_only"
-    ctx.metadata["router_vision_followup_needs_image"] = False
+    ctx.metadata["image_context_has_images"] = False
 
     routed = await apply_squilla_router(ctx)
 
@@ -1926,7 +2121,7 @@ async def test_recent_historical_image_without_sticky_uses_text_router(
 
 
 @pytest.mark.asyncio
-async def test_image_attachment_without_image_tier_fails_locally(
+async def test_image_attachment_without_multimodal_c_tier_uses_marker(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(
@@ -1941,12 +2136,22 @@ async def test_image_attachment_without_image_tier_fails_locally(
         attachments=[{"type": "image", "mime_type": "image/png"}],
     )
     ctx.config.squilla_router.tiers["image_model"]["supports_image"] = False
+    catalog = ModelCatalog()
+    catalog._populate_from_data(
+        [
+            {"id": tier["model"], "architecture": {"input_modalities": ["text"]}}
+            for name, tier in ctx.config.squilla_router.tiers.items()
+            if name in {"c0", "c1", "c2", "c3"}
+        ]
+    )
+    monkeypatch.setattr("opensquilla.provider.model_catalog._shared_catalog", catalog)
 
     result = await apply_squilla_router(ctx)
 
-    assert result.metadata["image_input_forced_rejection_reason"] == (
-        "router_image_route_unavailable"
-    )
+    assert result.metadata["routed_tier"] == "c1"
+    assert result.metadata["image_input_mode"] == "marker"
+    assert result.metadata["image_input_projection_required"] is True
+    assert result.metadata["router_fallback_chain"] == []
 
 
 @pytest.mark.asyncio
@@ -1967,11 +2172,12 @@ async def test_caption_less_image_attachment_still_routes_to_vision_tier(
         routed = await apply_squilla_router(ctx)
 
         assert routed.metadata["routing_source"] == "image_route"
-        assert routed.metadata["routed_tier"] == "image_model"
+        assert routed.metadata["routed_tier"] == "c0"
+        assert routed.metadata["image_input_mode"] == "native"
 
 
 @pytest.mark.asyncio
-async def test_caption_less_image_attachment_without_image_tier_fails_locally(
+async def test_caption_less_image_without_multimodal_c_tier_uses_marker(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(
@@ -1986,12 +2192,21 @@ async def test_caption_less_image_attachment_without_image_tier_fails_locally(
         attachments=[{"type": "image", "mime_type": "image/png"}],
     )
     ctx.config.squilla_router.tiers["image_model"]["supports_image"] = False
+    catalog = ModelCatalog()
+    catalog._populate_from_data(
+        [
+            {"id": tier["model"], "architecture": {"input_modalities": ["text"]}}
+            for name, tier in ctx.config.squilla_router.tiers.items()
+            if name in {"c0", "c1", "c2", "c3"}
+        ]
+    )
+    monkeypatch.setattr("opensquilla.provider.model_catalog._shared_catalog", catalog)
 
     result = await apply_squilla_router(ctx)
 
-    assert result.metadata["image_input_forced_rejection_reason"] == (
-        "router_image_route_unavailable"
-    )
+    assert result.metadata["routed_tier"] == "c1"
+    assert result.metadata["image_input_mode"] == "marker"
+    assert result.metadata["router_fallback_chain"] == []
 
 
 @pytest.mark.asyncio
@@ -2042,7 +2257,7 @@ async def test_observe_rollout_records_decisions_without_applying_model_or_promp
 
     assert routed.model == baseline_model
     assert routed.metadata["routed_tier"] == "c2"
-    assert routed.metadata["routed_model"] == "z-ai/glm-5.2"
+    assert routed.metadata["routed_model"] == "deepseek/deepseek-v4-pro-0813"
     assert routed.metadata["routing_applied"] is False
     assert routed.metadata["thinking_mode"] == "T2"
     assert routed.metadata["thinking_level"] == "medium"
@@ -2156,7 +2371,7 @@ async def test_runtime_router_short_chinese_prompt_injects_localized_p0_hint() -
 
     assert routed.metadata["routing_source"] == "v4_phase3"
     assert routed.metadata["routed_tier"] == "c0"
-    assert routed.model == "deepseek/deepseek-v4-flash"
+    assert routed.model == "qwen/qwen3.7-flash"
     assert routed.metadata["thinking_mode"] == "T0"
     assert routed.metadata.get("thinking_requested") is None
     assert routed.metadata["prompt_policy"] == "P0"
@@ -2172,7 +2387,7 @@ async def test_runtime_router_complex_request_applies_deep_thinking_without_p2_p
 
     assert routed.metadata["routing_source"] == "v4_phase3"
     assert routed.metadata["routed_tier"] == "c3"
-    assert routed.model == "anthropic/claude-opus-4.8"
+    assert routed.model == "z-ai/glm-5.3"
     assert routed.metadata["thinking_mode"] == "T3"
     assert routed.metadata["thinking_requested"] is True
     assert routed.metadata["thinking_level"] == "high"

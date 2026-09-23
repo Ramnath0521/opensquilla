@@ -57,20 +57,26 @@ def pending_input_payload(turn: AdmitTurn, confirmed_plain_text: bool) -> dict[s
         "clientMessageId": turn.client_message_id,
         "_source": source,
     }
+    if turn.workspace_files:
+        payload["workspaceFiles"] = list(turn.workspace_files)
     if turn.intent_was_provided:
         payload["intent"] = turn.intent
     for name, value in (
         ("workspaceId", turn.workspace_id),
         ("collaborationMode", turn.initial_collaboration_mode),
         ("initialRoutingMode", turn.initial_routing_mode),
+        ("initialModel", turn.initial_model),
+        ("initialProvider", turn.initial_provider),
         ("displayText", turn.display_text),
     ):
         if value is not None:
             payload[name] = value
     if confirmed_plain_text:
         payload["confirmedPlainText"] = True
-    if turn.prompt_annotation_ids:
-        payload["promptAnnotationIds"] = list(turn.prompt_annotation_ids)
+    if turn.page_context is not None:
+        payload["pageContext"] = turn.page_context
+    if turn.selected_skills:
+        payload["selectedSkills"] = list(turn.selected_skills)
     return payload
 
 
@@ -113,17 +119,23 @@ def pending_input_projection(
         "replayed": replayed,
         "schemaVersion": row.schema_version,
     }
+    if payload.get("workspaceFiles"):
+        result["workspaceFiles"] = payload["workspaceFiles"]
     display = payload.get("displayText")
     if isinstance(display, str):
         result["displayText"] = display
     if payload.get("confirmedPlainText") is True:
         result["confirmedPlainText"] = True
-    annotations = payload.get("promptAnnotationIds")
-    if isinstance(annotations, list) and annotations:
-        result["promptAnnotationIds"] = [item for item in annotations if isinstance(item, str)][:16]
+    if isinstance(payload.get("pageContext"), dict):
+        result["pageContext"] = payload["pageContext"]
+    if payload.get("selectedSkills"):
+        result["selectedSkills"] = payload["selectedSkills"]
     routing = payload.get("initialRoutingMode")
     if isinstance(routing, str):
         result["initialRoutingMode"] = routing
+    for field in ("initialModel", "initialProvider"):
+        if isinstance(payload.get(field), str):
+            result[field] = payload[field]
     return cast(PendingInputProjection, result)
 
 
@@ -155,9 +167,11 @@ def stored_pending_input(row: PendingChatInput) -> StoredPendingInput:
         turn=turn,
         projection=pending_input_projection(row),
         material_scopes=scopes,
-        has_non_text_semantics=any(
+        has_non_text_semantics=bool(turn.selected_skills) or any(
             row.payload.get(name) is not None
             for name in (
+                "pageContext",
+                "workspaceFiles",
                 "intent",
                 "model",
                 "model_id",

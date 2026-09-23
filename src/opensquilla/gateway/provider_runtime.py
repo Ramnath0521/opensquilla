@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from opensquilla.provider.selector import ProviderConfig
 
 
-def resolve_provider_selector_config(config: Any) -> Any | None:
+def resolve_provider_selector_config(config: Any) -> ProviderConfig | None:
     llm_config = getattr(config, "llm", None)
     if llm_config is None:
         return None
@@ -21,6 +24,7 @@ def resolve_provider_selector_config(config: Any) -> Any | None:
         base_url=runtime.base_url,
         proxy=runtime.proxy,
         provider_routing=runtime.provider_routing,
+        extra_body=runtime.extra_body,
     )
 
 

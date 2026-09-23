@@ -22,13 +22,18 @@ from .error_redaction import (
     redact_upstream_error_text,
     redacted_httpx_error,
 )
+from .failures import CONNECTION_FAILED_CODE, is_connection_failure, retry_after_from_headers
+from .protocol import ProviderModelListingResponseError
 from .request_proof import (
     ProviderRequestBudgetExceededError,
     project_final_request_payload,
     protected_tool_result_indexes,
     prove_provider_payload_from_env,
+    provider_request_character_budget,
+    provider_request_token_budget,
 )
 from .stream_assembly import ToolStreamAccumulator, ToolStreamProtocolError
+from .tool_argument_rejection import rejected_tool_arguments_error
 from .trace_recorder import LLMTraceRecorder
 from .types import (
     ChatConfig,
@@ -37,8 +42,10 @@ from .types import (
     Message,
     ModelInfo,
     ProviderFinalRequestProjection,
+    RejectedToolArguments,
     StreamEvent,
     TextDeltaEvent,
+    ToolArgumentRejection,
     ToolDefinition,
     ToolUseStartEvent,
 )
@@ -274,7 +281,8 @@ class OllamaProvider:
         return project_final_request_payload(
             payload,
             projection_adapter="ollama",
-            proof_budget=cfg.provider_request_max_chars,
+            proof_budget=provider_request_character_budget(payload, cfg),
+            token_budget=provider_request_token_budget(payload, cfg),
             active_user_message_index=wire_active_user_index,
             message_limit=message_limit,
             protected_tool_result_indexes=protected_result_indexes,
@@ -303,7 +311,8 @@ class OllamaProvider:
         budget_decision = coordinate_provider_context_budget(
             payload,
             projection_adapter="ollama",
-            proof_budget=cfg.provider_request_max_chars,
+            proof_budget=provider_request_character_budget(payload, cfg),
+            token_budget=provider_request_token_budget(payload, cfg),
             active_user_message_index=wire_active_user_index,
             protected_tool_result_indexes=protected_result_indexes,
         )
@@ -328,6 +337,7 @@ class OllamaProvider:
         try:
             prove_provider_payload_from_env(
                 payload,
+                token_budget=provider_request_token_budget(payload, cfg),
                 projection_adapter="ollama",
                 active_user_message_index=wire_active_user_index,
                 protected_tool_result_indexes=protected_result_indexes,
@@ -374,6 +384,7 @@ class OllamaProvider:
         prepared_tool_events: list[StreamEvent] = []
         prepared_tool_calls: list[dict[str, Any]] = []
         recognized_tool_starts: list[ToolUseStartEvent] = []
+        rejected_argument_ids: set[str] = set()
         candidate_call_key = 0
         saw_done = False
 
@@ -411,6 +422,9 @@ class OllamaProvider:
                         yield ErrorEvent(
                             message=message,
                             code=str(response.status_code),
+                            retry_after_s=retry_after_from_headers(
+                                response.status_code, getattr(response, "headers", None)
+                            ),
                         )
                         return
 
@@ -608,7 +622,9 @@ class OllamaProvider:
                                 if isinstance(event, ToolUseStartEvent)
                             )
                             try:
-                                arguments_json = json.dumps(arguments, allow_nan=False)
+                                # Bound the full representation before strict
+                                # finite-object validation, including NaN values.
+                                arguments_json = json.dumps(arguments)
                                 call_events = [
                                     *start_events,
                                     *tools_acc.append(key, arguments_json),
@@ -621,6 +637,17 @@ class OllamaProvider:
                                 ValueError,
                                 ToolStreamProtocolError,
                             ) as exc:
+                                # Argument rejection is recoverable only after
+                                # done=true. Keep reading so EOF, transport errors,
+                                # and later identity conflicts cannot authorize it.
+                                if (
+                                    isinstance(tool_name, str)
+                                    and bool(tool_name.strip())
+                                    and isinstance(exc, ToolStreamProtocolError)
+                                    and exc.reason == "invalid_tool_arguments"
+                                ):
+                                    rejected_argument_ids.add(tool_use_id)
+                                    continue
                                 message = (
                                     "Ollama response contained an invalid tool lifecycle"
                                 )
@@ -665,6 +692,47 @@ class OllamaProvider:
                             metadata={"phase": "stream", "terminal_field": "done"},
                         )
                         yield ErrorEvent(message=message, code="incomplete_stream")
+                        return
+
+                    if rejected_argument_ids:
+                        for start_event in recognized_tool_starts:
+                            yield start_event
+                        if chunk.get("done_reason") in (None, "stop"):
+                            yield rejected_tool_arguments_error(
+                                ToolArgumentRejection(
+                                    calls=tuple(
+                                        RejectedToolArguments(
+                                            tool_call_id=event.tool_use_id,
+                                            tool_name=event.tool_name,
+                                            reason=(
+                                                "invalid_json"
+                                                if event.tool_use_id in rejected_argument_ids
+                                                else "batch_not_executed"
+                                            ),
+                                        )
+                                        for event in recognized_tool_starts
+                                    ),
+                                    terminal_reason="done",
+                                ),
+                                usage=(
+                                    DoneEvent(
+                                        input_tokens=input_tokens,
+                                        output_tokens=output_tokens,
+                                        model=self._model,
+                                        provider=self.provider_id,
+                                    )
+                                    if any(
+                                        type(chunk.get(key)) is int and chunk[key] >= 0
+                                        for key in ("prompt_eval_count", "eval_count")
+                                    )
+                                    else None
+                                ),
+                            )
+                        else:
+                            yield ErrorEvent(
+                                message="Ollama response ended with invalid tool arguments",
+                                code="incomplete_tool_call",
+                            )
                         return
 
                     # Commit the already-validated lifecycle only after the
@@ -736,21 +804,23 @@ class OllamaProvider:
             )
             yield ErrorEvent(message=message, code="candidate_artifact_limit_exceeded")
         except httpx.TimeoutException as exc:
+            code = CONNECTION_FAILED_CODE if is_connection_failure(exc) else "timeout"
             message = redact_upstream_error_text(
                 f"Request timed out: {str(exc) or repr(exc)}",
                 api_key=self._api_key,
                 max_len=2000,
             )
-            trace.record_error(code="timeout", message=message)
-            yield ErrorEvent(message=message, code="timeout")
+            trace.record_error(code=code, message=message)
+            yield ErrorEvent(message=message, code=code)
         except httpx.RequestError as exc:
+            code = CONNECTION_FAILED_CODE if is_connection_failure(exc) else "request_error"
             message = redact_upstream_error_text(
                 f"Request error: {str(exc) or repr(exc)}",
                 api_key=self._api_key,
                 max_len=2000,
             )
-            trace.record_error(code="request_error", message=message)
-            yield ErrorEvent(message=message, code="request_error")
+            trace.record_error(code=code, message=message)
+            yield ErrorEvent(message=message, code=code)
         except Exception as exc:  # noqa: BLE001 - chat() contract: ErrorEvent instead of raising
             message = redact_upstream_error_text(
                 f"Provider response handling failed: {str(exc) or repr(exc)}",
@@ -781,6 +851,7 @@ class OllamaProvider:
         so callers that must distinguish an unreachable/secured host from an
         empty catalog (e.g. onboarding discovery) can classify it.
         """
+        resp: httpx.Response | None = None
         try:
             async with httpx.AsyncClient(
                 timeout=5.0,
@@ -793,6 +864,10 @@ class OllamaProvider:
                 )
                 resp.raise_for_status()
                 data = resp.json()
+                if not isinstance(data, dict) or not isinstance(
+                    data.get("models", []), list
+                ):
+                    raise TypeError("Provider model catalog had an unexpected shape")
                 return [
                     ModelInfo(
                         provider=self.provider_id,
@@ -808,5 +883,10 @@ class OllamaProvider:
             return []
         except Exception:
             if raise_on_error:
+                if resp is not None:
+                    raise ProviderModelListingResponseError(
+                        "Provider model catalog response could not be parsed",
+                        status_code=resp.status_code,
+                    ) from None
                 raise
             return []

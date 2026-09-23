@@ -14,6 +14,14 @@ from opensquilla.cli.tui.contracts import TuiOutputHandle
 from opensquilla.cli.tui.opentui.host_runtime import HostFailureReason, HostRuntimeError
 
 
+def _interactive_client_factory(client_type: Any) -> Any:
+    def create(*, structured_user_input: bool = False) -> Any:
+        assert structured_user_input is True
+        return client_type()
+
+    return create
+
+
 def test_gateway_runtime_has_no_raw_prompt_application_dependency(monkeypatch) -> None:
     monkeypatch.delitem(
         sys.modules,
@@ -225,15 +233,25 @@ async def test_external_turn_discovery_error_releases_pending_fence() -> None:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("activity_error", [False, True])
 async def test_gateway_runtime_connects_to_configured_gateway_target(
     monkeypatch: pytest.MonkeyPatch,
+    activity_error: bool,
 ) -> None:
     from opensquilla.cli.repl import gateway_runtime
+
+    calls: list[tuple[str, dict[str, Any]]] = []
 
     class _FakeGatewayClient:
         connected_url: str | None = None
         connected_token: str | None = None
         closed = False
+
+        async def call(self, method: str, params: dict[str, Any]) -> dict[str, Any]:
+            calls.append((method, params))
+            if activity_error and method == "telemetry.product_active.record":
+                raise RuntimeError("synthetic old Gateway")
+            return {"recorded": True}
 
         async def connect(self, url: str, *, token: str | None = None) -> None:
             type(self).connected_url = url
@@ -259,7 +277,10 @@ async def test_gateway_runtime_connects_to_configured_gateway_target(
         async def close(self) -> None:
             type(self).closed = True
 
-    monkeypatch.setattr("opensquilla.cli.gateway_client.GatewayClient", _FakeGatewayClient)
+    monkeypatch.setattr(
+        "opensquilla.cli.gateway_client.GatewayClient",
+        _interactive_client_factory(_FakeGatewayClient),
+    )
     monkeypatch.setenv("OPENSQUILLA_GATEWAY_URL", "http://127.0.0.1:18790")
     monkeypatch.setenv("OPENSQUILLA_GATEWAY_TOKEN", "branch-token")
 
@@ -268,8 +289,11 @@ async def test_gateway_runtime_connects_to_configured_gateway_target(
         scope: gateway_runtime.GatewayRuntimeScope,
         dispatch,
         abort_active_turn=None,
+        on_surface_ready=None,
+        on_user_activity=None,
     ) -> None:
-        return None
+        await on_surface_ready()
+        await on_user_activity()
 
     deps = gateway_runtime.GatewayRuntimeDependencies(
         stream_response=cast(Any, None),
@@ -289,6 +313,11 @@ async def test_gateway_runtime_connects_to_configured_gateway_target(
     assert _FakeGatewayClient.connected_url == "ws://127.0.0.1:18790/ws"
     assert _FakeGatewayClient.connected_token == "branch-token"
     assert _FakeGatewayClient.closed is True
+    assert calls == [
+        ("telemetry.product_active.record", {"surface": "tui"}),
+        ("telemetry.client_launch.record", {}),
+        ("telemetry.product_active.record", {"surface": "tui"}),
+    ]
 
 
 @pytest.mark.asyncio
@@ -316,7 +345,7 @@ async def test_gateway_runtime_does_not_announce_resume_before_bootstrap_succeed
 
     monkeypatch.setattr(
         "opensquilla.cli.gateway_client.GatewayClient",
-        _MissingSessionGatewayClient,
+        _interactive_client_factory(_MissingSessionGatewayClient),
     )
     notices: list[gateway_runtime.GatewayRuntimeNotice] = []
     deps = gateway_runtime.GatewayRuntimeDependencies(
@@ -386,7 +415,10 @@ async def test_gateway_runtime_dispatches_messages_slash_commands_and_exit(
         async def close(self) -> None:
             self.closed = True
 
-    monkeypatch.setattr("opensquilla.cli.gateway_client.GatewayClient", _FakeGatewayClient)
+    monkeypatch.setattr(
+        "opensquilla.cli.gateway_client.GatewayClient",
+        _interactive_client_factory(_FakeGatewayClient),
+    )
 
     output = cast(TuiOutputHandle, object())
     captured: dict[str, Any] = {}
@@ -546,7 +578,10 @@ async def test_gateway_abort_targets_active_turn_session_after_session_changes(
         async def close(self) -> None:
             return None
 
-    monkeypatch.setattr("opensquilla.cli.gateway_client.GatewayClient", _FakeGatewayClient)
+    monkeypatch.setattr(
+        "opensquilla.cli.gateway_client.GatewayClient",
+        _interactive_client_factory(_FakeGatewayClient),
+    )
 
     stream_started = asyncio.Event()
     release_stream = asyncio.Event()
@@ -742,7 +777,10 @@ async def test_gateway_runtime_projects_external_turn_and_converges_approval(
         async def close(self) -> None:
             self.closed = True
 
-    monkeypatch.setattr("opensquilla.cli.gateway_client.GatewayClient", _Client)
+    monkeypatch.setattr(
+        "opensquilla.cli.gateway_client.GatewayClient",
+        _interactive_client_factory(_Client),
+    )
     output = _Output()
     projected = asyncio.Event()
     captured_events: list[dict[str, Any]] = []
@@ -924,7 +962,10 @@ async def test_local_dispatch_parked_behind_external_turn_notifies_queued(
         async def close(self) -> None:
             return None
 
-    monkeypatch.setattr("opensquilla.cli.gateway_client.GatewayClient", _Client)
+    monkeypatch.setattr(
+        "opensquilla.cli.gateway_client.GatewayClient",
+        _interactive_client_factory(_Client),
+    )
 
     external_started = asyncio.Event()
     release_external = asyncio.Event()
@@ -1081,7 +1122,10 @@ async def test_mirrored_goal_turn_steers_exact_identity_then_race_falls_back(
         async def send_message(self, kind: str, payload: dict[str, object]) -> None:
             return None
 
-    monkeypatch.setattr("opensquilla.cli.gateway_client.GatewayClient", _Client)
+    monkeypatch.setattr(
+        "opensquilla.cli.gateway_client.GatewayClient",
+        _interactive_client_factory(_Client),
+    )
     external_started = asyncio.Event()
     release_external = asyncio.Event()
     streamed: list[str] = []
@@ -1248,7 +1292,10 @@ async def test_discovered_external_turn_is_steerable_before_projection_queue_adm
         async def send_message(self, kind: str, payload: dict[str, object]) -> None:
             return None
 
-    monkeypatch.setattr("opensquilla.cli.gateway_client.GatewayClient", _Client)
+    monkeypatch.setattr(
+        "opensquilla.cli.gateway_client.GatewayClient",
+        _interactive_client_factory(_Client),
+    )
     local_streams: list[str] = []
 
     async def stream_response(
@@ -1358,7 +1405,10 @@ async def test_local_dispatch_with_idle_external_turns_emits_no_queued_notice(
         async def close(self) -> None:
             return None
 
-    monkeypatch.setattr("opensquilla.cli.gateway_client.GatewayClient", _Client)
+    monkeypatch.setattr(
+        "opensquilla.cli.gateway_client.GatewayClient",
+        _interactive_client_factory(_Client),
+    )
     notices: list[gateway_runtime.GatewayRuntimeNotice] = []
 
     async def stream_response(
@@ -1432,7 +1482,10 @@ async def test_terminal_race_steer_false_falls_back_to_normal_send(
         async def send_message(self, kind: str, payload: dict[str, object]) -> None:
             return None
 
-    monkeypatch.setattr("opensquilla.cli.gateway_client.GatewayClient", _Client)
+    monkeypatch.setattr(
+        "opensquilla.cli.gateway_client.GatewayClient",
+        _interactive_client_factory(_Client),
+    )
     first_started = asyncio.Event()
     release_first = asyncio.Event()
     streamed: list[str] = []
@@ -1982,8 +2035,10 @@ async def test_external_turn_remaining_discovery_frames_do_not_duplicate_project
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("pending_question", [False, True])
 async def test_replay_gap_bootstraps_and_hydrates_existing_surface_once(
     monkeypatch: pytest.MonkeyPatch,
+    pending_question: bool,
 ) -> None:
     from opensquilla.cli.repl import gateway_runtime
 
@@ -2031,6 +2086,15 @@ async def test_replay_gap_bootstraps_and_hydrates_existing_surface_once(
                     "model": None,
                     "effective_model": "gateway/effective",
                     "workspace": "/workspace/gap",
+                    "pendingUserInputs": [{
+                        "kind": "user_input",
+                        "status": "input_required",
+                        "request_id": "question-gap",
+                        "run_id": "task-gap",
+                        "clarify_schema": {"fields": [{
+                            "name": "label", "prompt": "Which label?",
+                        }]},
+                    }] if pending_question and self.bootstrap_calls > 1 else [],
                 },
                 "history": {
                     "messages": [
@@ -2058,11 +2122,18 @@ async def test_replay_gap_bootstraps_and_hydrates_existing_surface_once(
     class _Output:
         def __init__(self) -> None:
             self.messages: list[tuple[str, dict[str, Any]]] = []
+            self.writes: list[str] = []
 
         async def send_message(self, kind: str, payload: dict[str, Any]) -> None:
             self.messages.append((kind, payload))
 
-    monkeypatch.setattr("opensquilla.cli.gateway_client.GatewayClient", _Client)
+        async def write_through(self, text: str) -> None:
+            self.writes.append(text)
+
+    monkeypatch.setattr(
+        "opensquilla.cli.gateway_client.GatewayClient",
+        _interactive_client_factory(_Client),
+    )
     output = _Output()
 
     async def input_loop(*, scope, dispatch, abort_active_turn=None) -> None:
@@ -2070,6 +2141,9 @@ async def test_replay_gap_bootstraps_and_hydrates_existing_surface_once(
         assert scope["state"].model == "gateway/effective"
         assert scope["workspace_label"] == "/workspace/gap"
         assert scope["replay_gap_reason"] == "buffer_window_missed"
+        assert len(output.writes) == int(pending_question)
+        if pending_question:
+            assert "Which label?" in output.writes[0]
 
     summary = await gateway_runtime.run_gateway_chat(
         model=None,
@@ -2142,7 +2216,10 @@ async def test_runtime_failure_returns_queue_aware_exit_summary(
         async def close(self) -> None:
             return None
 
-    monkeypatch.setattr("opensquilla.cli.gateway_client.GatewayClient", _Client)
+    monkeypatch.setattr(
+        "opensquilla.cli.gateway_client.GatewayClient",
+        _interactive_client_factory(_Client),
+    )
 
     async def input_loop(*, scope, dispatch, abort_active_turn=None) -> None:
         raise failure
@@ -2176,7 +2253,10 @@ async def test_gateway_runtime_preserves_pre_session_startup_error(
         async def connect(self, url: str, *, token: str | None = None) -> None:
             raise RuntimeError("startup handshake failed")
 
-    monkeypatch.setattr("opensquilla.cli.gateway_client.GatewayClient", _Client)
+    monkeypatch.setattr(
+        "opensquilla.cli.gateway_client.GatewayClient",
+        _interactive_client_factory(_Client),
+    )
 
     with pytest.raises(RuntimeError, match="startup handshake failed"):
         await gateway_runtime.run_gateway_chat(

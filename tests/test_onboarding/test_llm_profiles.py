@@ -11,10 +11,13 @@ from opensquilla.onboarding.mutations import (
     activate_llm_profile,
     remove_active_llm_profile,
     remove_llm_profile,
+    upsert_and_activate_llm_profile,
     upsert_llm_profile,
+    upsert_llm_provider,
 )
 from opensquilla.onboarding.status import get_onboarding_status
 from opensquilla.provider.deployment import resolve_provider_deployment
+from opensquilla.provider.preset_registry import get_preset
 
 
 def test_profile_upsert_redacts_secret_and_keeps_credential_sources() -> None:
@@ -289,19 +292,22 @@ def test_profile_remove_rejects_disabled_static_ensemble_reference() -> None:
         remove_llm_profile(cfg, provider_id="openrouter")
 
 
-def test_profile_remove_allows_untouched_packaged_defaults() -> None:
+@pytest.mark.parametrize("binding", [None, "follow_primary"])
+def test_profile_remove_allows_untouched_packaged_defaults(binding: str | None) -> None:
     """A profile blocked only by packaged preset defaults is removable (#1297).
 
-    With a non-openrouter primary, an untouched router still materializes the
-    packaged openrouter tier preset, and the legacy static selection_mode
-    default — neither is persisted, so neither can dangle after removal.
+    A disabled unmanaged router still materializes OpenRouter defaults, while
+    a managed router resolves the primary provider's preset. Neither the
+    implicit tiers nor the legacy static selection mode pins a saved profile.
     """
     cfg = GatewayConfig(
         llm={"provider": "tokenrhythm", "api_key": "k"},
         llm_profiles={"openrouter": {"api_key_env": "OPENROUTER_PROFILE_KEY"}},
-        squilla_router={"preset_binding": "follow_primary", "enabled": False},
+        squilla_router={"preset_binding": binding, "enabled": False},
     )
-    assert cfg.squilla_router.tiers["c0"].get("provider") == "openrouter"
+    assert cfg.squilla_router.tiers["c0"].get("provider") == (
+        "tokenrhythm" if binding == "follow_primary" else "openrouter"
+    )
     assert cfg.llm_ensemble.selection_mode == "static_openrouter_b5"
 
     result = remove_llm_profile(cfg, provider_id="openrouter")
@@ -593,7 +599,10 @@ def test_profile_activation_atomically_swaps_primary_without_touching_routes() -
     assert "old-primary-secret" not in repr(result.public_payload)
 
 
-def test_profile_activation_model_precedence_is_request_then_profile_then_default() -> None:
+@pytest.mark.parametrize("saved_model", ["deepseek-profile-model", "deepseek-v4-flash"])
+def test_profile_activation_model_precedence_is_request_then_profile_then_default(
+    saved_model: str,
+) -> None:
     base = {
         "llm": {
             "provider": "openai",
@@ -608,7 +617,7 @@ def test_profile_activation_model_precedence_is_request_then_profile_then_defaul
             **base,
             llm_profiles={
                 "deepseek": {
-                    "model": "deepseek-profile-model",
+                    "model": saved_model,
                     "api_key": "synthetic-deepseek-secret",
                 }
             },
@@ -623,14 +632,15 @@ def test_profile_activation_model_precedence_is_request_then_profile_then_defaul
             **base,
             llm_profiles={
                 "deepseek": {
-                    "model": "deepseek-profile-model",
+                    "model": saved_model,
                     "api_key": "synthetic-deepseek-secret",
                 }
             },
         ),
         provider_id="deepseek",
     ).config
-    assert saved.llm.model == "deepseek-profile-model"
+    assert saved.llm.model == saved_model
+    assert saved.to_toml_dict()["llm"]["model"] == saved_model
 
     legacy_without_model = activate_llm_profile(
         GatewayConfig(
@@ -639,7 +649,7 @@ def test_profile_activation_model_precedence_is_request_then_profile_then_defaul
         ),
         provider_id="deepseek",
     ).config
-    assert legacy_without_model.llm.model == "deepseek-v4-flash"
+    assert legacy_without_model.llm.model == "deepseek-flash"
 
 
 def test_profile_activation_without_saved_or_provider_default_model_fails_closed() -> None:
@@ -728,6 +738,108 @@ def test_profile_activation_managed_router_follows_primary_and_preserves_control
     }
     assert activated.llm.model == "deepseek-chat"
     assert activated.llm_ensemble.model_dump(mode="python") == ensemble_before
+
+
+def _curated_primary_switch_config(
+    source: str,
+    target: str,
+    *,
+    binding: str | None = "custom",
+    enabled: bool = True,
+    cross_provider: bool = False,
+) -> GatewayConfig:
+    return GatewayConfig(
+        llm={"provider": source, "model": "synthetic-old-model", "api_key": "old-secret"},
+        llm_profiles={
+            target: {"model": "synthetic-new-model", "api_key": "new-secret"},
+        },
+        squilla_router={
+            "enabled": enabled,
+            "preset_binding": binding,
+            "cross_provider_tiers": cross_provider,
+            "rollout_phase": "observe",
+            "default_tier": "c2",
+            "confidence_threshold": 0.71,
+            "tiers": {
+                name: {"provider": source, "model": f"synthetic-{name}"}
+                for name in ("c0", "c1", "c2", "c3")
+            },
+        },
+        llm_ensemble={"enabled": False, "candidate_max_chars": 12345},
+    )
+
+
+@pytest.mark.parametrize(
+    ("source", "target"), [("openrouter", "tokenrhythm"), ("tokenrhythm", "openrouter")]
+)
+@pytest.mark.parametrize("binding", [None, "custom", "follow_primary"])
+@pytest.mark.parametrize("enabled", [False, True])
+@pytest.mark.parametrize("cross_provider", [False, True])
+def test_curated_primary_activation_replaces_ladder_and_preserves_strategy(
+    source, target, binding, enabled, cross_provider,
+) -> None:
+    cfg = _curated_primary_switch_config(
+        source, target, binding=binding, enabled=enabled, cross_provider=cross_provider,
+    )
+    router_before = cfg.squilla_router.model_dump(mode="python")
+    ensemble_before = cfg.llm_ensemble.model_dump(mode="python")
+
+    activated = activate_llm_profile(cfg, provider_id=target).config
+
+    preset = get_preset(target)
+    assert preset is not None
+    defaults = preset.tier_defaults()
+    router = activated.squilla_router
+    assert router.preset_binding == "follow_primary"
+    assert router.tier_profile == (target if enabled and preset.persistable else None)
+    for name in ("c0", "c1", "c2", "c3"):
+        assert router.tiers[name] == defaults[name]
+    assert router.enabled is enabled
+    assert router.cross_provider_tiers is cross_provider
+    assert router.rollout_phase == "observe"
+    assert router.default_tier == "c2"
+    assert router.confidence_threshold == 0.71
+    assert activated.llm_ensemble.model_dump(mode="python") == ensemble_before
+    assert activated.llm.model == "synthetic-new-model"
+    assert activated.llm.api_key == "new-secret"
+    assert activated.llm_profiles[source].api_key == "old-secret"
+    assert cfg.llm.provider == source
+    assert cfg.squilla_router.model_dump(mode="python") == router_before
+
+
+@pytest.mark.parametrize(
+    ("source", "target"), [("openrouter", "tokenrhythm"), ("tokenrhythm", "openrouter")]
+)
+@pytest.mark.parametrize("action", ["use_recommended", "disable", "enable_cross_provider"])
+def test_curated_primary_activation_honors_explicit_router_action(source, target, action) -> None:
+    cfg = _curated_primary_switch_config(source, target)
+    tiers_before = cfg.squilla_router.tiers
+
+    activated = activate_llm_profile(cfg, provider_id=target, router_action=action).config
+
+    router = activated.squilla_router
+    assert router.enabled is (action != "disable")
+    assert router.cross_provider_tiers is (action == "enable_cross_provider")
+    assert router.default_tier == "c2"
+    assert router.rollout_phase == "observe"
+    if action == "use_recommended":
+        assert router.preset_binding == "follow_primary"
+        assert router.tiers["c0"]["provider"] == target
+    else:
+        assert router.preset_binding == "custom"
+        assert router.tiers == tiers_before
+
+
+@pytest.mark.parametrize("provider", ["openrouter", "tokenrhythm"])
+def test_curated_primary_model_edit_preserves_custom_ladder(provider) -> None:
+    target = "tokenrhythm" if provider == "openrouter" else "openrouter"
+    cfg = _curated_primary_switch_config(provider, target)
+    router_before = cfg.squilla_router.model_dump(mode="python")
+
+    result = upsert_llm_provider(cfg, provider_id=provider, model="synthetic-edited-model")
+
+    assert result.config.llm.model == "synthetic-edited-model"
+    assert result.config.squilla_router.model_dump(mode="python") == router_before
 
 
 @pytest.mark.parametrize("binding", [None, "custom"])
@@ -1102,3 +1214,180 @@ def test_profile_status_does_not_treat_route_member_model_as_direct_model() -> N
     assert rows["anthropic"]["ready"] is True
     assert rows["anthropic"]["primaryEligible"] is False
     assert rows["anthropic"]["primaryBlockReason"] == "missing_model"
+
+
+@pytest.mark.parametrize("edit", [False, True])
+def test_profile_save_and_activate_uses_submitted_deployment_and_can_switch_back(edit):
+    cfg = GatewayConfig(
+        llm={"provider": "openai", "model": "gpt-old", "api_key": "old-primary-key"},
+        llm_profiles={"deepseek": {"model": "old-model", "api_key": "old-profile-key"}}
+        if edit
+        else {},
+        squilla_router={"preset_binding": "follow_primary"},
+        image_generation={"enabled": False},
+    )
+    before = cfg.model_dump()
+    result = upsert_and_activate_llm_profile(
+        cfg,
+        provider_id="DeepSeek",
+        model="deepseek-new",
+        api_key="submitted-key",
+        base_url="https://deployment.example/v1",
+        proxy="http://proxy.example:8080",
+    )
+    assert cfg.model_dump() == before
+    active = result.config
+    assert active.llm.provider == "deepseek"
+    assert active.llm.model == "deepseek-new"
+    assert active.llm.api_key == "submitted-key"
+    assert active.llm.base_url == "https://deployment.example/v1"
+    assert active.llm.proxy == "http://proxy.example:8080"
+    assert "deepseek" not in active.llm_profiles
+    assert active.llm_profiles["openai"].api_key == "old-primary-key"
+    assert active.image_generation == cfg.image_generation
+    assert active.llm_ensemble == cfg.llm_ensemble
+    assert "submitted-key" not in repr(result.public_payload)
+    returned = activate_llm_profile(active, provider_id="openai").config
+    assert returned.llm.model == "gpt-old"
+    assert returned.llm.api_key == "old-primary-key"
+    assert returned.llm_profiles["deepseek"].api_key == "submitted-key"
+    assert returned.llm_profiles["deepseek"].base_url == "https://deployment.example/v1"
+
+
+def test_profile_save_and_activate_keep_omit_clear_and_endpoint_boundary(monkeypatch):
+    monkeypatch.delenv("DEEPSEEK_API_KEY", raising=False)
+    cfg = GatewayConfig(
+        llm={"provider": "openai", "api_key": "primary-key"},
+        llm_profiles={
+            "deepseek": {
+                "model": "deepseek-stored",
+                "api_key": "stored-key",
+                "base_url": "https://one.example/v1",
+                "proxy": "http://proxy.example:8080",
+            }
+        },
+        squilla_router={"preset_binding": "follow_primary"},
+    )
+    active = upsert_and_activate_llm_profile(
+        cfg,
+        provider_id="deepseek",
+        preserve_api_key=True,
+        proxy="",
+    ).config
+    assert active.llm.model == "deepseek-stored"
+    assert active.llm.api_key == "stored-key"
+    assert active.llm.proxy == ""
+    assert active.llm.base_url == "https://one.example/v1"
+    for changes in ({"base_url": "https://two.example/v1"}, {"api_key": ""}):
+        with pytest.raises(LlmProfileActivationError) as error:
+            upsert_and_activate_llm_profile(
+                cfg,
+                provider_id="deepseek",
+                preserve_api_key=True,
+                **changes,
+            )
+        assert error.value.reason == "missing_credential"
+    assert cfg.llm_profiles["deepseek"].api_key == "stored-key"
+
+
+def test_profile_save_and_activate_rejects_active_before_building_profile(monkeypatch):
+    def unexpected(*args, **kwargs):
+        pytest.fail("already-active target must be rejected before profile upsert")
+
+    monkeypatch.setattr("opensquilla.onboarding.mutations.upsert_llm_profile", unexpected)
+    with pytest.raises(LlmProfileActivationError) as error:
+        cfg = GatewayConfig()
+        upsert_and_activate_llm_profile(cfg, provider_id=cfg.llm.provider, api_key="new-key")
+    assert error.value.reason == "already_active"
+
+
+@pytest.mark.parametrize("credential_source", ["env", "runtime", "explicit"])
+def test_profile_save_and_activate_preserves_secret_provenance(monkeypatch, credential_source):
+    target_key = "synthetic-target-key"
+    monkeypatch.setenv("DEEPSEEK_API_KEY", target_key)
+    cfg = GatewayConfig(
+        llm={
+            "provider": "openai",
+            "api_key": "synthetic-old-runtime-key",
+            "api_key_env": "OPENAI_API_KEY",
+        },
+        llm_profiles={"DeepSeek": {"model": "deepseek-chat", "api_key": target_key}}
+        if credential_source == "runtime"
+        else {},
+        squilla_router={"preset_binding": "follow_primary"},
+    )
+    cfg.mark_runtime_secret("llm.api_key")
+    kwargs = {}
+    if credential_source == "runtime":
+        cfg.mark_runtime_secret("llm_profiles.DeepSeek.api_key")
+        kwargs["preserve_api_key"] = True
+    elif credential_source == "explicit":
+        kwargs["api_key"] = target_key
+    else:
+        kwargs["api_key_env"] = "DEEPSEEK_API_KEY"
+    result = upsert_and_activate_llm_profile(cfg, provider_id="deepseek", **kwargs)
+    persisted = result.config.to_toml_dict()
+    assert "synthetic-old-runtime-key" not in repr(persisted)
+    assert "api_key" not in persisted["llm_profiles"]["openai"]
+    if credential_source == "explicit":
+        assert persisted["llm"]["api_key"] == target_key
+    else:
+        assert target_key not in repr(persisted)
+        assert "api_key" not in persisted["llm"]
+    assert target_key not in repr(result.public_payload)
+
+
+@pytest.mark.parametrize("action", ["preserve", "use_recommended", "disable"])
+def test_profile_save_and_activate_custom_router_resolution_is_atomic(action):
+    cfg = GatewayConfig(
+        llm={"provider": "openai", "api_key": "primary-key"},
+        squilla_router={"tier_profile": "openai", "preset_binding": "custom"},
+    )
+    before = cfg.model_dump()
+    if action == "preserve":
+        with pytest.raises(LlmProfileActivationError) as error:
+            upsert_and_activate_llm_profile(cfg, provider_id="deepseek", api_key="draft-key")
+        assert error.value.reason == "router_provider_conflict"
+    else:
+        candidate = upsert_and_activate_llm_profile(
+            cfg,
+            provider_id="deepseek",
+            api_key="draft-key",
+            router_action=action,
+        ).config
+        if action == "disable":
+            assert candidate.squilla_router.enabled is False
+            assert candidate.squilla_router.tiers == cfg.squilla_router.tiers
+        else:
+            assert candidate.squilla_router.preset_binding == "follow_primary"
+            assert candidate.squilla_router.tiers != cfg.squilla_router.tiers
+        assert candidate.llm_ensemble == cfg.llm_ensemble
+    assert cfg.model_dump() == before
+
+
+def test_profile_save_and_activate_rejects_pool_without_saving_draft():
+    cfg = GatewayConfig()
+    before = cfg.model_dump()
+    with pytest.raises(LlmProfileActivationError) as error:
+        upsert_and_activate_llm_profile(
+            cfg,
+            provider_id="deepseek",
+            api_key="draft-key",
+            api_key_env_pool=["POOL_KEY"],
+        )
+    assert error.value.reason == "primary_pool_unsupported"
+    assert cfg.model_dump() == before
+
+
+@pytest.mark.parametrize("intent,enabled", [("preserve", False), ("enable_provider_default", True)])
+def test_profile_save_and_activate_applies_only_explicit_image_intent(intent, enabled):
+    cfg = GatewayConfig(
+        llm={"provider": "openai", "api_key": "primary-key"},
+        squilla_router={"preset_binding": "follow_primary"},
+    )
+    result = upsert_and_activate_llm_profile(
+        cfg, provider_id="openrouter", api_key="draft-key", image_generation_intent=intent,
+    )
+    assert result.config.image_generation.enabled is enabled
+    assert cfg.image_generation.enabled is False
+    assert result.config.llm_ensemble == cfg.llm_ensemble

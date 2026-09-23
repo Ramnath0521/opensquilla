@@ -78,7 +78,7 @@
       </div>
       <span v-if="!editing" ref="actionsRef" class="goal-ribbon__actions">
         <span
-          v-if="goal.status === 'complete'"
+          v-if="goal.status === 'complete' && !completeSettled"
           class="goal-ribbon__finalizing"
           role="status"
         >
@@ -86,7 +86,7 @@
           {{ t('chat.goal.finalizing') }}
         </span>
         <button
-          v-else
+          v-else-if="goal.status !== 'complete'"
           type="button"
           class="goal-ribbon__primary"
           :disabled="busy"
@@ -98,7 +98,7 @@
           {{ lifecycleLabel }}
         </button>
         <button
-          v-if="goal.status !== 'complete'"
+          v-if="completeMenuAvailable"
           ref="menuTrigger"
           type="button"
           class="goal-ribbon__menu-trigger"
@@ -145,24 +145,7 @@
       </span>
     </div>
 
-    <details v-if="goal.progress && goal.progress.steps.length" class="goal-ribbon__progress">
-      <summary>{{ progressSummary }}</summary>
-      <p v-if="goal.progress.explanation" class="goal-ribbon__explanation">
-        {{ goal.progress.explanation }}
-      </p>
-      <ol class="goal-ribbon__steps">
-        <li
-          v-for="(step, index) in goal.progress.steps"
-          :key="`${index}:${step.text}`"
-          :data-status="step.status"
-        >
-          <span class="goal-ribbon__step-marker" aria-hidden="true">
-            {{ step.status === 'completed' ? '✓' : step.status === 'in_progress' ? '●' : '○' }}
-          </span>
-          <span>{{ step.text }}</span>
-        </li>
-      </ol>
-    </details>
+    <ExecutionProgress v-if="goal.progress" :progress="goal.progress" />
   </div>
 </template>
 
@@ -171,6 +154,7 @@ import { computed, nextTick, ref, watch } from 'vue'
 import { useI18n } from 'vue-i18n'
 import Icon from '@/components/Icon.vue'
 import type { GoalSnapshot } from '@/composables/chat/useChatGoals'
+import ExecutionProgress from './ExecutionProgress.vue'
 import { useDocumentEvent } from '@/composables/useDocumentEvent'
 
 const props = defineProps<{
@@ -208,6 +192,17 @@ type LifecycleAction = 'pause' | 'resume' | 'takeover'
 
 const goalHasUnsettledTask = computed(() => (
   props.goal.activeTaskId !== null || props.goal.executionState !== 'idle'
+))
+
+// A completed Goal only suppresses interactions while its final task is still
+// settling. Once idle, the overflow menu stays reachable so owners can edit
+// the objective or clear the completed Goal instead of the notice sticking
+// to the conversation forever (issue 1447).
+const completeSettled = computed(() => (
+  props.goal.status === 'complete' && !goalHasUnsettledTask.value
+))
+const completeMenuAvailable = computed(() => (
+  props.goal.status !== 'complete' || completeSettled.value
 ))
 
 const lifecycleAction = computed<LifecycleAction>(() => {
@@ -259,6 +254,7 @@ const pauseReasonText = computed(() => {
   switch (props.goal.pauseReason) {
     case 'user':
     case 'user_paused': return t('chat.goal.pausedByUser')
+    case 'empty_continuations': return t('chat.goal.emptyContinuations')
     case 'turn_limit': return t('chat.goal.turnLimitReached')
     case 'runtime_limit': return t('chat.goal.runtimeLimitReached')
     case 'process_restart': return t('chat.goal.pausedAfterRestart')
@@ -306,11 +302,6 @@ const metaText = computed(() => {
   return parts.join(' · ')
 })
 
-const progressSummary = computed(() => {
-  const steps = props.goal.progress?.steps ?? []
-  const completed = steps.filter(step => step.status === 'completed').length
-  return t('chat.goal.progressSummary', { completed, total: steps.length })
-})
 
 function beginEdit() {
   closeMenu()
@@ -373,7 +364,7 @@ function focusMenuItem(position: 'first' | 'last') {
 }
 
 function openMenu(position: 'first' | 'last' = 'first') {
-  if (props.busy || props.goal.status === 'complete') return
+  if (props.busy || !completeMenuAvailable.value) return
   menuOpen.value = true
   void nextTick(() => focusMenuItem(position))
 }
@@ -664,6 +655,7 @@ watch(() => [props.goal.goalId, props.goal.stateRevision, props.busy], () => {
 }
 .goal-ribbon__edit {
   display: flex;
+  flex-wrap: wrap;
   align-items: center;
   gap: 6px;
   flex: 1 1 auto;
@@ -691,40 +683,6 @@ watch(() => [props.goal.goalId, props.goal.stateRevision, props.busy], () => {
   background: transparent;
   color: var(--text);
   cursor: pointer;
-}
-.goal-ribbon__progress {
-  margin: 6px 0 0 23px;
-  color: var(--text-muted, var(--muted));
-}
-.goal-ribbon__progress summary {
-  width: max-content;
-  cursor: pointer;
-  font-weight: 500;
-}
-.goal-ribbon__explanation {
-  margin: 6px 0 4px;
-}
-.goal-ribbon__steps {
-  display: grid;
-  gap: 3px;
-  margin: 4px 0 0;
-  padding: 0;
-  list-style: none;
-}
-.goal-ribbon__steps li {
-  display: flex;
-  gap: 6px;
-}
-.goal-ribbon__steps li[data-status='completed'] {
-  color: var(--text-muted, var(--muted));
-  text-decoration: line-through;
-}
-.goal-ribbon__steps li[data-status='in_progress'] .goal-ribbon__step-marker {
-  color: var(--accent);
-}
-.goal-ribbon__step-marker {
-  flex: 0 0 1em;
-  text-align: center;
 }
 .goal-ribbon__sr-only {
   position: absolute;

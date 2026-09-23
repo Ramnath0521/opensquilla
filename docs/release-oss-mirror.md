@@ -9,6 +9,22 @@ workflow downloads release assets from GitHub, verifies `SHA256SUMS`, then
 uploads version-scoped assets, moving installer aliases, and strict JSON
 channel manifests used by update clients.
 
+## Repository transfer boundary
+
+New releases are sourced from the canonical GitHub repository
+`TokenRhythm/opensquilla`. The organization transfer does not rename the OSS
+bucket, object prefix, versioned release paths, or moving aliases: the mirror
+continues to use `ALIYUN_OSS_BUCKET`, the `releases` prefix, and the existing
+`latest/` and `channels/` objects. The workflow fails closed when it runs from
+another GitHub repository, so a release from the pre-transfer repository cannot
+silently populate the mirror.
+
+The channel manifest intentionally keeps the legacy v1 `releaseUrl` spelling
+(`github.com/opensquilla/opensquilla`) for already-shipped clients while new
+GitHub API and download operations use `TokenRhythm/opensquilla`. Do not rewrite
+existing OSS object keys or moving aliases solely because the GitHub owner
+changed.
+
 ## Repository configuration
 
 Configure these GitHub repository secrets:
@@ -94,7 +110,7 @@ condition and verified again after upload. A changed asset under an already
 mirrored tag is rejected; publish corrected release bytes under a new tag
 instead.
 
-Unsigned Windows clients do not execute an OSS object directly. They fetch the
+Windows clients do not execute an OSS object directly. They fetch the
 matching release's `SHA256SUMS` from the OSS mirror first (itself verified
 against the GitHub Release at mirror time), falling back to the canonical
 GitHub Release copy when the mirror object is missing or unreadable. They then

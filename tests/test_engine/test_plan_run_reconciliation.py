@@ -80,6 +80,8 @@ class _ReconcilesCheckpointProvider:
         self.calls = 0
         self.model = "test/model"
         self.requests: list[list[Message]] = []
+        self.system_prompts: list[str] = []
+        self.tool_names_per_request: list[set[str]] = []
 
     def chat(
         self,
@@ -89,6 +91,8 @@ class _ReconcilesCheckpointProvider:
     ) -> AsyncIterator[Any]:
         self.calls += 1
         self.requests.append(list(messages))
+        self.system_prompts.append(config.system or "")
+        self.tool_names_per_request.append({tool.name for tool in tools or []})
         return self._stream(self.calls)
 
     async def _stream(self, call_number: int) -> AsyncIterator[Any]:
@@ -122,6 +126,9 @@ class _IgnoresReconciliationProvider(_ReconcilesCheckpointProvider):
 
 
 class _CheckpointThenMutateProvider(_ReconcilesCheckpointProvider):
+    mutation_tool = "write_file"
+    mutation_arguments = {"path": "after-completion.txt", "content": "must not run"}
+
     async def _stream(self, call_number: int) -> AsyncIterator[Any]:
         if call_number == 1:
             for tool_use_id, tool_name, arguments in (
@@ -132,8 +139,8 @@ class _CheckpointThenMutateProvider(_ReconcilesCheckpointProvider):
                 ),
                 (
                     "write-1",
-                    "write_file",
-                    {"path": "after-completion.txt", "content": "must not run"},
+                    self.mutation_tool,
+                    self.mutation_arguments,
                 ),
             ):
                 yield ProviderToolUseStart(
@@ -152,6 +159,9 @@ class _CheckpointThenMutateProvider(_ReconcilesCheckpointProvider):
 
 
 class _CheckpointThenPublishProvider(_ReconcilesCheckpointProvider):
+    delivery_tool = "publish_artifact"
+    delivery_path = "report.txt"
+
     async def _stream(self, call_number: int) -> AsyncIterator[Any]:
         if call_number == 1:
             for tool_use_id, tool_name, arguments in (
@@ -162,8 +172,8 @@ class _CheckpointThenPublishProvider(_ReconcilesCheckpointProvider):
                 ),
                 (
                     "publish-1",
-                    "publish_artifact",
-                    {"path": "report.txt"},
+                    self.delivery_tool,
+                    {"path": self.delivery_path},
                 ),
             ):
                 yield ProviderToolUseStart(
@@ -179,6 +189,16 @@ class _CheckpointThenPublishProvider(_ReconcilesCheckpointProvider):
             return
         yield ProviderText(text="The report is ready.")
         yield ProviderDone(stop_reason="stop", input_tokens=1, output_tokens=1)
+
+
+class _CheckpointThenPreviewProvider(_CheckpointThenPublishProvider):
+    delivery_tool = "open_workspace_preview"
+    delivery_path = "site/index.html"
+
+
+class _CheckpointThenStartServerProvider(_CheckpointThenMutateProvider):
+    mutation_tool = "exec_command"
+    mutation_arguments = {"command": "python -m http.server"}
 
 
 class _SubmitThenCheckpointProvider(_ReconcilesCheckpointProvider):
@@ -316,6 +336,36 @@ def _registry(
         ),
         publish_artifact,
     )
+
+    async def open_workspace_preview(path: str) -> str:
+        if observed_calls is not None:
+            observed_calls.append(f"open_workspace_preview:{path}")
+        return "opened"
+
+    registry.register(
+        ToolSpec(
+            name="open_workspace_preview",
+            description="Open an existing page",
+            parameters={"path": {"type": "string"}},
+            required=["path"],
+        ),
+        open_workspace_preview,
+    )
+
+    async def exec_command(command: str) -> str:
+        if observed_calls is not None:
+            observed_calls.append(f"exec_command:{command}")
+        return "started"
+
+    registry.register(
+        ToolSpec(
+            name="exec_command",
+            description="Run a command",
+            parameters={"command": {"type": "string"}},
+            required=["command"],
+        ),
+        exec_command,
+    )
     return registry
 
 
@@ -350,6 +400,7 @@ async def _run(
         plan_storage=plan_storage,
         plan_revision=_revision(),
         plan_run=plan_storage.run,
+        workspace_preview_opener=_preview_opener,
     )
     try:
         return [
@@ -366,47 +417,28 @@ async def _run(
         await session_storage.close()
 
 
+async def _preview_opener(*args: Any, **kwargs: Any) -> dict[str, Any]:
+    return {"resourceId": "document:test"}
+
+
 @pytest.mark.asyncio
-async def test_plan_run_final_response_gets_one_checkpoint_reconciliation(
-    tmp_path: Path,
+@pytest.mark.parametrize(
+    "provider_type", [_ReconcilesCheckpointProvider, _IgnoresReconciliationProvider],
+)
+async def test_plan_run_finishes_without_checkpoint_or_extra_model_call(
+    tmp_path: Path, provider_type: Any,
 ) -> None:
     plan_storage = _PlanStorage()
-    provider = _ReconcilesCheckpointProvider()
-
+    provider = provider_type()
     events = await _run(tmp_path, provider, plan_storage)
-
-    assert provider.calls == 3
-    assert plan_storage.run.status == "running"
-    assert plan_storage.run.current_step_id is None
-    assert any(
-        isinstance(event, WarningEvent) and event.code == "plan_run_reconciliation"
-        for event in events
-    )
-    assert not any(isinstance(event, ErrorEvent) for event in events)
-    done = next(event for event in events if isinstance(event, DoneEvent))
-    assert done.text == "Implementation and verification are complete."
-    second_request = "\n".join(str(message.content) for message in provider.requests[1])
-    assert "[PlanRun reconciliation]" in second_request
-    assert '"currentStepId": "step-1"' in second_request
+    assert provider.calls == 1
+    assert plan_storage.run.current_step_id == "step-1"
+    assert not any(isinstance(event, (ErrorEvent, WarningEvent)) for event in events)
+    assert next(event for event in events if isinstance(event, DoneEvent)).text
 
 
 @pytest.mark.asyncio
-async def test_plan_run_cannot_succeed_after_ignoring_reconciliation(
-    tmp_path: Path,
-) -> None:
-    plan_storage = _PlanStorage()
-    provider = _IgnoresReconciliationProvider()
-
-    events = await _run(tmp_path, provider, plan_storage)
-
-    assert provider.calls == 2
-    errors = [event for event in events if isinstance(event, ErrorEvent)]
-    assert [event.code for event in errors] == ["plan_run_checkpoint_required"]
-    assert plan_storage.run.status == "running"
-
-
-@pytest.mark.asyncio
-async def test_final_checkpoint_rejects_later_workspace_mutation(
+async def test_final_checkpoint_allows_later_verification_and_repair(
     tmp_path: Path,
 ) -> None:
     plan_storage = _PlanStorage()
@@ -420,7 +452,7 @@ async def test_final_checkpoint_rejects_later_workspace_mutation(
         observed_calls=observed_calls,
     )
 
-    assert observed_calls == []
+    assert observed_calls == ["write_file:after-completion.txt:must not run"]
     assert plan_storage.run.status == "running"
     assert plan_storage.run.current_step_id is None
     assert not any(isinstance(event, ErrorEvent) for event in events)
@@ -428,7 +460,8 @@ async def test_final_checkpoint_rejects_later_workspace_mutation(
         "The implementation is complete."
     )
     denied_result = "\n".join(str(message.content) for message in provider.requests[1])
-    assert "plan_run_delivery_only" in denied_result
+    assert "plan_run_delivery_only" not in denied_result
+    assert "written" in denied_result
 
 
 @pytest.mark.asyncio
@@ -456,7 +489,40 @@ async def test_final_checkpoint_allows_later_artifact_delivery(
 
 
 @pytest.mark.asyncio
-async def test_attached_plan_run_rejects_submit_control(
+async def test_final_checkpoint_allows_prepared_preview_without_publication(tmp_path: Path) -> None:
+    plan_storage = _PlanStorage()
+    provider = _CheckpointThenPreviewProvider()
+    observed_calls: list[str] = []
+
+    events = await _run(tmp_path, provider, plan_storage, observed_calls=observed_calls)
+
+    assert observed_calls == ["open_workspace_preview:site/index.html"]
+    assert not any(isinstance(event, ErrorEvent) for event in events)
+    assert {"write_file", "exec_command", "publish_artifact"} <= provider.tool_names_per_request[1]
+    assert plan_storage.run.current_step_id is None
+    assert len(provider.system_prompts) == 2
+    for system_prompt in provider.system_prompts:
+        assert "## Approved Plan Execution" in system_prompt
+        assert "Only publish artifacts when the user requested" in system_prompt
+
+
+@pytest.mark.asyncio
+async def test_final_checkpoint_preserves_ordinary_shell_tools(tmp_path: Path) -> None:
+    plan_storage = _PlanStorage()
+    provider = _CheckpointThenStartServerProvider()
+    observed_calls: list[str] = []
+
+    events = await _run(tmp_path, provider, plan_storage, observed_calls=observed_calls)
+
+    assert observed_calls == ["exec_command:python -m http.server"]
+    assert not any(isinstance(event, ErrorEvent) for event in events)
+    denied_result = "\n".join(str(message.content) for message in provider.requests[1])
+    assert "plan_run_delivery_only" not in denied_result
+    assert "started" in denied_result
+
+
+@pytest.mark.asyncio
+async def test_attached_plan_run_uses_ordinary_submit_control(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -472,12 +538,12 @@ async def test_attached_plan_run_rejects_submit_control(
         observed_calls=observed_calls,
     )
 
-    assert "submit" not in observed_calls
+    assert "submit" in observed_calls
     assert plan_storage.run.status == "running"
     assert plan_storage.run.current_step_id is None
     assert not any(isinstance(event, ErrorEvent) for event in events)
     submit_result = "\n".join(str(message.content) for message in provider.requests[1])
-    assert "plan_run_checkpoint_required" in submit_result
+    assert "plan_run_checkpoint_required" not in submit_result
 
 
 @pytest.mark.asyncio

@@ -1,3 +1,5 @@
+import { copySelectedSkills } from '@/types/selectedSkills'
+import { pageAnnotationSnapshots } from '@/types/pageContext'
 import { nextTick, ref, type Ref } from 'vue'
 import type {
   ChatMessage,
@@ -16,13 +18,7 @@ import {
   reconcileRunningHistoryMessages,
   rehomePromotedSteerRows,
 } from '@/utils/chat/historyMerge'
-import {
-  captureVisibleMessageAnchor,
-  createScrollHandoffGuard,
-  restoreMessageAnchor,
-  stabilizeMessageAnchor,
-} from '@/utils/chat/scrollAnchor'
-import { applyProgrammaticScroll } from '@/utils/chat/scrollMutation'
+import { createScrollHandoffGuard } from '@/utils/chat/scrollAnchor'
 import type { InitialHistoryLoadStatus } from '@/utils/chat/sessionLoadState'
 import { planRevisionsFromToolSegments } from '@/utils/chat/plans'
 import {
@@ -32,6 +28,7 @@ import {
   type SessionPhaseResult,
 } from '@/composables/chat/sessionBootstrapContract'
 import {
+  SessionReadHistoryCursorError,
   SessionReadSessionMissingError,
   type SessionReadCompactionSummary,
   type SessionReadHistoryPage,
@@ -46,10 +43,11 @@ import {
   activityReasoningBlocks,
   activitySnapshotMatchesMessage,
 } from '@/utils/chat/activitySnapshot'
-import { isImageInputUnsupported, localizedChatErrorMessage } from '@/utils/chat/errors'
+import { localizedChatErrorMessage } from '@/utils/chat/errors'
+import { dedupeTerminalErrorNotices, hasTerminalErrorNotice } from '@/utils/chat/terminalErrorNotices'
 import { isUsageAccountingBarrier } from '@/utils/chat/usageAccountingFailure'
 import { interleaveHistoryModelCallSegments } from '@/utils/chat/historyModelCallSegments'
-import { normalizePromptAnnotationSnapshot } from '@/workbench/artifactPromptAnnotationProvider'
+import { normalizePromptAnnotationSnapshot } from '@/utils/chat/promptAnnotationHistory'
 
 function recordArray<T extends Record<string, unknown>>(value: unknown): T[] {
   return Array.isArray(value)
@@ -168,7 +166,7 @@ function historyActivityMarkers(
     const id = String(data.id || '').trim()
     if (!id || suppressedCompactionIds.has(id)) return []
     const rawStatus = String(data.status || 'completed').toLowerCase()
-    const state = rawStatus === 'completed'
+    const state = rawStatus === 'completed' || rawStatus === 'emergency_ephemeral'
       ? 'completed'
       : rawStatus === 'failed' ? 'failed' : 'running'
     const at = Number(data.at)
@@ -180,7 +178,9 @@ function historyActivityMarkers(
       category: 'maintenance',
       state,
       source: 'automatic',
-      durability: 'durable',
+      durability: rawStatus === 'emergency_ephemeral'
+        ? 'request_scoped'
+        : String(data.durability || 'durable'),
     }]
   })
 }
@@ -359,6 +359,7 @@ function turnOutcomeRecord(outcome: SessionReadTurnOutcome): Record<string, unkn
     turnId: outcome.turnId,
     taskId: outcome.taskId ?? undefined,
     status: outcome.status,
+    statusSource: 'task',
     startedAt: outcome.startedAt ?? undefined,
     finishedAt: outcome.finishedAt ?? undefined,
     outcome: outcome.outcome,
@@ -375,6 +376,19 @@ function turnOutcomeRecord(outcome: SessionReadTurnOutcome): Record<string, unkn
   }
 }
 
+function isLegacyTerminalError(message: SessionReadMessage): boolean {
+  if (message.role !== 'system') return false
+  // Cron/channel and imported system rows are user-authored content even when
+  // they happen to begin with “Error:”. Only unscoped engine receipts are
+  // eligible for the safe terminal projection.
+  if (message.provenance.kind || message.provenance.sourceTool || message.provenance.sourceSessionKey) return false
+  const text = (message.text || '').trim()
+  // These are engine-owned transcript receipts. Their prose supplies no
+  // classification: absent a durable outcome they receive the safe unknown.
+  return text.startsWith('Error:')
+    || /^The provider stopped because the output limit was reached before the task finished\.(?: \(ref: [0-9a-f]{8}\))?$/.test(text)
+}
+
 function attachHistoryTurnOutcomes(
   messages: ChatMessage[],
   data: SessionReadHistoryPage,
@@ -384,7 +398,7 @@ function attachHistoryTurnOutcomes(
       .map(outcome => normalizeTurnOutcome(turnOutcomeRecord(outcome)))
       .filter(outcome => outcome !== undefined)
   const byTurnId = new Map(outcomes.map(outcome => [outcome.turnId, outcome] as const))
-  if (byTurnId.size === 0) return messages
+  if (byTurnId.size === 0) return dedupeTerminalErrorNotices(messages)
   const enriched = messages.map(message => {
     const outcome = message.turnId ? byTurnId.get(message.turnId) : undefined
     if (!outcome) return message
@@ -404,10 +418,7 @@ function attachHistoryTurnOutcomes(
         ? activitySnapshot
         : { ...activitySnapshot, complete: false }
       : undefined
-    const usageBarrier = isUsageAccountingBarrier(outcome.errorClass)
-    const durableLocalizedError = (usageBarrier || isImageInputUnsupported(outcome.errorClass))
-      && message.role === 'system'
-      && message.text.trimStart().startsWith('Error:')
+    const durableLocalizedError = message.role === 'error'
     return {
       ...message,
       ...(durableLocalizedError
@@ -417,6 +428,9 @@ function attachHistoryTurnOutcomes(
               outcome.errorClass,
               outcome.terminalMessage || message.text,
               outcome.replaySafe === true,
+              outcome.failureKind,
+              outcome.status,
+              { reason: outcome.reason, cancellationSource: outcome.cancellationSource, outcomeKind: outcome.kind },
             ),
             errorCode: outcome.errorClass,
             terminalNotice: true,
@@ -493,15 +507,12 @@ function attachHistoryTurnOutcomes(
     enriched.splice(insertionIndex, 0, activityOnlyMessage)
   }
 
-  // The task outcome is the durable authority for a pre-provider usage
-  // barrier. Transcript error rows are best-effort and may be absent from a
-  // compacted or paginated window, so materialize the retry card whenever the
-  // outcome has no matching terminal row in this page.
+  // The task outcome is the durable authority for these terminal failures.
+  // Transcript error rows are best-effort and may be absent from a compacted
+  // or paginated window, so recover the notice when its identified turn is
+  // present but has no matching error row in this page.
   for (const outcome of outcomes) {
-    if (
-      !isUsageAccountingBarrier(outcome.errorClass)
-      && !isImageInputUnsupported(outcome.errorClass)
-    ) continue
+    if (!hasTerminalErrorNotice(outcome)) continue
     if (enriched.some(message =>
       message.turnId === outcome.turnId && message.role === 'error',
     )) continue
@@ -515,6 +526,9 @@ function attachHistoryTurnOutcomes(
         outcome.errorClass,
         outcome.terminalMessage || '',
         outcome.replaySafe === true,
+        outcome.failureKind,
+        outcome.status,
+        { reason: outcome.reason, cancellationSource: outcome.cancellationSource, outcomeKind: outcome.kind },
       ),
       ts: outcome.finishedAt ?? null,
       turnId: outcome.turnId,
@@ -525,39 +539,7 @@ function attachHistoryTurnOutcomes(
       terminalNotice: true,
     })
   }
-  return enriched
-}
-
-function dedupeSyntheticUsageBarrierErrors(messages: ChatMessage[]): ChatMessage[] {
-  const durableErrorTurns = new Set(
-    messages
-      .filter(message =>
-        message.role === 'error'
-        && Boolean(message.turnId)
-        && (
-          isUsageAccountingBarrier(message.errorCode)
-          || isImageInputUnsupported(message.errorCode)
-        )
-        && !message.messageId?.startsWith('terminal-error:'),
-      )
-      .map(message => message.turnId!),
-  )
-  const seenSynthetic = new Set<string>()
-  return messages.filter(message => {
-    if (
-      message.role !== 'error'
-      || !message.turnId
-      || !(
-        isUsageAccountingBarrier(message.errorCode)
-        || isImageInputUnsupported(message.errorCode)
-      )
-      || !message.messageId?.startsWith('terminal-error:')
-    ) return true
-    if (durableErrorTurns.has(message.turnId)) return false
-    if (seenSynthetic.has(message.messageId)) return false
-    seenSynthetic.add(message.messageId)
-    return true
-  })
+  return dedupeTerminalErrorNotices(enriched)
 }
 
 type AcceptedEnsembleMode = 'ensemble' | 'llm_ensemble'
@@ -703,6 +685,7 @@ interface HistoryLoadParams {
   bridgeRetry?: boolean
   retry?: boolean
   nonReconnecting?: boolean
+  replaceCanonicalWindow?: boolean
 }
 
 type FailedHistoryRequest =
@@ -716,8 +699,24 @@ type FailedHistoryRequest =
       kind: 'bridge'
       key: string
     }
+  | {
+      kind: 'latest'
+      key: string
+      error: unknown
+    }
 
 const MAX_FORWARD_BRIDGE_PAGES = 2
+const BACKGROUND_HISTORY_RETRY_DELAYS_MS = [250, 1_000, 3_000] as const
+
+type HistoryLoadResult = SessionPhaseResult & { historyContinuation?: boolean }
+
+interface BackgroundHistoryRecovery {
+  key: string
+  lease: SessionReadLease | null
+  expectedUserMessageIds: Set<string>
+  retryCount: number
+  exhausted: boolean
+}
 
 export function useChatHistory(options: UseChatHistoryOptions) {
   let historySyncTimer: ReturnType<typeof setTimeout> | null = null
@@ -733,13 +732,14 @@ export function useChatHistory(options: UseChatHistoryOptions) {
   let hasLoadedEarlier = false
   let loadEarlierPending = false
   let failedHistoryRequest: FailedHistoryRequest | null = null
+  let backgroundRecovery: BackgroundHistoryRecovery | null = null
   let activeHistory: {
     key: string
+    lease: SessionReadLease | null
     bootstrapGeneration: number
     controller: AbortController
     promise: Promise<SessionPhaseResult | void>
   } | null = null
-  let stopAnchorStabilization: () => void = () => {}
   const loadedEarlierCursors = new Set<string>()
   const historyState = ref<ChatHistoryState>({
     hasMore: false,
@@ -771,13 +771,15 @@ export function useChatHistory(options: UseChatHistoryOptions) {
     }
   }
 
-  function cancelAnchorStabilization() {
-    const stop = stopAnchorStabilization
-    stopAnchorStabilization = () => {}
-    stop()
+  function isCurrentRecovery(recovery: BackgroundHistoryRecovery): boolean {
+    return backgroundRecovery === recovery
+      && recovery.key === options.sessionKey.value
+      && recovery.lease === options.sessionReadLeaseReader.current()
   }
 
-  function armHistorySync(nonReconnecting: boolean, advanceGeneration: boolean) {
+  function armHistorySync(nonReconnecting: boolean, advanceGeneration: boolean, delayMs = 50) {
+    const key = options.sessionKey.value
+    const lease = options.sessionReadLeaseReader.current()
     if (nonReconnecting && advanceGeneration) preserveLocalTailGeneration += 1
     historySyncTimerNonReconnecting ||= nonReconnecting
     if (historySyncTimer) clearTimeout(historySyncTimer)
@@ -785,17 +787,86 @@ export function useChatHistory(options: UseChatHistoryOptions) {
       historySyncTimer = null
       const timerNonReconnecting = historySyncTimerNonReconnecting
       historySyncTimerNonReconnecting = false
-      if (historyState.value.loading) {
+      if (key !== options.sessionKey.value || lease !== options.sessionReadLeaseReader.current()) return
+      const activeReadIsStale = activeHistory && (
+        activeHistory.key !== key || activeHistory.lease !== lease
+      )
+      if ((historyState.value.loading && !activeReadIsStale) || failedHistoryRequest?.kind === 'latest') {
         historySyncPending = true
         historySyncPendingNonReconnecting ||= timerNonReconnecting
         return
       }
       void loadHistory({ nonReconnecting: timerNonReconnecting })
-    }, 50)
+    }, delayMs)
   }
 
-  function scheduleHistorySync(preserveLocalTail = false) {
+  function scheduleHistorySync(preserveLocalTail = false, expectedUserMessageId?: string) {
+    if (preserveLocalTail) {
+      const expectedId = expectedUserMessageId?.trim()
+      if (!backgroundRecovery || !isCurrentRecovery(backgroundRecovery)) {
+        backgroundRecovery = {
+          key: options.sessionKey.value,
+          lease: options.sessionReadLeaseReader.current(),
+          expectedUserMessageIds: new Set(),
+          retryCount: 0,
+          exhausted: false,
+        }
+      } else if (expectedId && backgroundRecovery.expectedUserMessageIds.has(expectedId)) {
+        // queued/running/input notifications for one input share one budget.
+        return
+      } else if (backgroundRecovery.exhausted) {
+        // An explicit terminal/commit invalidation can arrive after an outage
+        // exhausted input hydration. Give that new durable evidence its own
+        // bounded budget; identified duplicate input events return above.
+        backgroundRecovery.retryCount = 0
+        backgroundRecovery.exhausted = false
+      }
+      if (expectedId) backgroundRecovery.expectedUserMessageIds.add(expectedId)
+    }
     armHistorySync(preserveLocalTail, true)
+  }
+
+  function finishBackgroundRecovery(
+    recovery: BackgroundHistoryRecovery,
+    result: HistoryLoadResult | void,
+    requestPreserveLocalTailGeneration: number,
+  ) {
+    if (!isCurrentRecovery(recovery)) return
+    if (result?.cancelled) {
+      backgroundRecovery = null
+      if (historySyncTimer) clearTimeout(historySyncTimer)
+      historySyncTimer = null
+      historySyncTimerNonReconnecting = false
+      historySyncPending = false
+      historySyncPendingNonReconnecting = false
+      return
+    }
+    // Forward bridging already schedules its next bounded page. Progress is
+    // not a failed attempt merely because the latest input is further ahead.
+    if (result?.ok && result.historyContinuation) return
+    // A successful read admitted before a later terminal/input invalidation
+    // cannot settle it. The pending post-invalidation read owns that proof.
+    if (result?.ok && requestPreserveLocalTailGeneration < preserveLocalTailGeneration) return
+    const missingInput = [...recovery.expectedUserMessageIds].some(id => (
+      !options.messages.value.some(message => message.role === 'user' && message.messageId === id)
+    ))
+    if (result?.ok && !missingInput) {
+      backgroundRecovery = null
+      return
+    }
+    // Cursor invalidation has its own explicit canonical-window replacement.
+    if (failedHistoryRequest?.kind === 'latest') return
+    historySyncPending = false
+    historySyncPendingNonReconnecting = false
+    const delay = BACKGROUND_HISTORY_RETRY_DELAYS_MS[recovery.retryCount]
+    if (delay !== undefined) {
+      recovery.retryCount += 1
+      armHistorySync(true, true, delay)
+      return
+    }
+    recovery.exhausted = true
+    failedHistoryRequest = { kind: 'page', key: recovery.key, before: null, prepend: false }
+    historyState.value = { ...historyState.value, recoveryError: true }
   }
 
   function flushPendingHistorySync() {
@@ -828,9 +899,13 @@ export function useChatHistory(options: UseChatHistoryOptions) {
     const messageId = msg.messageId || msg.id || ''
     const steerContext = historyHasSteerEvidence(msg.turnContext)
     const turnProvenance = historyTurnPresentationProvenance(msg.turnContext)
+    const terminalError = msg.role === 'error' || isLegacyTerminalError(msg)
     return {
-      role: msg.role || 'assistant',
-      text: msg.role === 'user' ? options.stripTimePrefix(msg.text || '') : msg.text || '',
+      role: terminalError ? 'error' : msg.role || 'assistant',
+      text: terminalError
+        ? localizedChatErrorMessage(undefined, '')
+        : msg.role === 'user' ? options.stripTimePrefix(msg.text || '') : msg.text || '',
+      ...(terminalError ? { terminalNotice: true } : {}),
       ts: msg.createdAt,
       reasoning: reasoningText ? { text: reasoningText, seconds: 0 } : undefined,
       routerDecision: msg.routerDecision,
@@ -839,10 +914,13 @@ export function useChatHistory(options: UseChatHistoryOptions) {
       planRevisions: planRevisionsFromToolSegments(msg.toolCalls),
       timeline: recordArray<ChatTimelineSegment>(msg.timeline),
       attachments: normalizeDisplayAttachments([...msg.attachments], { messageId }),
-      promptAnnotations: msg.promptAnnotations
-        .map(normalizePromptAnnotationSnapshot)
-        .filter((item): item is PromptAnnotationSnapshot => item !== null)
-        .sort((left, right) => left.sentOrder - right.sentOrder),
+      ...(msg.selectedSkills?.length ? { selectedSkills: copySelectedSkills(msg.selectedSkills) } : {}),
+      promptAnnotations: msg.pageContext
+        ? pageAnnotationSnapshots(msg.pageContext)
+        : msg.promptAnnotations
+            .map(normalizePromptAnnotationSnapshot)
+            .filter((item): item is PromptAnnotationSnapshot => item !== null)
+            .sort((left, right) => (left.sentOrder || 0) - (right.sentOrder || 0)),
       provenanceKind: msg.provenance.kind || '',
       provenanceSourceSessionKey: msg.provenance.sourceSessionKey || '',
       provenanceSourceTool: msg.provenance.sourceTool || '',
@@ -928,7 +1006,7 @@ export function useChatHistory(options: UseChatHistoryOptions) {
 
   function resetForSession(key: string): boolean {
     if (historySessionKey.value === key) return false
-    cancelAnchorStabilization()
+    if (backgroundRecovery?.key !== key) backgroundRecovery = null
     const crossedSession = Boolean(historySessionKey.value)
     if (crossedSession) {
       acknowledgedPreserveLocalTailGeneration = preserveLocalTailGeneration
@@ -1005,13 +1083,12 @@ export function useChatHistory(options: UseChatHistoryOptions) {
   async function runHistoryLoad(
     params: HistoryLoadParams = {},
     bootstrap: SessionBootstrapPhaseContext,
-  ): Promise<SessionPhaseResult | void> {
+  ): Promise<HistoryLoadResult | void> {
     if (!options.sessionKey.value) return
     const key = options.sessionKey.value
     const lease = options.sessionReadLeaseReader.current()
     const requestScrollEpoch = options.scrollEpoch?.value ?? 0
     const crossedSession = resetForSession(key)
-    cancelAnchorStabilization()
     const historyStateBeforeLoad = historyState.value
     const failedHistoryRequestBeforeLoad = failedHistoryRequest
     const requestPreserveLocalTailGeneration = preserveLocalTailGeneration
@@ -1074,7 +1151,17 @@ export function useChatHistory(options: UseChatHistoryOptions) {
       if (!isCurrentRequest()) return { ok: false, cancelled: true }
       const msgs = data.messages
       const canonicalAvailable = data.canonicalAvailable
-      if (canonicalAvailable === false) {
+      // A draft WebChat key has no canonical store yet, but the server can
+      // positively confirm its empty transcript. Reconnection must accept
+      // that state without treating unavailable or already-loaded history
+      // as empty, or the first message remains blocked by the live fence.
+      const confirmedEmptyDraft = data.canonicalComplete === true
+        && msgs.length === 0
+        && !data.hasMore
+        && !params.prepend
+        && !hasLoadedEarlier
+        && options.messages.value.length === 0
+      if (canonicalAvailable === false && !confirmedEmptyDraft) {
         if (nonReconnecting) {
           restoreSilentBackgroundState()
           return { ok: false }
@@ -1111,8 +1198,17 @@ export function useChatHistory(options: UseChatHistoryOptions) {
         data,
       )
       const previousMessages = crossedSession ? [] : options.messages.value
-      const previousMaintenance = previousMessages.filter(isHistoryMaintenance)
-      const previousTranscript = previousMessages.filter(message => !isHistoryMaintenance(message))
+      const previousMaintenance = previousMessages.filter(message => (
+        isHistoryMaintenance(message)
+        && (!params.replaceCanonicalWindow || message.restoredFromHistory !== true)
+      ))
+      const previousTranscript = previousMessages.filter(message => (
+        !isHistoryMaintenance(message)
+        && (
+          !params.replaceCanonicalWindow
+          || (message.restoredFromHistory !== true && !message.terminalNotice)
+        )
+      ))
       const maintenanceMessages = compactionSummaryMessages(data)
       let historyData = data
       let bridgeContinuationNeeded = false
@@ -1237,7 +1333,7 @@ export function useChatHistory(options: UseChatHistoryOptions) {
         }
       }
 
-      if (canonicalAvailable !== false) failedHistoryRequest = null
+      if (canonicalAvailable !== false || confirmedEmptyDraft) failedHistoryRequest = null
       // Gate the full-session error on explicit coverage metadata. Older
       // Gateways used canonical_available=false for a legitimate empty WebChat
       // session but did not yet publish canonical_complete.
@@ -1294,16 +1390,13 @@ export function useChatHistory(options: UseChatHistoryOptions) {
 
       const followingLiveEdge = !params.prepend && (options.autoScroll?.value ?? true)
       const historyContainer = options.threadRef?.value ?? null
-      const visibleAnchor = !followingLiveEdge
-        ? captureVisibleMessageAnchor(historyContainer)
-        : null
-      const prependFallbackHeight = visibleAnchor ? 0 : historyContainer?.scrollHeight ?? 0
       if (params.prepend) {
         const existing = new Set(previousTranscript.map(messageKey))
         const transcript = interleaveHistoryModelCallSegments(
           rehomePromotedSteerRows(
-            dedupeSyntheticUsageBarrierErrors([
-              ...mapped.filter(msg => !existing.has(messageKey(msg))),
+            dedupeTerminalErrorNotices([
+              ...mapped.filter(msg => !existing.has(messageKey(msg))
+                || (msg.role === 'error' && msg.terminalNotice && msg.turnId)),
               ...previousTranscript,
             ]),
           ),
@@ -1315,7 +1408,7 @@ export function useChatHistory(options: UseChatHistoryOptions) {
       } else {
         const refreshedWindow = reconcileHistoryWindow(previousTranscript, mapped)
         let nextMessages: ChatMessage[]
-        if (preserveLiveTail) {
+        if (params.replaceCanonicalWindow || preserveLiveTail) {
           nextMessages = reconcileRunningHistoryMessages(previousTranscript, refreshedWindow)
         } else {
           nextMessages = refreshedWindow
@@ -1327,9 +1420,7 @@ export function useChatHistory(options: UseChatHistoryOptions) {
         )
         const transcript = interleaveHistoryModelCallSegments(
           rehomePromotedSteerRows(
-            dedupeSyntheticUsageBarrierErrors(
-              reconcileClientTerminalNotices(previousTranscript, nextMessages),
-            ),
+            reconcileClientTerminalNotices(previousTranscript, nextMessages),
           ),
         )
         options.messages.value = mergeHistoryMaintenance(
@@ -1341,32 +1432,9 @@ export function useChatHistory(options: UseChatHistoryOptions) {
       options.lastHeaderRole.value = ''
       options.lastHeaderDay.value = ''
 
-      if (visibleAnchor) {
-        await nextTick()
-        if (!isCurrentRequest()) return { ok: false, cancelled: true }
-        if (
-          (options.canApplyViewportCorrection?.() ?? true)
-          && restoreMessageAnchor(visibleAnchor)
-        ) {
-          stopAnchorStabilization = stabilizeMessageAnchor(visibleAnchor, {
-            isCurrent: () => options.sessionKey.value === key
-              && historySessionKey.value === key
-              && historyRequestSeq === requestSeq
-              && requestScrollEpoch === (options.scrollEpoch?.value ?? 0)
-              && options.threadRef?.value === historyContainer
-              && (options.canApplyViewportCorrection?.() ?? true),
-          })
-        }
-      } else if (params.prepend && historyContainer) {
-        await nextTick()
-        if (!isCurrentRequest()) return { ok: false, cancelled: true }
-        applyProgrammaticScroll(historyContainer, () => {
-          historyContainer.scrollTop += Math.max(
-            0,
-            historyContainer.scrollHeight - prependFallbackHeight,
-          )
-        })
-      } else if (followingLiveEdge) {
+      // The list virtualizer owns prepend/reflow geometry. History only
+      // preserves the user's live-edge intent across its async data commit.
+      if (followingLiveEdge) {
         // Message assignment is one synchronous commit. Install the input
         // guard immediately afterwards and before yielding to layout.
         const liveEdgeGuard = historyContainer
@@ -1391,14 +1459,7 @@ export function useChatHistory(options: UseChatHistoryOptions) {
             // live-edge ownership captured before the commit and mark the
             // correction as application-owned.
             if (options.autoScroll) options.autoScroll.value = true
-            if (historyContainer) {
-              applyProgrammaticScroll(historyContainer, () => {
-                historyContainer.scrollTop = historyContainer.scrollHeight
-              })
-              liveEdgeGuard?.acceptCurrentPosition()
-            } else {
-              options.scrollToBottom()
-            }
+            options.scrollToBottom()
           }
         } finally {
           liveEdgeGuard?.dispose()
@@ -1414,11 +1475,12 @@ export function useChatHistory(options: UseChatHistoryOptions) {
       }
       if (!bridgeContinuationNeeded) acknowledgePreservedLocalTail()
       flushPendingHistorySync()
-      return { ok: true }
+      return bridgeContinuationNeeded ? { ok: true, historyContinuation: true } : { ok: true }
     } catch (error: unknown) {
       // History endpoint may not exist yet.
       if (isCurrentRequest()) {
-        if (nonReconnecting) {
+        const cursorRequiresLatestReload = error instanceof SessionReadHistoryCursorError
+        if (nonReconnecting && !cursorRequiresLatestReload) {
           restoreSilentBackgroundState()
           return {
             ok: false,
@@ -1427,14 +1489,16 @@ export function useChatHistory(options: UseChatHistoryOptions) {
           }
         }
         const initialLoadFailed = isInitialLoad && !bridgeAttempted
-        failedHistoryRequest = bridgeAttempted
-          ? { kind: 'bridge', key }
-          : {
-              kind: 'page',
-              key,
-              before: params.before ?? null,
-              prepend: Boolean(params.prepend),
-            }
+        failedHistoryRequest = cursorRequiresLatestReload || params.replaceCanonicalWindow
+          ? { kind: 'latest', key, error }
+          : bridgeAttempted
+            ? { kind: 'bridge', key }
+            : {
+                kind: 'page',
+                key,
+                before: params.before ?? null,
+                prepend: Boolean(params.prepend),
+              }
         historyState.value = {
           ...historyState.value,
           loading: false,
@@ -1464,9 +1528,21 @@ export function useChatHistory(options: UseChatHistoryOptions) {
   ): Promise<SessionPhaseResult | void> | undefined {
     const key = options.sessionKey.value
     if (!key) return
+    if (
+      failedHistoryRequest?.key === key
+      && failedHistoryRequest.kind === 'latest'
+      && !params.replaceCanonicalWindow
+    ) {
+      historySyncPending = true
+      historySyncPendingNonReconnecting ||= Boolean(params.nonReconnecting)
+      // Bootstrap and live reconciliation treat an absent result as success.
+      // Keep their recovery fence closed until the replacement page succeeds.
+      return Promise.resolve({ ok: false, error: failedHistoryRequest.error })
+    }
     if (activeHistory) {
       if (
         activeHistory.key === key
+        && activeHistory.lease === options.sessionReadLeaseReader.current()
         && (
           !bootstrap
           || activeHistory.bootstrapGeneration === bootstrap.generation
@@ -1482,7 +1558,11 @@ export function useChatHistory(options: UseChatHistoryOptions) {
         // The caller observes the real terminal result of the in-flight read.
         return activeHistory.promise
       }
+      const currentRecovery = backgroundRecovery && isCurrentRecovery(backgroundRecovery)
+        ? backgroundRecovery
+        : null
       cancelActiveHistory()
+      backgroundRecovery = currentRecovery
     }
 
     const controller = new AbortController()
@@ -1503,16 +1583,37 @@ export function useChatHistory(options: UseChatHistoryOptions) {
           skipSnapshot: false,
         }
 
+    const lease = options.sessionReadLeaseReader.current()
+    const requestPreserveLocalTailGeneration = preserveLocalTailGeneration
     const request = runHistoryLoad(params, boundedContext)
-    const tracked = request.finally(() => {
+    const finishRequest = () => {
       parentSignal?.removeEventListener('abort', relayAbort)
-      if (activeHistory?.promise === tracked) {
-        activeHistory = null
+      if (activeHistory?.promise !== tracked) return false
+      activeHistory = null
+      return true
+    }
+    const tracked = request.then(result => {
+      if (finishRequest()) {
+        // An input notification can create recovery after this read started.
+        // Join it at completion, but never retire a successor lease's recovery
+        // because the previous request returned a cancelled result.
+        if (
+          (!params.prepend || result?.ok === false)
+          && backgroundRecovery?.key === key
+          && backgroundRecovery.lease === lease
+        ) {
+          finishBackgroundRecovery(backgroundRecovery, result, requestPreserveLocalTailGeneration)
+        }
         flushPendingHistorySync()
       }
+      return result
+    }, error => {
+      if (finishRequest()) flushPendingHistorySync()
+      throw error
     })
     activeHistory = {
       key,
+      lease,
       bootstrapGeneration: bootstrap?.generation ?? -1,
       controller,
       promise: tracked,
@@ -1532,8 +1633,32 @@ export function useChatHistory(options: UseChatHistoryOptions) {
   }
 
   function retryHistory(bootstrap?: SessionBootstrapPhaseContext) {
+    if (
+      backgroundRecovery?.exhausted
+      && isCurrentRecovery(backgroundRecovery)
+      && failedHistoryRequest?.kind !== 'latest'
+    ) {
+      backgroundRecovery.retryCount = 0
+      backgroundRecovery.exhausted = false
+      failedHistoryRequest = null
+      preserveLocalTailGeneration += 1
+      return loadHistory({ nonReconnecting: true, retry: true }, bootstrap)
+    }
     const failed = failedHistoryRequest
     if (failed?.key === options.sessionKey.value) {
+      if (failed.kind === 'latest') {
+        hasLoadedEarlier = false
+        loadEarlierPending = false
+        loadedEarlierCursors.clear()
+        failedHistoryRequest = null
+        historyState.value = {
+          ...historyState.value,
+          hasMore: false,
+          oldestCursor: null,
+          newestCursor: null,
+        }
+        return loadHistory({ replaceCanonicalWindow: true, retry: true }, bootstrap)
+      }
       if (failed.kind === 'bridge') {
         return loadHistory({ bridgeRetry: true, retry: true }, bootstrap)
       }
@@ -1553,6 +1678,7 @@ export function useChatHistory(options: UseChatHistoryOptions) {
   }
 
   function cancelActiveHistory() {
+    backgroundRecovery = null
     activeHistory?.controller.abort()
     activeHistory = null
     ++historyRequestSeq
@@ -1564,7 +1690,6 @@ export function useChatHistory(options: UseChatHistoryOptions) {
     historySyncPending = false
     historySyncPendingNonReconnecting = false
     loadEarlierPending = false
-    cancelAnchorStabilization()
     historyState.value = {
       ...historyState.value,
       loading: false,
@@ -1573,22 +1698,30 @@ export function useChatHistory(options: UseChatHistoryOptions) {
     }
   }
 
+  async function reconcileHistory(): Promise<SessionPhaseResult | void> {
+    const key = options.sessionKey.value
+    // A read admitted before the snapshot cannot prove a terminal transition
+    // after its watermark. Join it, then admit one fresh current-window read.
+    await activeHistory?.promise.catch(() => {})
+    if (options.sessionKey.value !== key) return { ok: false, cancelled: true }
+    return loadHistory({ nonReconnecting: true })
+  }
+
   function cleanup() {
     cancelActiveHistory()
     historySyncPending = false
     loadEarlierPending = false
-    cancelAnchorStabilization()
   }
 
   return {
     historySessionKey,
     historyState,
     loadHistory,
+    reconcileHistory,
     loadEarlierHistory,
     retryHistory,
     markSessionMissing,
     scheduleHistorySync,
-    cancelAnchorStabilization,
     cancelActiveHistory,
     cleanup,
   }

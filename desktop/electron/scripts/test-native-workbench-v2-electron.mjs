@@ -237,6 +237,22 @@ const server = createServer((request, response) => {
           const video = document.getElementById('video-probe')
           let running = true
           let frame = 0
+          let presentedFrames = 0
+          let videoFrameHandle
+          let progressDeadline
+          let progressReady
+          let progressFailed
+          const progress = new Promise((resolve, reject) => {
+            progressReady = resolve
+            progressFailed = reject
+          })
+          const observeVideoFrame = () => {
+            videoFrameHandle = video.requestVideoFrameCallback(() => {
+              presentedFrames += 1
+              if (frame > 1 && presentedFrames > 1) progressReady()
+              else observeVideoFrame()
+            })
+          }
           const draw = () => {
             if (!running) return
             frame += 1
@@ -248,15 +264,37 @@ const server = createServer((request, response) => {
           const stream = source.captureStream(15)
           video.srcObject = stream
           try {
-            await video.play()
-            await withTimeout(new Promise(resolve => {
-              if (video.videoWidth > 0 && video.videoHeight > 0) {
-                resolve()
-                return
+            if (typeof video.requestVideoFrameCallback !== 'function') {
+              return { status: 'failed', reason: 'Video frame observation is unavailable' }
+            }
+            observeVideoFrame()
+            try {
+              await video.play()
+              await withTimeout(new Promise(resolve => {
+                if (video.videoWidth > 0 && video.videoHeight > 0) {
+                  resolve()
+                  return
+                }
+                video.addEventListener('loadedmetadata', resolve, { once: true })
+              }), 'captureStream video metadata')
+            } catch (error) {
+              return {
+                status: 'skipped',
+                reason: 'captureStream playback unavailable: '
+                  + String(error && error.name || error),
               }
-              video.addEventListener('loadedmetadata', resolve, { once: true })
-            }), 'captureStream video metadata')
-            await wait(120)
+            }
+            // Metadata alone does not prove playback. Observe both changing
+            // source frames and actual presented video frames within the same
+            // bounded capability-probe budget used above.
+            progressDeadline = setTimeout(() => progressFailed(new Error(
+              'Video frame progress timed out: ' + JSON.stringify({
+                drawnFrames: frame, presentedFrames, readyState: video.readyState,
+                visibility: document.visibilityState, paused: video.paused,
+                videoWidth: video.videoWidth, videoHeight: video.videoHeight,
+              }),
+            )), 5000)
+            await progress
             return {
               status: 'passed',
               tagName: video.tagName,
@@ -265,15 +303,17 @@ const server = createServer((request, response) => {
               videoWidth: video.videoWidth,
               videoHeight: video.videoHeight,
               drawnFrames: frame,
+              presentedFrames,
             }
           } catch (error) {
             return {
-              status: 'skipped',
-              reason: 'captureStream playback unavailable: '
-                + String(error && error.name || error),
+              status: 'failed',
+              reason: String(error && error.message || error),
             }
           } finally {
             running = false
+            clearTimeout(progressDeadline)
+            if (videoFrameHandle !== undefined) video.cancelVideoFrameCallback(videoFrameHandle)
             for (const track of stream.getTracks()) track.stop()
             video.srcObject = null
           }
@@ -584,8 +624,6 @@ try {
       })
       await owner.loadURL('data:text/html,<title>Trusted Control UI fixture</title>')
       let reentrantReplacementPromise = null
-      const candidateReleaseHandles = []
-      const previewPinReleases = []
       let manager
       manager = new Manager({
         annotationAudit: entry => annotationLifecycleDiagnostics.push(entry),
@@ -607,39 +645,6 @@ try {
                 scopeId: 'synthetic:terminal-replacement',
               },
             })
-          }
-        },
-        resolveCandidatePreview: async candidateHandle => ({
-          candidateHandle,
-          candidateArtifactId: `art-${candidateHandle}`,
-          leaseId: `apl-${candidateHandle}`,
-          launchUrl: `${fixture.previewOrigin}/binding-candidate`,
-          expectedOrigin: fixture.previewOrigin,
-          scopeId: candidateHandle.includes('binding_a')
-            ? 'synthetic:v4-binding-a'
-            : 'synthetic:v4-binding-b',
-          mode: 'offline',
-        }),
-        releaseCandidatePreview: async candidateHandle => {
-          candidateReleaseHandles.push(candidateHandle)
-        },
-        pinArtifactPreview: grant => {
-          let released = false
-          const currentGrant = { ...grant }
-          return {
-            currentGrant: () => ({ ...currentGrant }),
-            ensureCurrent: async () => released ? null : { ...currentGrant },
-            release: async () => {
-              if (released) return
-              released = true
-              const surfaceId = currentGrant.scopeId.endsWith('-a')
-                ? 'artifact:v4-binding-a'
-                : 'artifact:v4-binding-b'
-              previewPinReleases.push({
-                scopeId: currentGrant.scopeId,
-                surfacePresent: manager.surfaces.has(surfaceId),
-              })
-            },
           }
         },
       })
@@ -1074,12 +1079,10 @@ try {
         event.surfaceId === 'artifact:v2-full'
         && event.version === 2
         && event.type === 'navigation-state')
-      const v2ArtifactBridgeUnavailable = manager.getActiveArtifactBridgeTarget() === null
 
       await manager.destroySurface('artifact:v2-full')
       await waitFor(() => fullContents.isDestroyed(), 'full preview destruction')
 
-      const activePreviewArtifactId = 'art-synthetic-v3-bridge'
       const v3 = await manager.createSurface({
         version: 3,
         surfaceId: 'artifact:v3-bridge',
@@ -1090,7 +1093,7 @@ try {
           scopeId: 'synthetic:v3-bridge',
           mode: 'full',
         },
-      }, activePreviewArtifactId)
+      })
       if (!v3.ok) throw new Error(v3.message || 'Protocol-v3 preview failed to load.')
       const v3View = view('artifact:v3-bridge')
       const v3Contents = v3View.webContents
@@ -1103,9 +1106,7 @@ try {
         visible: true,
       })
       await waitFor(() => v3View.getVisible(), 'visible protocol-v3 surface')
-      const v3BridgeTarget = manager.getActiveArtifactBridgeTarget()
-      if (!v3BridgeTarget) throw new Error('Protocol-v3 bridge target was unavailable.')
-      const v3BridgeCapabilities = v3BridgeTarget.capabilities
+      const v3Target = manager.getBrowserTarget('artifact:v3-bridge')
       const v3AnnotationCapabilities = await manager.getArtifactAnnotationCapabilities()
       // This fixture intentionally loads a DOM-rendered animation library for
       // broader preview coverage. Wait for its one-time SVG construction so
@@ -1201,55 +1202,11 @@ try {
       if (selected.tagName !== 'div') {
         throw new Error(`The annotation click selected ${selected.tagName} instead of font-probe.`)
       }
-      const annotationSourceProofV2 = structuredClone(
-        manager.surfaces.get('artifact:v3-bridge')?.annotationCandidate?.annotationProofV2,
-      )
-      if (!annotationSourceProofV2) {
-        throw new Error('The internal annotation proof-v2 was not retained.')
-      }
-      const annotationSelectionHidesProofV2 = !('annotationProofV2' in selected)
+
+      const annotationSelectionHidesProofV2 = ['annotationProofV2', 'elementProofSha256', 'domSha256'].every(key => !(key in selected))
       const annotationPageClicks = await v3Contents.executeJavaScript(
         'Number(window.__annotationPageClicks || 0)',
       )
-      // A runtime-only change outside the selected element's ancestor chain
-      // must not invalidate its source-backed authorization proof.
-      await v3Contents.executeJavaScript(
-        "document.getElementById('lottie-probe').setAttribute('data-runtime-state', 'ready')",
-      )
-      await v3Contents.executeJavaScript(
-        "document.body.classList.add('fixture-runtime-visible')",
-      )
-      const resolvedSelection = await v3BridgeTarget.resolveAnnotationSelection(
-        {
-          version: 3,
-          activePreviewArtifactId,
-          selectionId: selected.selectionId,
-          tagName: selected.tagName,
-          elementPath: selected.elementPath,
-          elementProofSha256: selected.elementProofSha256,
-        },
-        new AbortController().signal,
-      )
-      const annotationAncestorClassAdditionAccepted = Boolean(
-        resolvedSelection.annotationProofV2
-        && resolvedSelection.annotationProofV2.stableElementProofSha256
-          === annotationSourceProofV2.stableElementProofSha256
-        && annotationSourceProofV2.ancestorClassCommitments.every(commitment => (
-          resolvedSelection.annotationProofV2.ancestorClassCommitments.includes(commitment)
-        )),
-      )
-      const annotationWrongArtifactResolveRejected =
-        await v3BridgeTarget.resolveAnnotationSelection(
-          {
-            version: 3,
-            activePreviewArtifactId: 'art-synthetic-other-preview',
-            selectionId: selected.selectionId,
-            tagName: selected.tagName,
-            elementPath: selected.elementPath,
-            elementProofSha256: selected.elementProofSha256,
-          },
-          new AbortController().signal,
-        ).then(() => false, () => true)
       const annotationOverlayResult = await manager.showArtifactAnnotationOverlay({
         version: 3,
         surfaceId: 'artifact:v3-bridge',
@@ -1272,6 +1229,21 @@ try {
       if (!annotationOverlay) throw new Error('Trusted annotation overlay was not created.')
       await annotationOverlay.ready
       await waitFor(() => annotationOverlay.view.getVisible(), 'trusted annotation overlay')
+      // Native visibility changes before Chromium necessarily receives setBounds.
+      // Check the renderer viewport before sampling CSS; do not wait for the
+      // expected textarea height, which would hide an actual layout regression.
+      let annotationOverlayLayout = null
+      await waitFor(async () => {
+        const bounds = annotationOverlay.view.getBounds()
+        const zoom = annotationOverlay.view.webContents.getZoomFactor()
+        const viewport = await annotationOverlay.view.webContents.executeJavaScript(
+          '({ width: innerWidth, height: innerHeight, dpr: devicePixelRatio })',
+        )
+        annotationOverlayLayout = { bounds, zoom, viewport }
+        // innerWidth/innerHeight are integers; fractional DPI can round by a pixel.
+        return Math.abs(viewport.width - bounds.width / zoom) < 1
+          && Math.abs(viewport.height - bounds.height / zoom) < 1
+      }, 'trusted annotation renderer viewport', 10_000, () => annotationOverlayLayout)
       const overlayPreferences = annotationOverlay.view.webContents.getLastWebPreferences()
       const annotationOverlaySecurity = {
         contextIsolation: overlayPreferences.contextIsolation,
@@ -1530,6 +1502,103 @@ try {
         !annotationOverlay.view.getVisible()
         && annotationOverlay.binding === null
         && manager.surfaces.get('artifact:v3-bridge')?.annotationCandidate === null
+      const annotationNormalizedSelections = []
+      for (const kind of ['before', 'after', 'text', 'shadow-open', 'shadow-closed', 'element', 'svg']) {
+        const eventsBefore = events.length
+        await v3Contents.executeJavaScript(`(() => {
+          const kind = ${JSON.stringify(kind)}
+          const host = document.createElement('div')
+          host.id = 'annotation-normalization-probe'
+          host.style.cssText = 'position:fixed;left:20px;top:100px;width:220px;height:80px;z-index:2147483647;background:#eee'
+          if (kind === 'before' || kind === 'after') {
+            const style = document.createElement('style')
+            style.id = 'annotation-normalization-style'
+            style.textContent = '#annotation-normalization-probe::' + kind
+              + '{content:"";position:absolute;inset:0;background:#ccc}'
+            document.head.append(style)
+            host.textContent = 'Decorative panel'
+          } else if (kind.startsWith('shadow-')) {
+            const root = host.attachShadow({ mode: kind.slice(7) })
+            root.innerHTML = '<button style="width:100%;height:100%">Component action</button>'
+          } else if (kind === 'svg') {
+            host.innerHTML = '<svg width="220" height="80"><foreignObject id="annotation-normalization-target" width="220" height="80"><div xmlns="http://www.w3.org/1999/xhtml">SVG content</div></foreignObject></svg>'
+          } else {
+            host.textContent = 'Editable panel'
+          }
+          document.body.append(host)
+        })()`)
+        await waitFor(() => view('artifact:v3-bridge').getVisible(), `${kind} annotation preview`)
+        const armed = await manager.setArtifactAnnotationMode({
+          version: 3, surfaceId: 'artifact:v3-bridge', enabled: true,
+        })
+        if (!armed.ok) throw new Error(`${kind} annotation picker failed to start.`)
+        if (kind === 'text' || kind === 'svg') {
+          const textObject = await v3Contents.debugger.sendCommand('Runtime.evaluate', {
+            expression: kind === 'text'
+              ? "document.getElementById('annotation-normalization-probe').firstChild"
+              : "document.getElementById('annotation-normalization-target')",
+          })
+          const textNode = await v3Contents.debugger.sendCommand('DOM.describeNode', {
+            objectId: textObject.result.objectId,
+          })
+          await manager.handleAnnotationNodeSelected(
+            manager.surfaces.get('artifact:v3-bridge'), textNode.node.backendNodeId,
+          )
+          await v3Contents.debugger.sendCommand('Runtime.releaseObject', {
+            objectId: textObject.result.objectId,
+          })
+        } else {
+          v3Contents.focus()
+          for (const type of ['mouseMoved', 'mousePressed', 'mouseReleased']) {
+            await v3Contents.debugger.sendCommand('Input.dispatchMouseEvent', {
+              type, x: 130, y: 140, button: type === 'mouseMoved' ? 'none' : 'left', clickCount: 1,
+            })
+          }
+        }
+        const event = await waitFor(() => events.slice(eventsBefore).find(event =>
+          event.surfaceId === 'artifact:v3-bridge'
+          && (event.type === 'annotation-selected' || event.type === 'blocked-action')),
+        `${kind} annotation selection`)
+        if (event.type !== 'annotation-selected') {
+          throw new Error(`${kind} annotation was rejected: ${JSON.stringify(event.detail)}`)
+        }
+        const selection = event.detail.selection
+        const expectedTargetId = kind === 'svg'
+          ? 'annotation-normalization-target' : 'annotation-normalization-probe'
+        const retained = manager.surfaces.get('artifact:v3-bridge').annotationCandidate
+        const selectedTarget = await v3Contents.debugger.sendCommand('Runtime.callFunctionOn', {
+          objectId: retained.objectId,
+          functionDeclaration: `function (locatorHint, expectedTargetId) {
+            const expected = document.getElementById(expectedTargetId)
+            return {
+              matchesHost: document.querySelector(locatorHint) === expected,
+              retainedHost: this === expected,
+            }
+          }`,
+          arguments: [{ value: selection.locatorHint }, { value: expectedTargetId }],
+          returnByValue: true,
+        })
+        const shown = await manager.showArtifactAnnotationOverlay({
+          version: 3, surfaceId: 'artifact:v3-bridge', selectionId: selection.selectionId,
+          annotationId: `annotation_normalized_${kind}`, initialBody: '',
+        })
+        annotationNormalizedSelections.push({
+          kind,
+          matchesHost: selectedTarget.result.value.matchesHost,
+          retainedHost: selectedTarget.result.value.retainedHost,
+          editorVisible: shown.ok && annotationOverlay.view.getVisible(),
+          tagName: selection.tagName,
+        })
+        const closed = await closeAnnotationOverlayImmediately({
+          version: 3, surfaceId: 'artifact:v3-bridge',
+          annotationId: `annotation_normalized_${kind}`, rearm: true,
+        })
+        if (!closed.ok) throw new Error(`${kind} annotation editor failed to close.`)
+        await v3Contents.executeJavaScript(`
+          document.getElementById('annotation-normalization-probe').remove();
+          document.getElementById('annotation-normalization-style')?.remove();
+        `)
+      }
       const annotationRearmEventsBefore = events.length
       const annotationPickerRearm = annotationOverlayAcknowledgement
       const annotationRejectedSelectionDiagnosticsBefore = annotationLifecycleDiagnostics.length
@@ -1537,10 +1606,9 @@ try {
       if (!annotationRejectedSelectionRecord) {
         throw new Error('The annotation surface disappeared before rejected-selection recovery.')
       }
-      // A CSS pseudo-element can produce an inspectNodeRequested backend id
-      // which cannot be resolved to a supported Element in the isolated
-      // world. Exercise the same rejection path deterministically, then prove
-      // the next real click is still captured by the picker below.
+      // A removed node can leave an inspectNodeRequested backend id which no
+      // longer resolves. Exercise that rejection path deterministically, then
+      // prove the next real click is still captured by the picker below.
       await manager.handleAnnotationNodeSelected(
         annotationRejectedSelectionRecord,
         Number.MAX_SAFE_INTEGER,
@@ -1977,178 +2045,11 @@ try {
       })
       const v3Record = manager.surfaces.get('artifact:v3-bridge')
       const annotationScrollBeforeFocus = await v3Contents.executeJavaScript('window.scrollY')
-      const annotationFocus = await v3BridgeTarget.focusAnnotation(
-        {
-          version: 3,
-          activePreviewArtifactId,
-          annotationId: 'annotation_electron_fixture',
-          scopeId: 'synthetic:v3-bridge',
-          tagName: selected.tagName,
-          elementPath: selected.elementPath,
-          elementProofSha256: selected.elementProofSha256,
-          annotationProofV2: annotationSourceProofV2,
-        },
-        new AbortController().signal,
-      )
+      const annotationFocus = await manager.focusAnnotation('artifact:v3-bridge', v3Target.targetRef, selected.locatorHint)
       const annotationScrollAfterFocus = await v3Contents.executeJavaScript('window.scrollY')
       const annotationFocusHighlightArmed = Boolean(v3Record.annotationFocusTimer)
-      const annotationWrongScopeRejected = await v3BridgeTarget.focusAnnotation(
-        {
-          version: 3,
-          activePreviewArtifactId,
-          annotationId: 'annotation_electron_fixture',
-          scopeId: 'synthetic:other-scope',
-          tagName: selected.tagName,
-          elementPath: selected.elementPath,
-          elementProofSha256: selected.elementProofSha256,
-          annotationProofV2: annotationSourceProofV2,
-        },
-        new AbortController().signal,
-      ).then(() => false, () => true)
-      const annotationWrongArtifactFocusRejected = await v3BridgeTarget.focusAnnotation(
-        {
-          version: 3,
-          activePreviewArtifactId: 'art-synthetic-other-preview',
-          annotationId: 'annotation_electron_fixture',
-          scopeId: 'synthetic:v3-bridge',
-          tagName: selected.tagName,
-          elementPath: selected.elementPath,
-          elementProofSha256: selected.elementProofSha256,
-          annotationProofV2: annotationSourceProofV2,
-        },
-        new AbortController().signal,
-      ).then(() => false, () => true)
-      await v3Contents.executeJavaScript(
-        "document.getElementById('font-probe').setAttribute('data-focus-mismatch', '1')",
-      )
-      const annotationDomMismatchRejected = await v3BridgeTarget.focusAnnotation(
-        {
-          version: 3,
-          activePreviewArtifactId,
-          annotationId: 'annotation_electron_fixture',
-          scopeId: 'synthetic:v3-bridge',
-          tagName: selected.tagName,
-          elementPath: selected.elementPath,
-          elementProofSha256: selected.elementProofSha256,
-          annotationProofV2: annotationSourceProofV2,
-        },
-        new AbortController().signal,
-      ).then(() => false, () => true)
-      await v3Contents.executeJavaScript(
-        "document.getElementById('font-probe').removeAttribute('data-focus-mismatch')",
-      )
-      await v3Contents.executeJavaScript(
-        "document.body.setAttribute('data-ancestor-mismatch', '1')",
-      )
-      const annotationAncestorMismatchRejected = await v3BridgeTarget.focusAnnotation(
-        {
-          version: 3,
-          activePreviewArtifactId,
-          annotationId: 'annotation_electron_fixture',
-          scopeId: 'synthetic:v3-bridge',
-          tagName: selected.tagName,
-          elementPath: selected.elementPath,
-          elementProofSha256: selected.elementProofSha256,
-          annotationProofV2: annotationSourceProofV2,
-        },
-        new AbortController().signal,
-      ).then(() => false, () => true)
-      await v3Contents.executeJavaScript(
-        "document.body.removeAttribute('data-ancestor-mismatch')",
-      )
-      const focusWithSourceProof = overrides => v3BridgeTarget.focusAnnotation(
-        {
-          version: 3,
-          activePreviewArtifactId,
-          annotationId: 'annotation_electron_fixture',
-          scopeId: 'synthetic:v3-bridge',
-          tagName: selected.tagName,
-          elementPath: selected.elementPath,
-          elementProofSha256: selected.elementProofSha256,
-          annotationProofV2: annotationSourceProofV2,
-          ...overrides,
-        },
-        new AbortController().signal,
-      )
-      await v3Contents.executeJavaScript(
-        "document.body.classList.remove('fixture-source-shell')",
-      )
-      const annotationAncestorClassRemovalRejected = await focusWithSourceProof()
-        .then(() => false, () => true)
-      await v3Contents.executeJavaScript(`(() => {
-        document.body.classList.add('fixture-source-shell')
-        document.body.classList.remove('fixture-runtime-replacement')
-      })()`)
-      await v3Contents.executeJavaScript(`(() => {
-        document.body.classList.remove('fixture-source-shell')
-        document.body.classList.add('fixture-runtime-replacement')
-      })()`)
-      const annotationAncestorClassReplacementRejected = await focusWithSourceProof()
-        .then(() => false, () => true)
-      await v3Contents.executeJavaScript(`(() => {
-        document.body.classList.remove('fixture-runtime-replacement')
-        document.body.classList.add('fixture-source-shell')
-      })()`)
-      await v3Contents.executeJavaScript(
-        "document.body.setAttribute('id', 'fixture-runtime-id')",
-      )
-      const annotationAncestorIdMismatchRejected = await focusWithSourceProof()
-        .then(() => false, () => true)
-      await v3Contents.executeJavaScript("document.body.removeAttribute('id')")
-      await v3Contents.executeJavaScript(
-        "document.body.setAttribute('style', 'opacity: 0.99')",
-      )
-      const annotationAncestorStyleMismatchRejected = await focusWithSourceProof()
-        .then(() => false, () => true)
-      await v3Contents.executeJavaScript("document.body.removeAttribute('style')")
-      await v3Contents.executeJavaScript(
-        "document.getElementById('font-probe').classList.add('fixture-selected-runtime')",
-      )
-      const annotationSelectedClassAdditionAccepted = await focusWithSourceProof()
-        .then(result => result.focused === true, () => false)
-      await v3Contents.executeJavaScript(
-        "document.getElementById('font-probe').classList.remove('fixture-source-target')",
-      )
-      const annotationSelectedClassRemovalRejected = await focusWithSourceProof()
-        .then(() => false, () => true)
-      await v3Contents.executeJavaScript(`(() => {
-        const target = document.getElementById('font-probe')
-        target.classList.remove('fixture-selected-runtime')
-        target.classList.add('fixture-runtime-replacement')
-      })()`)
-      const annotationSelectedClassReplacementRejected = await focusWithSourceProof()
-        .then(() => false, () => true)
-      await v3Contents.executeJavaScript(`(() => {
-        const target = document.getElementById('font-probe')
-        target.classList.remove('fixture-runtime-replacement')
-        target.classList.add('fixture-source-target')
-      })()`)
-      const mismatchedElementPath = JSON.stringify(
-        JSON.parse(selected.elementPath).map((segment, index, segments) => (
-          index === segments.length - 1
-            ? [segment[0], segment[1], segment[2] + 1]
-            : segment
-        )),
-      )
-      const annotationPathMismatchRejected = await focusWithSourceProof({
-        elementPath: mismatchedElementPath,
-      }).then(() => false, () => true)
-      const annotationTagMismatchRejected = await focusWithSourceProof({
-        tagName: 'span',
-      }).then(() => false, () => true)
-      const annotationRefocus = await v3BridgeTarget.focusAnnotation(
-        {
-          version: 3,
-          activePreviewArtifactId,
-          annotationId: 'annotation_electron_fixture',
-          scopeId: 'synthetic:v3-bridge',
-          tagName: selected.tagName,
-          elementPath: selected.elementPath,
-          elementProofSha256: selected.elementProofSha256,
-          annotationProofV2: annotationSourceProofV2,
-        },
-        new AbortController().signal,
-      )
+      const annotationWrongTargetRejected = await manager.focusAnnotation('artifact:v3-bridge', 'page-incorrect', selected.locatorHint).then(() => false, () => true)
+      const annotationRefocus = await manager.focusAnnotation('artifact:v3-bridge', v3Target.targetRef, selected.locatorHint)
       const annotationFallbackShow = await manager.showArtifactAnnotationOverlay({
         version: 3,
         surfaceId: 'artifact:v3-bridge',
@@ -2204,10 +2105,9 @@ try {
           event.surfaceId === 'artifact:v3-bridge'
           && event.type === 'annotation-selected'
           && event.detail?.selection?.tagName === 'path'),
-        'Unicode and SVG element proof selection',
+        'Unicode and SVG annotation selection',
       )
-      const annotationGoldenElementProof =
-        annotationGoldenSelectionEvent.detail.selection.elementProofSha256
+      const annotationSvgLocator = annotationGoldenSelectionEvent.detail.selection.locatorHint
 
       const annotationRollbackCommands = []
       const originalAnnotationCdpCommand = manager.cdpCommand.bind(manager)
@@ -2334,16 +2234,10 @@ try {
           && event.type === 'annotation-selected')
       const annotationPickerActiveAfterOff =
         manager.surfaces.get('artifact:v3-bridge')?.annotationPickerActive
-      const v3Screenshot = await v3BridgeTarget.screenshot(
-        { version: 3 },
-        new AbortController().signal,
-      )
+      const v3Screenshot = await manager.executeBrowser({operation:'screenshot',sessionKey:v3Target.sessionKey,targetRef:v3Target.targetRef},new AbortController().signal)
       const v3ReadyEventsBeforeReload = events.filter(event =>
         event.surfaceId === 'artifact:v3-bridge' && event.type === 'ready').length
-      const v3Reload = await v3BridgeTarget.reloadSurface(
-        { version: 3 },
-        new AbortController().signal,
-      )
+      const v3Reload = await manager.executeBrowser({operation:'reload',sessionKey:v3Target.sessionKey,targetRef:v3Target.targetRef},new AbortController().signal)
       const annotationFocusClearedOnReload = v3Record.annotationFocusTimer === null
       await waitFor(
         () => events.filter(event =>
@@ -2362,188 +2256,6 @@ try {
         surfaceId: 'artifact:v3-bridge',
         enabled: true,
       })
-
-      const v4BindingA = await manager.createSurface({
-        version: 4,
-        surfaceId: 'artifact:v4-binding-a',
-        kind: 'artifact-preview',
-        payload: {
-          launchUrl: `${fixture.previewOrigin}/binding-a`,
-          expectedOrigin: fixture.previewOrigin,
-          scopeId: 'synthetic:v4-binding-a',
-          mode: 'full',
-        },
-      }, 'art-v4-binding-a')
-      if (!v4BindingA.ok) throw new Error(v4BindingA.message || 'v4 binding A failed.')
-      const v4BindingAView = view('artifact:v4-binding-a')
-      manager.setSurfaceRect({
-        surfaceId: 'artifact:v4-binding-a',
-        x: 400,
-        y: 80,
-        width: 400,
-        height: 500,
-        visible: true,
-      })
-      await waitFor(() => v4BindingAView.getVisible(), 'visible v4 binding A')
-      const turnBindingA = await manager.acquireArtifactBridgeTargetBinding()
-      if (!turnBindingA) throw new Error('v4 turn binding A was unavailable.')
-      const sameSurfaceSecondBinding = await manager.acquireArtifactBridgeTargetBinding()
-      const bindingAInitial = await turnBindingA.target.browserInspect(
-        { version: 5, scope: 'document', maxNodes: 8 },
-        new AbortController().signal,
-      )
-
-      const v4BindingB = await manager.createSurface({
-        version: 4,
-        surfaceId: 'artifact:v4-binding-b',
-        kind: 'artifact-preview',
-        payload: {
-          launchUrl: `${fixture.previewOrigin}/binding-b`,
-          expectedOrigin: fixture.previewOrigin,
-          scopeId: 'synthetic:v4-binding-b',
-          mode: 'full',
-        },
-      }, 'art-v4-binding-b')
-      if (!v4BindingB.ok) throw new Error(v4BindingB.message || 'v4 binding B failed.')
-      const v4BindingBView = view('artifact:v4-binding-b')
-      manager.setSurfaceRect({
-        surfaceId: 'artifact:v4-binding-b',
-        x: 400,
-        y: 80,
-        width: 400,
-        height: 500,
-        visible: true,
-      })
-      await waitFor(() => v4BindingBView.getVisible(), 'visible v4 binding B')
-      const turnBindingB = await manager.acquireArtifactBridgeTargetBinding()
-      if (!turnBindingB) throw new Error('v4 turn binding B was unavailable.')
-      const bindingSwitchStress = []
-      for (let iteration = 0; iteration < 20; iteration += 1) {
-        const activeSurfaceId = iteration % 2 === 0
-          ? 'artifact:v4-binding-a'
-          : 'artifact:v4-binding-b'
-        const activation = manager.activateSurface(activeSurfaceId)
-        if (!activation.ok) throw new Error(activation.message || 'v4 binding switch failed.')
-        const [bindingAStress, bindingBStress] = await Promise.all([
-          turnBindingA.target.browserInspect(
-            { version: 5, scope: 'document', maxNodes: 8 },
-            new AbortController().signal,
-          ),
-          turnBindingB.target.browserInspect(
-            { version: 5, scope: 'document', maxNodes: 8 },
-            new AbortController().signal,
-          ),
-        ])
-        bindingSwitchStress.push({
-          activeSurfaceId,
-          bindingAScopeId: bindingAStress.scopeId,
-          bindingAGeneration: bindingAStress.bindingGeneration,
-          bindingBScopeId: bindingBStress.scopeId,
-          bindingBGeneration: bindingBStress.bindingGeneration,
-        })
-      }
-      manager.activateSurface('artifact:v4-binding-b')
-      const detachedBindingA = await manager.destroySurface('artifact:v4-binding-a')
-      const bindingAStayedPinned = manager.surfaces.has('artifact:v4-binding-a')
-        && !v4BindingAView.getVisible()
-      const [bindingAAfterSwitch, bindingBAfterSwitch] = await Promise.all([
-        turnBindingA.target.browserInspect(
-          { version: 5, scope: 'document', maxNodes: 8 },
-          new AbortController().signal,
-        ),
-        turnBindingB.target.browserInspect(
-          { version: 5, scope: 'document', maxNodes: 8 },
-          new AbortController().signal,
-        ),
-      ])
-      const candidateHandleA = 'candidate_v4_binding_a_1234'
-      const bindingACandidate = await turnBindingA.target.bindCandidatePreview(
-        { version: 5, candidateHandle: candidateHandleA },
-        new AbortController().signal,
-      )
-      const candidateSnapshotBeforeCrash = await turnBindingA.target.browserInspect(
-        {
-          version: 5,
-          scope: 'document',
-          maxNodes: 8,
-          candidateHandle: candidateHandleA,
-        },
-        new AbortController().signal,
-      )
-      const originalCdpCommand = manager.cdpCommand.bind(manager)
-      let droppedActionReply = false
-      manager.cdpCommand = async (record, method, params) => {
-        const value = await originalCdpCommand(record, method, params)
-        if (method === 'Runtime.callFunctionOn' && !droppedActionReply) {
-          droppedActionReply = true
-          throw new Error('synthetic action reply loss')
-        }
-        return value
-      }
-      let actionResultUnknownCode = ''
-      try {
-        await turnBindingA.target.browserAct(
-          {
-            version: 5,
-            action: 'press',
-            key: 'Enter',
-            candidateHandle: candidateHandleA,
-          },
-          new AbortController().signal,
-        )
-      } catch (error) {
-        actionResultUnknownCode = error?.code || ''
-      } finally {
-        manager.cdpCommand = originalCdpCommand
-      }
-      const candidateSnapshotAfterUnknownAction = await turnBindingA.target.browserInspect(
-        {
-          version: 5,
-          scope: 'document',
-          maxNodes: 8,
-          candidateHandle: candidateHandleA,
-        },
-        new AbortController().signal,
-      )
-      const bindingAContentsBeforeCrash = view('artifact:v4-binding-a').webContents
-      emitRendererGone(bindingAContentsBeforeCrash)
-      const candidateSnapshotAfterRecovery = await turnBindingA.target.browserInspect(
-        {
-          version: 5,
-          scope: 'document',
-          maxNodes: 8,
-          candidateHandle: candidateHandleA,
-        },
-        new AbortController().signal,
-      )
-      const bindingAContentsAfterRecovery = view('artifact:v4-binding-a').webContents
-      const candidateReboundAfterRecovery = manager.surfaces
-        .get('artifact:v4-binding-a')?.candidatePreview?.handle === candidateHandleA
-      emitRendererGone(bindingAContentsAfterRecovery)
-      let secondBindingFailureCode = ''
-      try {
-        await turnBindingA.target.browserInspect(
-          {
-            version: 5,
-            scope: 'document',
-            maxNodes: 8,
-            candidateHandle: candidateHandleA,
-          },
-          new AbortController().signal,
-        )
-      } catch (error) {
-        secondBindingFailureCode = error?.code || ''
-      }
-      await turnBindingA.release()
-      const bindingADestroyedBeforePinRelease = previewPinReleases.some(entry =>
-        entry.scopeId === 'synthetic:v4-binding-a'
-        && entry.surfacePresent === false)
-      const bindingAReleasedEventCount = events.filter(event =>
-        event.surfaceId === 'artifact:v4-binding-a'
-        && event.type === 'agent-edit-released').length
-      await turnBindingB.release()
-      const bindingBSurfaceRetained = manager.surfaces.has('artifact:v4-binding-b')
-      await manager.destroySurface('artifact:v4-binding-b')
 
       const isolated = await manager.createSurface({
         version: 2,
@@ -3059,8 +2771,6 @@ try {
         permissionResponse,
         permissionResult,
         fullNavigationEventCount: fullNavigationEvents.length,
-        v2ArtifactBridgeUnavailable,
-        v3BridgeCapabilities,
         v3AnnotationCapabilities,
         annotationPicker,
         annotationSelectionHidesProofV2,
@@ -3068,17 +2778,15 @@ try {
         annotationSelected: {
           tagName: selected.tagName,
           hasBoundedPath: selected.elementPath.length > 0 && selected.elementPath.length <= 4096,
-          omitsWholeDomDigest: selected.domSha256 === undefined,
-          hasElementProof: /^[a-f0-9]{64}$/.test(selected.elementProofSha256),
+          targetRef: selected.targetRef,
+          locatorHint: selected.locatorHint,
           rect: selected.rect,
         },
         annotationPageClicks,
-        resolvedSelection,
-        annotationAncestorClassAdditionAccepted,
-        annotationWrongArtifactResolveRejected,
         annotationOverlayResult,
         annotationOverlaySecurity,
         annotationOverlayVisualStructure,
+        annotationOverlayLayout,
         annotationOverlayDevToolsBlocked,
         annotationOverlayBounds,
         annotationOverlayMovedBounds,
@@ -3098,6 +2806,7 @@ try {
         annotationOverlayClosedAfterAcknowledgement,
         annotationAtomicHandoffPendingState,
         annotationPickerRearm,
+        annotationNormalizedSelections,
         annotationRejectedSelectionRecovery,
         annotationRejectedSelectionRearmFailure,
         annotationRearmOverlayResult,
@@ -3117,31 +2826,19 @@ try {
         annotationAtomicFailureRetry,
         annotationAtomicStopAfterCycles,
         annotationLifecycleDiagnostics,
+        annotationWrongTargetRejected,
+        annotationSvgLocator,
         annotationFocus,
         annotationScrollBeforeFocus,
         annotationScrollAfterFocus,
         annotationFocusHighlightArmed,
         annotationFocusClearedOnReload,
-        annotationWrongScopeRejected,
-        annotationWrongArtifactFocusRejected,
-        annotationDomMismatchRejected,
-        annotationAncestorMismatchRejected,
-        annotationAncestorClassRemovalRejected,
-        annotationAncestorClassReplacementRejected,
-        annotationAncestorIdMismatchRejected,
-        annotationAncestorStyleMismatchRejected,
-        annotationSelectedClassAdditionAccepted,
-        annotationSelectedClassRemovalRejected,
-        annotationSelectedClassReplacementRejected,
-        annotationPathMismatchRejected,
-        annotationTagMismatchRejected,
         annotationRefocus,
         annotationFallbackShow,
         annotationFallbackEvent,
         annotationPreviewHiddenForFallback,
         annotationFallbackClose,
         annotationPreviewRestoredAfterFallback,
-        annotationGoldenElementProof,
         annotationPostconditionFailure,
         annotationRollbackCommands: annotationRollbackCommands.filter(
           ([method]) => method.startsWith('Overlay.'),
@@ -3161,52 +2858,11 @@ try {
         v3NavigationEventCount: v3NavigationEvents.length,
         v3Reload,
         v3Screenshot: {
-          mime: v3Screenshot.mime,
-          byteLength: v3Screenshot.data.byteLength,
+          mime: v3Screenshot.mimeType,
+          byteLength: v3Screenshot.dataBase64.length,
           width: v3Screenshot.width,
           height: v3Screenshot.height,
         },
-        v4BindingA,
-        sameSurfaceSecondBindingWasRejected: sameSurfaceSecondBinding === null,
-        bindingAInitial: {
-          scopeId: bindingAInitial.scopeId,
-          generation: bindingAInitial.bindingGeneration,
-        },
-        detachedBindingA,
-        bindingAStayedPinned,
-        bindingAAfterSwitch: {
-          scopeId: bindingAAfterSwitch.scopeId,
-          generation: bindingAAfterSwitch.bindingGeneration,
-        },
-        bindingBAfterSwitch: {
-          scopeId: bindingBAfterSwitch.scopeId,
-          generation: bindingBAfterSwitch.bindingGeneration,
-        },
-        bindingSwitchStress,
-        bindingACandidate,
-        candidateSnapshotBeforeCrash: {
-          scopeId: candidateSnapshotBeforeCrash.scopeId,
-          candidateHandle: candidateSnapshotBeforeCrash.candidateHandle,
-          generation: candidateSnapshotBeforeCrash.bindingGeneration,
-        },
-        actionResultUnknownCode,
-        candidateSnapshotAfterUnknownAction: {
-          candidateHandle: candidateSnapshotAfterUnknownAction.candidateHandle,
-          generation: candidateSnapshotAfterUnknownAction.bindingGeneration,
-        },
-        candidateSnapshotAfterRecovery: {
-          scopeId: candidateSnapshotAfterRecovery.scopeId,
-          candidateHandle: candidateSnapshotAfterRecovery.candidateHandle,
-          generation: candidateSnapshotAfterRecovery.bindingGeneration,
-        },
-        bindingAContentsReplaced:
-          bindingAContentsAfterRecovery.id !== bindingAContentsBeforeCrash.id,
-        candidateReboundAfterRecovery,
-        secondBindingFailureCode,
-        bindingADestroyedBeforePinRelease,
-        bindingAReleasedEventCount,
-        bindingBSurfaceRetained,
-        candidateReleaseHandles,
         isolationState,
         offlineLocal,
         offlineNetworkWarning,
@@ -3343,7 +2999,8 @@ try {
     assert.equal(videoProbe.hasMediaStream, true)
     assert.ok(videoProbe.readyState >= 1)
     assert.ok(videoProbe.videoWidth > 0 && videoProbe.videoHeight > 0)
-    assert.ok(videoProbe.drawnFrames > 1)
+    assert.ok(videoProbe.drawnFrames > 1, JSON.stringify(videoProbe))
+    assert.ok(videoProbe.presentedFrames > 1, JSON.stringify(videoProbe))
   }
 
   const webglProbe = result.fullProbes.webglProbe
@@ -3416,31 +3073,6 @@ try {
   assert.equal(result.permissionResponse.ok, true, 'a current permission request may be answered')
   assert.equal(result.permissionResult, 'denied', 'denied permission must reach web content')
   assert.ok(result.fullNavigationEventCount > 0, 'v2 surfaces must emit navigation state')
-  assert.equal(
-    result.v2ArtifactBridgeUnavailable,
-    true,
-    'v2 surfaces must not gain protocol-v3 agent capabilities implicitly',
-  )
-  assert.deepEqual(
-    result.v3BridgeCapabilities,
-    {
-      captureSelection: false,
-      resolveAnnotationSelection: true,
-      focusAnnotation: true,
-      annotationProofV2: true,
-      browserInspect: false,
-      browserAct: false,
-      bindCandidatePreview: false,
-      restoreCanonicalPreview: false,
-      // Legacy v3 annotation capture/reload remain available to old clients;
-      // autonomous browser inspection/action and candidate preview binding are
-      // still v4-only.
-      screenshot: true,
-      officeFlush: false,
-      reloadSurface: true,
-    },
-    'v3 capabilities must default closed except for implemented host operations',
-  )
   assert.deepEqual(result.v3AnnotationCapabilities, {
     version: 3,
     available: true,
@@ -3453,7 +3085,7 @@ try {
   assert.equal(
     result.annotationSelectionHidesProofV2,
     true,
-    'annotation-selected must not expose the internal proof-v2 to WebUI',
+    'annotation-selected must not carry retired source-authorization proofs',
   )
   assert.equal(
     result.annotationUnrelatedNodeCount,
@@ -3462,8 +3094,6 @@ try {
   )
   assert.equal(result.annotationSelected.tagName, 'div')
   assert.equal(result.annotationSelected.hasBoundedPath, true)
-  assert.equal(result.annotationSelected.omitsWholeDomDigest, true)
-  assert.equal(result.annotationSelected.hasElementProof, true)
   assert.ok(result.annotationSelected.rect.width > 0)
   assert.ok(result.annotationSelected.rect.height > 0)
   assert.equal(
@@ -3471,11 +3101,6 @@ try {
     0,
     'CDP inspect mode must consume the click before artifact handlers receive it',
   )
-  assert.equal(result.resolvedSelection.selectionId.length > 0, true)
-  assert.equal(result.resolvedSelection.tagName, 'div')
-  assert.equal(result.resolvedSelection.scopeId, 'synthetic:v3-bridge')
-  assert.equal(result.resolvedSelection.activePreviewArtifactId, 'art-synthetic-v3-bridge')
-  assert.equal(result.annotationWrongArtifactResolveRejected, true)
   assert.equal(result.annotationOverlayResult.ok, true)
   assert.deepEqual(result.annotationOverlaySecurity, {
     contextIsolation: true,
@@ -3504,7 +3129,8 @@ try {
   assert.ok(
     Number.parseFloat(annotationTextareaHeight) >= 73
       && Number.parseFloat(annotationTextareaHeight) < 74,
-    'annotation textarea height must remain within one fractional Windows DPI pixel',
+    `annotation textarea height must remain within one fractional Windows DPI pixel; `
+      + `actual=${annotationTextareaHeight}; layout=${JSON.stringify(result.annotationOverlayLayout)}`,
   )
   assert.equal(result.annotationOverlayDevToolsBlocked, true)
   assert.ok(result.annotationOverlayBounds.width <= 304)
@@ -3619,6 +3245,13 @@ try {
     body: 'Retain this body after a failed handoff.',
   })
   assert.equal(result.annotationAtomicFailureRetry.ok, true)
+  assert.deepEqual(result.annotationNormalizedSelections,
+    ['before', 'after', 'text', 'shadow-open', 'shadow-closed', 'element', 'svg'].map(kind => ({
+      kind, matchesHost: true, retainedHost: true, editorVisible: true,
+      tagName: kind === 'svg' ? 'foreignobject' : 'div',
+    })),
+    'generated content and component internals must open an editor anchored to their document element',
+  )
   assert.deepEqual(result.annotationRejectedSelectionRecovery, {
     blocked: true,
     rejected: true,
@@ -3644,10 +3277,9 @@ try {
     result.annotationLifecycleDiagnostics.some(entry => entry.phase === 'selection-emitted'),
     true,
   )
-  assert.deepEqual(result.annotationFocus, {
-    focused: true,
-    activePreviewArtifactId: 'art-synthetic-v3-bridge',
-  })
+  assert.equal(result.annotationWrongTargetRejected, true)
+  assert.match(result.annotationSvgLocator, /path/)
+  assert.equal(result.annotationFocus.ok, true)
   assert.notEqual(
     result.annotationScrollAfterFocus,
     result.annotationScrollBeforeFocus,
@@ -3659,42 +3291,12 @@ try {
     true,
     'navigation must synchronously fence a pending annotation highlight',
   )
-  assert.equal(result.annotationWrongScopeRejected, true)
-  assert.equal(result.annotationWrongArtifactFocusRejected, true)
-  assert.equal(result.annotationDomMismatchRejected, true)
-  assert.equal(result.annotationAncestorMismatchRejected, true)
-  assert.equal(
-    result.annotationAncestorClassAdditionAccepted,
-    true,
-    'adding an ancestor class must preserve the source proof while returning refreshed commitments',
-  )
-  assert.equal(result.annotationAncestorClassRemovalRejected, true)
-  assert.equal(result.annotationAncestorClassReplacementRejected, true)
-  assert.equal(result.annotationAncestorIdMismatchRejected, true)
-  assert.equal(result.annotationAncestorStyleMismatchRejected, true)
-  assert.equal(
-    result.annotationSelectedClassAdditionAccepted,
-    true,
-    'adding a selected-element class must preserve the source proof',
-  )
-  assert.equal(result.annotationSelectedClassRemovalRejected, true)
-  assert.equal(result.annotationSelectedClassReplacementRejected, true)
-  assert.equal(result.annotationPathMismatchRejected, true)
-  assert.equal(result.annotationTagMismatchRejected, true)
-  assert.deepEqual(result.annotationRefocus, {
-    focused: true,
-    activePreviewArtifactId: 'art-synthetic-v3-bridge',
-  })
+  assert.equal(result.annotationRefocus.ok, true)
   assert.equal(result.annotationFallbackShow.ok, false)
   assert.equal(result.annotationFallbackEvent.detail.reason, 'selection-stale')
   assert.equal(result.annotationPreviewHiddenForFallback, true)
   assert.equal(result.annotationFallbackClose.ok, true)
   assert.equal(result.annotationPreviewRestoredAfterFallback, true)
-  assert.equal(
-    result.annotationGoldenElementProof,
-    '26992606963b33b7d475a826bf0a48ae802e9ac7bfe43ed5cab3aa97b7f0c5c8',
-    'Electron and Gateway element-proof serialization must stay byte-identical',
-  )
   assert.equal(result.annotationPostconditionFailure.ok, false)
   assert.deepEqual(result.annotationRollbackCommands, [
     ['Overlay.setInspectMode', 'none', true],
@@ -3720,7 +3322,7 @@ try {
     ok: false,
     code: 'PREVIEW_CAPABILITY_EXPIRED',
     retryable: true,
-    message: 'Only the active protocol-v4 HTML artifact preview supports annotations.',
+    message: 'Open the browser page before annotating it.',
   })
   assert.equal(result.annotationPickerBeforeOff.ok, true)
   assert.equal(result.annotationPickerOff.ok, true)
@@ -3734,91 +3336,8 @@ try {
   assert.equal(result.v3Screenshot.mime, 'image/png')
   assert.ok(result.v3Screenshot.byteLength > 0, 'v3 screenshot must return bounded PNG bytes')
   assert.ok(result.v3Screenshot.width > 0 && result.v3Screenshot.height > 0)
-  assert.equal(result.v3Reload.reloaded, true, 'v3 reload must stay on the active surface')
+  assert.equal(result.v3Reload.targetRef, result.annotationSelected.targetRef, 'reload must stay on the exact page')
   assert.ok(result.v3NavigationEventCount > 0, 'v3 surfaces must preserve v2 navigation events')
-  assert.equal(result.v4BindingA.ok, true)
-  assert.equal(
-    result.sameSurfaceSecondBindingWasRejected,
-    true,
-    'one native surface must admit only one editing turn binding',
-  )
-  assert.deepEqual(result.bindingAInitial, {
-    scopeId: 'synthetic:v4-binding-a',
-    generation: 1,
-  })
-  assert.equal(result.detachedBindingA.ok, true)
-  assert.equal(result.detachedBindingA.code, 'AGENT_EDIT_IN_PROGRESS')
-  assert.equal(
-    result.bindingAStayedPinned,
-    true,
-    'UI detach must hide rather than destroy a turn-bound surface',
-  )
-  assert.equal(result.bindingAAfterSwitch.scopeId, 'synthetic:v4-binding-a')
-  assert.equal(result.bindingBAfterSwitch.scopeId, 'synthetic:v4-binding-b')
-  assert.equal(result.bindingSwitchStress.length, 20)
-  for (const [iteration, snapshot] of result.bindingSwitchStress.entries()) {
-    assert.equal(
-      snapshot.activeSurfaceId,
-      iteration % 2 === 0 ? 'artifact:v4-binding-a' : 'artifact:v4-binding-b',
-    )
-    assert.equal(snapshot.bindingAScopeId, 'synthetic:v4-binding-a')
-    assert.equal(snapshot.bindingAGeneration, result.bindingAInitial.generation)
-    assert.equal(snapshot.bindingBScopeId, 'synthetic:v4-binding-b')
-    assert.equal(snapshot.bindingBGeneration, result.bindingBAfterSwitch.generation)
-  }
-  assert.equal(
-    result.bindingAAfterSwitch.generation,
-    result.bindingAInitial.generation,
-    'switching the active UI surface must not mutate the old binding generation',
-  )
-  assert.equal(result.bindingACandidate.bound, true)
-  assert.equal(
-    result.candidateSnapshotBeforeCrash.candidateHandle,
-    'candidate_v4_binding_a_1234',
-  )
-  assert.equal(
-    result.actionResultUnknownCode,
-    'action-result-unknown',
-    'a lost browser action reply must require inspection rather than replay',
-  )
-  assert.equal(
-    result.candidateSnapshotAfterUnknownAction.candidateHandle,
-    'candidate_v4_binding_a_1234',
-    'the binding must accept a fresh inspection after an uncertain action',
-  )
-  assert.equal(result.candidateSnapshotAfterRecovery.scopeId, 'synthetic:v4-binding-a')
-  assert.equal(
-    result.candidateSnapshotAfterRecovery.candidateHandle,
-    'candidate_v4_binding_a_1234',
-  )
-  assert.ok(
-    result.candidateSnapshotAfterRecovery.generation
-      > result.candidateSnapshotBeforeCrash.generation,
-    'surface recovery must invalidate the old binding generation',
-  )
-  assert.equal(result.bindingAContentsReplaced, true)
-  assert.equal(result.candidateReboundAfterRecovery, true)
-  assert.equal(
-    result.secondBindingFailureCode,
-    'binding-terminal-unavailable',
-    'a second surface failure must terminate the binding without another rebuild',
-  )
-  assert.equal(
-    result.bindingADestroyedBeforePinRelease,
-    true,
-    'a UI-detached surface must be destroyed before its canonical preview pin is released',
-  )
-  assert.equal(result.bindingAReleasedEventCount, 1)
-  assert.equal(
-    result.bindingBSurfaceRetained,
-    true,
-    'releasing a still-UI-owned binding must leave its canonical surface available',
-  )
-  assert.deepEqual(
-    result.candidateReleaseHandles,
-    ['candidate_v4_binding_a_1234'],
-    'candidate cleanup must remain exactly once across recovery and terminal release',
-  )
   assert.equal(
     result.isolationState.storageWasCleared,
     true,

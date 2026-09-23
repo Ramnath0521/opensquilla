@@ -61,7 +61,6 @@ from opensquilla.scheduler.types import (
     DeliveryConfig,
     DeliveryMode,
     FailureDestination,
-    JobStatus,
     ReplyTargetSnapshot,
     ScheduleKind,
     SessionTarget,
@@ -771,21 +770,7 @@ async def _update_cron_job(
         patch["tz"] = tz_value if isinstance(tz_value, str) else ""
 
     if "enabled" in params:
-        # Resolve the enabled toggle but DO NOT early-return: fall through so
-        # sibling field updates in the same request (text/schedule/…) are
-        # applied too, and so a DISABLED/FAILED job (not just PAUSED) can be
-        # revived — those are exactly the states a user runs `--enabled` to fix.
-        job = await scheduler.get_job(job_id)
-        if params["enabled"]:
-            revivable = {
-                JobStatus.PAUSED.value,
-                JobStatus.DISABLED.value,
-                JobStatus.FAILED.value,
-            }
-            if job is not None and job.status.value in revivable:
-                await scheduler.resume_job(job_id)
-        else:
-            await scheduler.pause_job(job_id)
+        patch["enabled"] = bool(params["enabled"])
 
     current_job = await scheduler.get_job(job_id)
     if current_job is None:
@@ -1108,7 +1093,6 @@ async def _cron_unsubscribe_contract(
 for _cron_method, _cron_implementation in (
     ("cron.list", _cron_list_contract),
     ("cron.status", _cron_status_contract),
-    ("cron.add", _cron_create_contract),
     ("cron.create", _cron_create_contract),
     ("cron.update", _cron_update_contract),
     ("cron.remove", _cron_remove_contract),

@@ -10,6 +10,7 @@ It covers:
   agent runtime to invoke them and is documented here for transparency.
 - The local SquillaRouter V4 Phase 3 model bundle under
   `src/opensquilla/squilla_router/models/v4.2_phase3_inference/`.
+- Selected Python runtime dependencies distributed with the Gateway.
 - Web UI runtime dependencies, bundled fonts, and generated Control UI assets.
 - The Web UI "Arctic" theme color palette, adapted from the Nord palette under
   the MIT license; see the dedicated section below.
@@ -20,6 +21,106 @@ It covers:
 - The cron prompt-injection scanner was reviewed against Hermes Agent
   reference material; the MIT notice is reproduced below for conservative
   attribution.
+
+## Python runtime dependencies
+
+SQLAlchemy defines the Gateway's persisted model types, and websockets supports
+channel and Gateway connections. The following notices reproduce the license
+files shipped in the exact upstream wheels selected by `uv.lock`.
+
+### SQLAlchemy 2.0.53
+
+Source: [SQLAlchemy 2.0.53 on PyPI](https://pypi.org/project/SQLAlchemy/2.0.53/).
+The wheel includes `sqlalchemy-2.0.53.dist-info/licenses/LICENSE` and `AUTHORS`;
+the license refers to the authors list reproduced below.
+
+```text
+Copyright 2005-2026 SQLAlchemy authors and contributors <see AUTHORS file>.
+
+Permission is hereby granted, free of charge, to any person obtaining a copy of
+this software and associated documentation files (the "Software"), to deal in
+the Software without restriction, including without limitation the rights to
+use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies
+of the Software, and to permit persons to whom the Software is furnished to do
+so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+```
+
+```text
+SQLAlchemy was created by Michael Bayer.
+
+Major contributing authors include:
+
+- Mike Bayer
+- Jason Kirtland
+- Michael Trier
+- Diana Clarke
+- Gaetan de Menten
+- Lele Gaifax
+- Jonathan Ellis
+- Gord Thompson
+- Federico Caselli
+- Philip Jenvey
+- Rick Morrison
+- Chris Withers
+- Ants Aasma
+- Sheila Allen
+- Paul Johnston
+- Tony Locke
+- Hajime Nakagami
+- Vraj Mohan
+- Robert Leftwich
+- Taavi Burns
+- Jonathan Vanasco
+- Jeff Widman
+- Scott Dugas
+- Dobes Vandermeer
+- Ville Skytta
+- Rodrigo Menezes
+```
+
+### websockets 17.1
+
+Source: [websockets 17.1 on PyPI](https://pypi.org/project/websockets/17.1/).
+The following BSD-3-Clause text comes from the wheel's
+`websockets-17.1.dist-info/licenses/LICENSE`.
+
+```text
+Copyright (c) Aymeric Augustin and contributors
+
+Redistribution and use in source and binary forms, with or without
+modification, are permitted provided that the following conditions are met:
+
+    * Redistributions of source code must retain the above copyright notice,
+      this list of conditions and the following disclaimer.
+    * Redistributions in binary form must reproduce the above copyright notice,
+      this list of conditions and the following disclaimer in the documentation
+      and/or other materials provided with the distribution.
+    * Neither the name of the copyright holder nor the names of its contributors
+      may be used to endorse or promote products derived from this software
+      without specific prior written permission.
+
+THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND
+ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED
+WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE
+FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
+DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR
+SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER
+CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY,
+OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
+OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+```
 
 ## Web UI dependencies and bundled fonts
 
@@ -34,6 +135,8 @@ resolved versions are recorded by `opensquilla-webui/package.json` and
 |---|---|---|
 | Vue.js (`vue`, `@vue/reactivity`, `@vue/runtime-core`, `@vue/runtime-dom`, `@vue/shared`) | Vue runtime in generated JavaScript under `src/opensquilla/gateway/static/dist/assets/` | MIT. Copyright (c) 2018-present, Yuxi (Evan) You. |
 | Pinia (`pinia`) | State-management runtime in generated JavaScript under `src/opensquilla/gateway/static/dist/assets/` | MIT. Copyright (c) 2019-present Eduardo San Martin Morote. |
+| TanStack Virtual (`@tanstack/vue-virtual`, `@tanstack/virtual-core`; [TanStack/virtual](https://github.com/TanStack/virtual)) | List virtualization and measurement runtime in generated Web UI JavaScript | MIT. Copyright (c) 2021-present Tanner Linsley. |
+| Vue Devtools API (`@vue/devtools-api`; [vuejs/devtools](https://github.com/vuejs/devtools)) | Explicit Pinia devtools peer; integration code where retained in generated JavaScript under `src/opensquilla/gateway/static/dist/assets/` | MIT. Copyright (c) 2023 webfansplz. |
 | Vue Router (`vue-router`) | Client-side routing runtime in generated JavaScript under `src/opensquilla/gateway/static/dist/assets/` | MIT. Copyright (c) 2019-present Eduardo San Martin Morote. |
 | Vue I18n (`vue-i18n`, `@intlify/core-base`, `@intlify/message-compiler`, `@intlify/shared`) | Localization runtime in generated JavaScript under `src/opensquilla/gateway/static/dist/assets/` | MIT. Copyright (c) 2020 kazuya kawaguchi. |
 | html-to-image (`html-to-image`) | Image-export runtime in generated JavaScript under `src/opensquilla/gateway/static/dist/assets/` | MIT. Copyright (c) 2017-2025 W.Y. |
@@ -41,8 +144,6 @@ resolved versions are recorded by `opensquilla-webui/package.json` and
 | marked (`marked`) | npm dependency used by `opensquilla-webui/src/composables/chat/useChatTextRendering.ts`; generated JavaScript under `src/opensquilla/gateway/static/dist/assets/` | MIT. Copyright (c) 2018+, MarkedJS and Copyright (c) 2011-2018, Christopher Jeffrey. The bundled Markdown-derived portion carries the John Gruber notice reproduced below. |
 | DOMPurify (`dompurify`) | npm dependency used by `opensquilla-webui/src/composables/chat/useChatTextRendering.ts`; generated JavaScript under `src/opensquilla/gateway/static/dist/assets/` | MPL-2.0 OR Apache-2.0. OpenSquilla distributes this component under the Apache-2.0 option. Copyright belongs to Cure53 and other contributors. |
 | highlight.js (`highlight.js`) | npm dependency used by `opensquilla-webui/src/composables/chat/useChatTextRendering.ts`; generated JavaScript under `src/opensquilla/gateway/static/dist/assets/` | BSD-3-Clause. Copyright (c) 2006, Ivan Sagalaev. |
-| Monaco Editor (`monaco-editor`) | HTML Artifact Studio source editor and language workers in generated JavaScript under `src/opensquilla/gateway/static/dist/assets/` | MIT. Copyright (c) 2016-present Microsoft Corporation. |
-| parse5 (`parse5`) | Canonical HTML source-location parser in generated JavaScript under `src/opensquilla/gateway/static/dist/assets/` | MIT. Copyright (c) 2013-2019 Ivan Nikulin. |
 | IBM Plex Sans and IBM Plex Mono | `opensquilla-webui/src/assets/fonts/ibm-plex-*.woff2` and generated Web UI font assets | SIL Open Font License 1.1. Copyright 2017 IBM Corp. with Reserved Font Name "Plex". |
 | Space Grotesk | `opensquilla-webui/src/assets/fonts/space-grotesk-*.woff2` and generated Web UI font assets | SIL Open Font License 1.1. Copyright 2020 The Space Grotesk Project Authors. |
 | Fraunces | `opensquilla-webui/src/themes/out-of-register/fonts/fraunces-*.woff2` and generated Web UI font assets | SIL Open Font License 1.1. Copyright 2020 The Fraunces Project Authors (https://github.com/undercasetype/Fraunces). |
@@ -51,6 +152,32 @@ resolved versions are recorded by `opensquilla-webui/package.json` and
 The Web UI lockfile is the version authority for these dependencies. The build
 pipeline regenerates the browser bundle from that lockfile; no separate
 hand-maintained copies of these libraries are shipped by the gateway.
+
+### TanStack Virtual MIT license
+
+```text
+MIT License
+
+Copyright (c) 2021-present Tanner Linsley
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+```
 
 ### marked Markdown notice
 
@@ -329,13 +456,8 @@ in a package-local provenance file.
 
 - Component: SKILL.md frontmatter and instruction text for these bundled skills:
   - `sub-agent`
-- `cron`
   - `github`
-  - `nano-pdf`
   - `skill-creator`
-  - `summarize`
-  - `tmux`
-  - `weather`
 - Upstream project: https://github.com/openclaw/openclaw
 - License: MIT
 - Copyright notice: Copyright (c) 2025 Peter Steinberger
@@ -378,72 +500,41 @@ SOFTWARE.
 These bundled skill descriptors are authored and maintained by OpenSquilla and
 are released under OpenSquilla's repository license (Apache-2.0; see `LICENSE`):
 
-- `cron`
 - `code-task`
 - `AwesomeWebpageMetaSkill`
 - `awesome-webpage-image-download`
 - `awesome-webpage-research`
 - `deep-research`
 - `docx`
-- `git-diff`
 - `github`
 - `history-explorer`
-- `html-to-pdf`
-- `http-fetch`
-- `latex-compile`
-- `memory`
 - `meta-kid-project-planner`
 - `meta-paper-write`
 - `meta-short-drama`
 - `meta-skill-creator`
 - `multi-search-engine`
-- `nano-pdf`
 - `openrouter-video-generator`
-- `paper-abstract-author`
 - `paper-artifact-runtime`
 - `paper-citation-integrity-gate`
-- `paper-citation-planner`
 - `paper-delivery-summary`
-- `paper-experiment-stub`
 - `paper-latex-sanitizer`
 - `paper-length-gate`
-- `paper-outline-author`
-- `paper-plot-stub`
-- `paper-preference-planner`
 - `paper-quality-gate`
 - `paper-refbib-stub`
-- `paper-revision-author`
 - `paper-section-author`
 - `paper-source-readiness-gate`
-- `paper-source-curator`
 - `pdf-toolkit`
 - `pptx`
 - `skill-creator`
-- `skill-creator-linter`
-- `skill-creator-proposals`
-- `skill-creator-smoke-test`
 - `short-drama-delivery-audit`
 - `short-drama-review-normalizer`
-- `stack-trace-generic-probe`
-- `stack-trace-go-probe`
-- `stack-trace-js-probe`
-- `stack-trace-python-probe`
-- `stack-trace-rust-probe`
 - `sub-agent`
 - `srt-from-script`
 - `subtitle-burner`
-- `summarize`
 - `text-file-read`
 - `title-card-image`
-- `tmux`
 - `video-still-animator`
-- `weather`
 - `xlsx`
-- `advanced-dubbing-studio`
-- `music-and-singing-studio`
-- `voice-clone-lab`
-- `voice-conversion-studio`
-- `voiceover-studio`
 
 ## tokenjuice adapted reduction rules
 
@@ -527,7 +618,6 @@ SOFTWARE.
   - `deep-research`
   - `docx`
   - `html-coder`
-  - `html-to-pdf`
   - `multi-search-engine`
   - `nano-banana-pro`
   - `nano-banana-pro-openrouter`

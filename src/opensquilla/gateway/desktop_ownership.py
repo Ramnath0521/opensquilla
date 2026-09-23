@@ -29,6 +29,7 @@ from pathlib import Path
 from typing import Any, Final, cast
 
 from opensquilla import __version__
+from opensquilla.recovery.atomic import _native_io_path
 from opensquilla.recovery.locking import profile_lock_key
 
 DESKTOP_GATEWAY_OWNERSHIP_FILENAME: Final = "desktop-gateway.json"
@@ -43,6 +44,7 @@ DESKTOP_GATEWAY_OWNERSHIP_SCHEMA_VERSION: Final = 1
 DESKTOP_GATEWAY_INSTANCE_NONCE_ENV: Final = (
     "OPENSQUILLA_DESKTOP_GATEWAY_INSTANCE_NONCE"
 )
+DESKTOP_GATEWAY_INSTANCE_ID_ENV: Final = "OPENSQUILLA_DESKTOP_GATEWAY_INSTANCE_ID"
 DESKTOP_GATEWAY_AUTH_CONTEXT: Final = b"opensquilla-desktop-gateway-auth-v1"
 
 _ENABLED_VALUES = frozenset({"1", "true", "yes", "on"})
@@ -229,7 +231,7 @@ def _fsync_directory(path: Path) -> None:
     if hasattr(os, "O_DIRECTORY"):
         flags |= os.O_DIRECTORY
     try:
-        descriptor = os.open(path, flags)
+        descriptor = os.open(_native_io_path(path), flags)
     except OSError:
         return
     try:
@@ -241,7 +243,7 @@ def _fsync_directory(path: Path) -> None:
 
 
 def _atomic_write_private_json(path: Path, payload: dict[str, Any]) -> None:
-    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    os.makedirs(_native_io_path(path.parent), mode=0o700, exist_ok=True)
     temporary = path.parent / (
         f".{path.name}.{os.getpid()}.{secrets.token_hex(8)}.tmp"
     )
@@ -250,7 +252,7 @@ def _atomic_write_private_json(path: Path, payload: dict[str, Any]) -> None:
         flags |= os.O_NOFOLLOW
     descriptor: int | None = None
     try:
-        descriptor = os.open(temporary, flags, 0o600)
+        descriptor = os.open(_native_io_path(temporary), flags, 0o600)
         fchmod = getattr(os, "fchmod", None)
         if fchmod is not None:
             try:
@@ -262,9 +264,9 @@ def _atomic_write_private_json(path: Path, payload: dict[str, Any]) -> None:
             json.dump(payload, stream, sort_keys=True, separators=(",", ":"))
             stream.flush()
             os.fsync(stream.fileno())
-        os.replace(temporary, path)
+        os.replace(_native_io_path(temporary), _native_io_path(path))
         try:
-            path.chmod(0o600)
+            os.chmod(_native_io_path(path), 0o600)
         except OSError:
             pass
         _fsync_directory(path.parent)
@@ -272,14 +274,14 @@ def _atomic_write_private_json(path: Path, payload: dict[str, Any]) -> None:
         if descriptor is not None:
             os.close(descriptor)
         try:
-            temporary.unlink(missing_ok=True)
+            os.unlink(_native_io_path(temporary))
         except OSError:
             pass
 
 
 def _read_record(path: Path) -> dict[str, Any] | None:
     try:
-        with path.open("rb") as stream:
+        with open(_native_io_path(path), "rb") as stream:
             raw = stream.read(_MAX_RECORD_BYTES + 1)
         if len(raw) > _MAX_RECORD_BYTES:
             return None
@@ -328,11 +330,11 @@ def _unlock_record(fd: int) -> None:
 def _ownership_record_lock(state_dir: Path) -> Iterator[None]:
     """Serialize record replacement/removal on one permanent lock inode."""
 
-    state_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+    os.makedirs(_native_io_path(state_dir), mode=0o700, exist_ok=True)
     lock_path = state_dir / DESKTOP_GATEWAY_OWNERSHIP_LOCK_FILENAME
     flags = os.O_RDWR | os.O_CREAT | getattr(os, "O_CLOEXEC", 0)
     flags |= getattr(os, "O_NOFOLLOW", 0)
-    fd = os.open(lock_path, flags, 0o600)
+    fd = os.open(_native_io_path(lock_path), flags, 0o600)
     acquired = False
     try:
         value = os.fstat(fd)
@@ -343,7 +345,7 @@ def _ownership_record_lock(state_dir: Path) -> Iterator[None]:
             os.write(fd, b"\0")
             os.fsync(fd)
         with contextlib.suppress(OSError):
-            os.chmod(lock_path, 0o600)
+            os.chmod(_native_io_path(lock_path), 0o600)
 
         deadline = time.monotonic() + _RECORD_LOCK_TIMEOUT_SECONDS
         while not _try_lock_record(fd):
@@ -371,6 +373,7 @@ class DesktopGatewayOwnership:
     pid: int = field(default_factory=os.getpid)
     start_identity: str = field(default_factory=process_start_identity)
     version: str = __version__
+    instance_id: str = ""
     _active: bool = field(default=False, init=False, repr=False)
     _written_record: dict[str, Any] | None = field(
         default=None, init=False, repr=False
@@ -418,11 +421,13 @@ class DesktopGatewayOwnership:
             profile_fingerprint=profile_fingerprint,
             port=int(port),
             instance_nonce=nonce,
+            instance_id=os.environ.get(DESKTOP_GATEWAY_INSTANCE_ID_ENV, "").strip(),
         )
         # The nonce is process-control authority, not provider/runtime config.
         # Remove both handoff values before service/channel subprocesses inherit
         # the Gateway environment; the active owner object retains what it needs.
         os.environ.pop(DESKTOP_GATEWAY_INSTANCE_NONCE_ENV, None)
+        os.environ.pop(DESKTOP_GATEWAY_INSTANCE_ID_ENV, None)
         os.environ.pop(DESKTOP_GATEWAY_OWNERSHIP_DIR_ENV, None)
         return owner
 
@@ -470,7 +475,7 @@ class DesktopGatewayOwnership:
             if _read_record(self.path) != expected:
                 return
             try:
-                self.path.unlink(missing_ok=True)
+                os.unlink(_native_io_path(self.path))
             except OSError:
                 return
             _fsync_directory(self.path.parent)

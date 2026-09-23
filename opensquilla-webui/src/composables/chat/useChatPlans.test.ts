@@ -64,10 +64,11 @@ function harness({ draft = false }: { draft?: boolean } = {}) {
     setMode: (sessionKey: string, mode: string, expectedRevision: number) => rpc.call('plans.setMode', { sessionKey, mode, expectedRevision }),
     revise: (sessionKey: string, request: { revisionId: string; prompt: string }, clientRequestId: string) => rpc.call('plans.revise', { sessionKey, planRevisionId: request.revisionId, prompt: request.prompt, clientRequestId }),
     implement: (sessionKey: string, target: { revisionId: string }, clientRequestId: string, options?: { intent?: string }) => rpc.call('plans.implement', { sessionKey, planRevisionId: target.revisionId, clientRequestId, ...(options?.intent ? { intent: options.intent } : {}) }),
+    setPresentation: (input: import('@/modules/planCenter').PlanPresentationInput) => rpc.call('plans.setPresentation', input),
     cancelRun: (sessionKey: string, runId: string, expectedStateRevision?: number) => rpc.call('plans.cancelRun', { sessionKey, runId, ...(expectedStateRevision !== undefined ? { expectedStateRevision } : {}) }),
     subscribe: (listener: (event: any) => void) => {
-      const unsubs = ['session.event.collaboration_mode', 'session.event.plan_revision', 'session.event.plan_run'].map(name => {
-        const handler = (...args: unknown[]) => listener({ kind: name.endsWith('run') ? 'run' : name.endsWith('revision') ? 'revision' : 'collaboration', sessionKey: (args[0] as Record<string, unknown>)?.session_key, collaboration: (args[0] as Record<string, unknown>)?.collaboration, plan: (args[0] as Record<string, unknown>)?.plan_revision, run: (args[0] as Record<string, unknown>)?.plan_run })
+      const unsubs = ['session.event.collaboration_mode', 'session.event.plan_revision', 'session.event.plan_run', 'session.event.plan_presentation'].map(name => {
+        const handler = (...args: unknown[]) => listener({ kind: name.endsWith('presentation') ? 'presentation' : name.endsWith('run') ? 'run' : name.endsWith('revision') ? 'revision' : 'collaboration', sessionKey: (args[0] as Record<string, unknown>)?.session_key, epoch: (args[0] as Record<string, unknown>)?.epoch, planPresentations: (args[0] as Record<string, unknown>)?.planPresentations, collaboration: (args[0] as Record<string, unknown>)?.collaboration, plan: (args[0] as Record<string, unknown>)?.plan_revision, run: (args[0] as Record<string, unknown>)?.plan_run })
         return rpc.on(name, handler)
       })
       return { close: () => unsubs.forEach(unsub => unsub()) }
@@ -109,6 +110,201 @@ function harness({ draft = false }: { draft?: boolean } = {}) {
 }
 
 describe('useChatPlans', () => {
+  it('hides and restores a historical plan without changing mode or stopping execution', async () => {
+    const { api, rpc, isStreaming } = harness()
+    api.applyBootstrap({ key: SESSION_ONE, epoch: 4, collaboration: { mode: 'plan', revision: 2 }, currentPlan: revision(), activePlanRun: run() })
+    isStreaming.value = true
+    const target = { planId: 'plan-1', revisionId: 'historical-revision' }
+    rpc.call.mockResolvedValueOnce({ planPresentations: [{ ...target, dismissed: true, stateRevision: 1 }] })
+    expect(await api.setPresentation({ ...target, dismissed: true })).toBe(true)
+    expect(rpc.call).toHaveBeenLastCalledWith('plans.setPresentation', {
+      sessionKey: SESSION_ONE, revisionId: target.revisionId, dismissed: true,
+      expectedEpoch: 4, expectedPresentationRevision: 0, clientRequestId: expect.any(String),
+    })
+    expect(api.currentPlan.value?.revisionId).toBe('revision-2')
+    expect(api.collaboration.value.mode).toBe('plan')
+    expect(api.activePlanRun.value?.status).toBe('running')
+    rpc.call.mockResolvedValueOnce({ planPresentations: [{ ...target, dismissed: false, stateRevision: 2 }] })
+    await api.setPresentation({ ...target, dismissed: false })
+    expect(rpc.call).toHaveBeenLastCalledWith('plans.setPresentation', expect.objectContaining({ expectedPresentationRevision: 1, dismissed: false }))
+    expect(api.planPresentations.value[target.revisionId]?.dismissed).toBe(false)
+    expect(rpc.call.mock.calls.map(call => call[0])).toEqual(['plans.setPresentation', 'plans.setPresentation'])
+  })
+
+  it('merges durable presentation independently and rejects stale session, epoch, and revision events', () => {
+    const { api, handlers, currentEpoch, sessionKey } = harness()
+    api.subscribe()
+    api.applyBootstrap({ key: SESSION_ONE, epoch: 2, collaboration: { mode: 'default', revision: 5 }, planPresentations: [{ revisionId: 'r1', dismissed: true, stateRevision: 3 }] })
+    // A snapshot's collaboration order cannot roll presentation back or erase historical entries.
+    api.applyBootstrap({ key: SESSION_ONE, epoch: 2, collaboration: { mode: 'plan', revision: 2 }, planPresentations: [{ revisionId: 'r1', dismissed: false, stateRevision: 2 }, { revisionId: 'r2', dismissed: true, stateRevision: 1 }] })
+    const event = handlers.get('session.event.plan_presentation')!
+    event({ session_key: SESSION_TWO, epoch: 2, planPresentations: [{ revisionId: 'r1', dismissed: false, stateRevision: 8 }] })
+    event({ session_key: SESSION_ONE, epoch: 1, planPresentations: [{ revisionId: 'r1', dismissed: false, stateRevision: 8 }] })
+    expect(api.planPresentations.value.r1).toMatchObject({ dismissed: true, stateRevision: 3 })
+    expect(api.planPresentations.value.r2?.dismissed).toBe(true)
+    event({ session_key: SESSION_ONE, epoch: 2, planPresentations: [{ revisionId: 'r1', dismissed: false, stateRevision: 4 }] })
+    expect(api.planPresentations.value.r1?.dismissed).toBe(false)
+    currentEpoch.value = 3
+    expect(api.planPresentations.value).toEqual({})
+    event({ session_key: SESSION_ONE, epoch: 3, planPresentations: [{ revisionId: 'r1', dismissed: true, stateRevision: 1 }] })
+    sessionKey.value = SESSION_TWO
+    expect(api.planPresentations.value).toEqual({})
+  })
+
+  it('ignores a delayed presentation response after the session changes', async () => {
+    const { api, rpc, sessionKey, notifyError } = harness()
+    const pending = deferred()
+    rpc.call.mockReturnValueOnce(pending.promise)
+    const operation = api.setPresentation({ planId: 'p1', revisionId: 'r1', dismissed: true })
+    sessionKey.value = SESSION_TWO
+    pending.resolve({ planPresentations: [{ revisionId: 'r1', dismissed: true, stateRevision: 1 }] })
+    expect(await operation).toBe(false)
+    expect(api.planPresentations.value).toEqual({})
+    expect(api.presentationPending.value).toBeNull()
+    expect(notifyError).not.toHaveBeenCalled()
+  })
+
+  it.each([false, true])('reuses an uncertain implementation request and destination (new session: %s)', async inNewSession => {
+    const { api, rpc } = harness()
+    const target = { planId: 'retry-plan', revisionId: `retry-revision-${inNewSession}` }
+    rpc.call.mockRejectedValueOnce(new Error('Connection closed before response'))
+    await api.implement(target, inNewSession)
+    const first = rpc.call.mock.calls[0]![1]
+    rpc.call.mockResolvedValueOnce({ accepted: true, replayed: true, sessionKey: first.sessionKey })
+    await api.implement(target, inNewSession)
+    expect(rpc.call.mock.calls[1]![1]).toEqual(first)
+    rpc.call.mockResolvedValueOnce({ accepted: true })
+    await api.implement(target, inNewSession)
+    expect(rpc.call.mock.calls[2]![1].clientRequestId).not.toBe(first.clientRequestId)
+  })
+
+  it.each(['queued', 'running'])('pauses only the visible %s run when its owning task settles', status => {
+    const { api } = harness()
+    api.applyBootstrap({ key: SESSION_ONE, currentPlan: revision(), activePlanRun: run(status, {
+      activeTaskId: 'task-owner',
+      steps: [
+        { stepId: 'inspect', title: 'Inspect', status: 'completed' },
+        { stepId: 'implement', title: 'Implement', status: 'in_progress' },
+      ],
+      currentStepId: 'implement',
+    }) })
+    const authoritative = api.activePlanRun.value!
+    api.noteTaskSettled('task-owner')
+    const visible = api.activePlanRun.value!
+    expect(visible).toEqual({ ...authoritative, status: 'paused', activeTaskId: undefined })
+    expect(authoritative.status).toBe(status)
+    expect(authoritative.activeTaskId).toBe('task-owner')
+    expect(visible.steps).toBe(authoritative.steps)
+    expect(visible.currentStepId).toBe('implement')
+    expect(visible.finishedAt).toBe(authoritative.finishedAt)
+    api.noteTaskSettled('task-owner')
+    expect(api.activePlanRun.value).toBe(visible)
+  })
+
+  it('does not pause a run for an unrelated or missing task identity', () => {
+    const { api } = harness()
+    api.applyBootstrap({ key: SESSION_ONE, currentPlan: revision(), activePlanRun: run('running', {
+      activeTaskId: 'task-owner',
+    }) })
+    const authoritative = api.activePlanRun.value
+    api.noteTaskSettled('task-other')
+    api.noteTaskSettled('')
+    expect(api.activePlanRun.value).toBe(authoritative)
+    expect(api.activePlanRun.value?.status).toBe('running')
+  })
+
+  it('keeps late old-owner running updates paused and accepts a same-run new owner', () => {
+    const { api, handlers } = harness()
+    api.subscribe()
+    api.applyBootstrap({ key: SESSION_ONE, currentPlan: revision(), activePlanRun: run('running', {
+      activeTaskId: 'task-old',
+    }) })
+    api.noteTaskSettled('task-old')
+    handlers.get('session.event.plan_run')?.({ session_key: SESSION_ONE, plan_run: run('running', {
+      activeTaskId: 'task-old', stateRevision: 4, updatedAt: 304,
+    }) })
+    expect(api.activePlanRun.value).toMatchObject({ status: 'paused', stateRevision: 4, activeTaskId: undefined })
+    handlers.get('session.event.plan_run')?.({ session_key: SESSION_ONE, plan_run: run('paused', {
+      activeTaskId: null, stateRevision: 5, updatedAt: 305, terminalReason: 'task_cancelled',
+    }) })
+    expect(api.activePlanRun.value).toMatchObject({ status: 'paused', stateRevision: 5, terminalReason: 'task_cancelled' })
+    handlers.get('session.event.plan_run')?.({ session_key: SESSION_ONE, plan_run: run('running', {
+      activeTaskId: 'task-new', stateRevision: 6, updatedAt: 306,
+    }) })
+    expect(api.activePlanRun.value).toMatchObject({ status: 'running', stateRevision: 6, activeTaskId: 'task-new' })
+    // A delayed pre-resume snapshot must not transfer ownership back to A.
+    handlers.get('session.event.plan_run')?.({ session_key: SESSION_ONE, plan_run: run('running', {
+      activeTaskId: 'task-old', stateRevision: 4, updatedAt: 304,
+    }) })
+    expect(api.activePlanRun.value?.activeTaskId).toBe('task-new')
+  })
+
+  it.each(['cancelled', 'completed', 'superseded'])('preserves an authoritative %s run after temporary pause', status => {
+    const { api, handlers } = harness()
+    api.subscribe()
+    api.applyBootstrap({ key: SESSION_ONE, currentPlan: revision(), activePlanRun: run('running', {
+      activeTaskId: 'task-owner',
+    }) })
+    api.noteTaskSettled('task-owner')
+    handlers.get('session.event.plan_run')?.({ session_key: SESSION_ONE, plan_run: run(status, {
+      activeTaskId: 'task-owner', stateRevision: 4, updatedAt: 304, finishedAt: 304,
+    }) })
+    expect(api.activePlanRun.value).toMatchObject({ status, finishedAt: 304 })
+    handlers.get('session.event.plan_run')?.({ session_key: SESSION_ONE, plan_run: run('running', {
+      activeTaskId: 'task-owner', stateRevision: 5, updatedAt: 305,
+    }) })
+    expect(api.activePlanRun.value?.status).toBe(status)
+  })
+
+  it.each(['paused', 'blocked'])('does not rewrite an authoritative %s state or its progress', status => {
+    const { api } = harness()
+    api.applyBootstrap({ key: SESSION_ONE, currentPlan: revision(), activePlanRun: run(status, {
+      activeTaskId: 'task-owner', terminalReason: 'needs_input',
+    }) })
+    const authoritative = api.activePlanRun.value
+    api.noteTaskSettled('task-owner')
+    expect(api.activePlanRun.value).toBe(authoritative)
+  })
+
+  it('remembers a task terminal received before its run bootstrap', () => {
+    const { api } = harness()
+    api.noteTaskSettled('task-owner')
+    api.applyBootstrap({ key: SESSION_ONE, epoch: 0, currentPlan: revision(), activePlanRun: run('running', {
+      activeTaskId: 'task-owner',
+    }) })
+    expect(api.activePlanRun.value).toMatchObject({ status: 'paused', activeTaskId: undefined })
+  })
+
+  it('keeps a new-epoch task terminal through bootstrap and rejects an older-epoch terminal', () => {
+    const { api, currentEpoch } = harness()
+    api.noteTaskSettled('task-owner', 4)
+    expect(currentEpoch.value).toBe(4)
+    api.applyBootstrap({ key: SESSION_ONE, epoch: 4, currentPlan: revision(), activePlanRun: run('running', {
+      activeTaskId: 'task-owner',
+    }) })
+    expect(api.activePlanRun.value?.status).toBe('paused')
+    api.applyBootstrap({ key: SESSION_ONE, epoch: 4, activePlanRun: run('running', {
+      activeTaskId: 'task-new', stateRevision: 5, updatedAt: 305,
+    }) })
+    api.noteTaskSettled('task-new', 3)
+    expect(api.activePlanRun.value).toMatchObject({ status: 'running', activeTaskId: 'task-new' })
+  })
+
+  it.each(['reset', 'epoch', 'session'])('clears settled task presentation on %s without contaminating the new context', kind => {
+    const { api, currentEpoch, sessionKey } = harness()
+    api.applyBootstrap({ key: SESSION_ONE, epoch: 0, currentPlan: revision(), activePlanRun: run('running', {
+      activeTaskId: 'task-owner',
+    }) })
+    api.noteTaskSettled('task-owner')
+    if (kind === 'reset') api.reset()
+    else if (kind === 'epoch') currentEpoch.value = 1
+    else sessionKey.value = SESSION_TWO
+    api.applyBootstrap({ key: sessionKey.value, epoch: currentEpoch.value, currentPlan: revision(), activePlanRun: run('running', {
+      activeTaskId: 'task-owner',
+    }) })
+    expect(api.activePlanRun.value).toMatchObject({ status: 'running', activeTaskId: 'task-owner' })
+  })
+
   it('hydrates collaboration, current revision, and active run from bootstrap', () => {
     const { api } = harness()
 
@@ -259,6 +455,67 @@ describe('useChatPlans', () => {
       status: 'completed',
       stateRevision: 6,
       terminalReason: 'all_steps_completed',
+    })
+  })
+
+  it('keeps a terminal watermark across an empty bootstrap snapshot', () => {
+    const { api, handlers } = harness()
+    api.applyBootstrap({
+      key: SESSION_ONE,
+      currentPlan: revision(),
+    })
+    api.subscribe()
+
+    handlers.get('session.event.plan_run')?.({
+      session_key: SESSION_ONE,
+      plan_run: run('completed', {
+        stateRevision: 6,
+        updatedAt: 306,
+        terminalReason: 'all_steps_completed',
+      }),
+    })
+    api.applyBootstrap({
+      key: SESSION_ONE,
+      currentPlan: revision(),
+      activePlanRun: null,
+    })
+    handlers.get('session.event.plan_run')?.({
+      session_key: SESSION_ONE,
+      plan_run: run('running', { stateRevision: 7, updatedAt: 307 }),
+    })
+
+    expect(api.activePlanRun.value).toMatchObject({
+      status: 'completed',
+      stateRevision: 6,
+      terminalReason: 'all_steps_completed',
+    })
+  })
+
+  it('treats an explicit empty active-run snapshot as a replay fence', () => {
+    const { api, handlers } = harness()
+    api.applyBootstrap({
+      key: SESSION_ONE,
+      currentPlan: revision(),
+      activePlanRun: null,
+    })
+    api.subscribe()
+
+    handlers.get('session.event.plan_run')?.({
+      session_key: SESSION_ONE,
+      plan_run: run('running', { stateRevision: 7 }),
+    })
+    expect(api.activePlanRun.value).toBeNull()
+
+    // A later mutation/bootstrap with a real run reopens the lane for the
+    // current execution; only historical events are fenced.
+    api.applyBootstrap({
+      key: SESSION_ONE,
+      currentPlan: revision(),
+      activePlanRun: run('running', { stateRevision: 8 }),
+    })
+    expect(api.activePlanRun.value).toMatchObject({
+      status: 'running',
+      stateRevision: 8,
     })
   })
 
@@ -623,6 +880,33 @@ describe('useChatPlans', () => {
     expect(api.pendingAction.value).toBe('revise')
     newRequest.resolve({ collaboration: { mode: 'plan', revision: 1 } })
     await newMutation
+    expect(api.pendingAction.value).toBeNull()
+  })
+
+  it('adopts a cancellation conflict snapshot so the next explicit retry uses its current revision', async () => {
+    const { api, rpc } = harness()
+    api.applyBootstrap({ key: SESSION_ONE, currentPlan: revision(), activePlanRun: run() })
+    rpc.call.mockRejectedValueOnce(Object.assign(new Error('Plan run changed'), {
+      details: { planRun: run('running', { stateRevision: 4 }) },
+    }))
+    await api.cancelRun()
+    expect(api.activePlanRun.value?.stateRevision).toBe(4)
+    expect(api.activePlanRun.value?.status).toBe('running')
+    expect(rpc.call).toHaveBeenCalledTimes(1)
+    rpc.call.mockResolvedValueOnce({ planRun: run('cancelled', { stateRevision: 5 }) })
+    await api.cancelRun()
+    expect(rpc.call.mock.calls[1]![1].expectedStateRevision).toBe(4)
+    expect(api.activePlanRun.value?.status).toBe('cancelled')
+  })
+
+  it('does not claim cancellation before terminal acknowledgement or adopt another run from an error', async () => {
+    const { api, rpc } = harness()
+    api.applyBootstrap({ key: SESSION_ONE, currentPlan: revision(), activePlanRun: run() })
+    rpc.call.mockRejectedValueOnce(Object.assign(new Error('The implementation is still stopping'), {
+      code: 'PLAN_RUN_CANCEL_PENDING', details: { planRun: run('cancelled', { runId: 'other-run', stateRevision: 20 }) },
+    }))
+    await api.cancelRun()
+    expect(api.activePlanRun.value).toMatchObject({ runId: 'run-1', status: 'running', stateRevision: 3 })
     expect(api.pendingAction.value).toBeNull()
   })
 

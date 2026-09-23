@@ -63,7 +63,7 @@ def test_fresh_tokenrhythm_ensemble_activation_materializes_recommended_plan() -
     assert "llm_ensemble.candidates" not in changed.force_persist_paths()
 
 
-def test_fresh_openrouter_ensemble_activation_materializes_custom_lineup() -> None:
+def test_fresh_openrouter_ensemble_activation_uses_recommended_static_plan() -> None:
     cfg = GatewayConfig(
         llm={
             "provider": "openrouter",
@@ -73,13 +73,10 @@ def test_fresh_openrouter_ensemble_activation_materializes_custom_lineup() -> No
 
     changed = upsert_llm_ensemble(cfg, enabled=True).config
 
-    assert changed.llm_ensemble.selection_mode == "custom_b5"
-    assert len(changed.llm_ensemble.candidates) == 5
-    assert {
-        candidate.provider for candidate in changed.llm_ensemble.candidates
-    } == {"openrouter"}
-    assert changed.llm_ensemble.candidates[-1].model == "z-ai/glm-5.2"
-    assert changed.llm_ensemble.candidates[-1].role == "aggregator"
+    assert changed.llm_ensemble.selection_mode == "static_openrouter_b5"
+    assert changed.llm_ensemble.candidates == []
+    assert "llm_ensemble.selection_mode" in changed.force_persist_paths()
+    assert "llm_ensemble.candidates" not in changed.force_persist_paths()
 
 
 def test_explicit_cross_provider_ensemble_selection_is_preserved() -> None:
@@ -168,6 +165,66 @@ def test_other_provider_activation_with_one_candidate_fails_atomically() -> None
 
     with pytest.raises(ValueError, match="at least two distinct runtime-supported"):
         upsert_llm_ensemble(cfg, enabled=True)
+
+    assert cfg.llm_ensemble.enabled is False
+    assert cfg.llm_ensemble.candidates == []
+
+
+@pytest.mark.parametrize("provider", ["byteplus", "openrouter", "tokenrhythm"])
+def test_first_activation_uses_submitted_lineup_without_selection_mode(provider: str) -> None:
+    cfg = GatewayConfig(
+        llm={"provider": provider, "model": "primary-model"},
+        squilla_router={
+            "enabled": False,
+            "tiers": {
+                "c0": {"provider": provider, "model": "same-model"},
+                "c3": {"provider": provider, "model": "same-model"},
+            },
+        },
+    )
+    candidates = [
+        {"provider": provider, "model": "first-model", "thinking_level": "low"},
+        {"provider": provider, "model": "second-model", "role": "proposer"},
+        {"provider": provider, "model": "fusion-model", "role": "aggregator"},
+    ]
+
+    changed = upsert_llm_ensemble(cfg, enabled=True, candidates=candidates).config
+
+    assert changed.llm_ensemble.enabled is True
+    assert changed.llm_ensemble.selection_mode == "custom_b5"
+    assert [candidate.model for candidate in changed.llm_ensemble.candidates] == [
+        "first-model", "second-model", "fusion-model",
+    ]
+    assert changed.llm_ensemble.candidates[0].thinking_level == "low"
+    assert changed.llm_ensemble.candidates[-1].role == "aggregator"
+    assert {"llm_ensemble.selection_mode", "llm_ensemble.candidates"}.issubset(
+        changed.force_persist_paths()
+    )
+    assert cfg.llm_ensemble.enabled is False
+    assert cfg.llm_ensemble.candidates == []
+
+
+def test_submitted_lineup_keeps_existing_selection_mode_on_activation() -> None:
+    cfg = GatewayConfig(
+        llm={"provider": "tokenrhythm"},
+        llm_ensemble={"selection_mode": "static_openrouter_b5"},
+    )
+
+    changed = upsert_llm_ensemble(
+        cfg,
+        enabled=True,
+        candidates=[{"provider": "openrouter", "model": "stored-custom-model"}],
+    ).config
+
+    assert changed.llm_ensemble.selection_mode == "static_openrouter_b5"
+    assert changed.llm_ensemble.candidates[0].model == "stored-custom-model"
+
+
+def test_first_activation_with_explicit_empty_lineup_fails_without_generation() -> None:
+    cfg = GatewayConfig(llm={"provider": "tokenrhythm"})
+
+    with pytest.raises(ValueError, match="enabled proposer candidates"):
+        upsert_llm_ensemble(cfg, enabled=True, candidates=[])
 
     assert cfg.llm_ensemble.enabled is False
     assert cfg.llm_ensemble.candidates == []
@@ -377,7 +434,7 @@ def test_model_routing_snapshot_exposes_direct_image_admission(
     snapshot = model_routing_snapshot(config)
 
     assert snapshot["image_input"] == {
-        "admission": "blocked",
+        "admission": "allowed",
         "reason": "model_vision_unsupported",
     }
     assert "api_key" not in str(snapshot)
@@ -448,7 +505,7 @@ def test_model_routing_public_snapshot_exposes_complete_capability_matrix(
         },
         "ensemble": {
             "image_input": {
-                "admission": "blocked",
+                "admission": "allowed",
                 "reason": "ensemble_mode_unsupported",
             }
         },
@@ -523,7 +580,7 @@ def test_model_routing_capability_projection_isolates_one_mode_failure(
         "unknown",
     }
     assert capabilities["ensemble"]["image_input"] == {
-        "admission": "blocked",
+        "admission": "allowed",
         "reason": "ensemble_mode_unsupported",
     }
 
@@ -536,19 +593,19 @@ def test_model_routing_capability_projection_isolates_one_mode_failure(
             "supported",
             {
                 "admission": "allowed",
-                "reason": "router_image_route_available",
+                "reason": "router_image_route_unavailable",
             },
         ),
         (
-            {"image_model": {"model": "text-only-model", "supports_image": True}},
+            {"c0": {"model": "text-only-model"}},
             "unsupported",
             {
-                "admission": "blocked",
-                "reason": "model_vision_unsupported",
+                "admission": "allowed",
+                "reason": "router_image_route_unavailable",
             },
         ),
         (
-            {"image_model": {"model": "unlisted-model", "supports_image": True}},
+            {"c0": {"model": "unlisted-model"}},
             "unknown",
             {
                 "admission": "unknown",
@@ -556,11 +613,30 @@ def test_model_routing_capability_projection_isolates_one_mode_failure(
             },
         ),
         (
-            {"image_model": {"model": "", "supports_image": True}},
+            {"c0": {"model": "declared-vision", "supports_image": True}},
+            "unsupported",
+            {
+                "admission": "allowed",
+                "reason": "router_image_route_unavailable",
+            },
+        ),
+        (
+            {"c0": {"model": "text-only-model", "supports_image": False}},
             "supported",
             {
-                "admission": "blocked",
-                "reason": "router_image_route_unavailable",
+                "admission": "allowed",
+                "reason": "router_image_route_available",
+            },
+        ),
+        (
+            {
+                "c0": {"model": "unknown-model"},
+                "c1": {"model": "declared-vision", "supports_image": True},
+            },
+            "unknown",
+            {
+                "admission": "unknown",
+                "reason": "capability_unknown",
             },
         ),
     ],
@@ -593,6 +669,56 @@ def test_model_routing_snapshot_applies_image_route_in_observe(
 
     assert snapshot["mode"] == "direct"
     assert snapshot["image_input"] == expected
+
+
+def test_model_routing_snapshot_preserves_unknown_direct_image_admission(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class _Catalog:
+        def resolve_deployment_vision_support(self, *args: Any, **kwargs: Any) -> str:
+            del args, kwargs
+            return "unknown"
+
+    monkeypatch.setattr(
+        "opensquilla.provider.model_catalog.shared_catalog",
+        lambda: _Catalog(),
+    )
+    config = GatewayConfig(
+        llm={"provider": "custom", "model": "unlisted"},
+        squilla_router={"enabled": False, "rollout_phase": "observe"},
+        llm_ensemble={"enabled": False},
+    )
+
+    assert model_routing_snapshot(config)["image_input"] == {
+        "admission": "unknown",
+        "reason": "capability_unknown",
+    }
+
+
+@pytest.mark.parametrize(
+    ("selection_mode", "router_enabled"),
+    [
+        ("static_openrouter_b5", False),
+        ("static_tokenrhythm_b5", False),
+        ("router_dynamic", True),
+    ],
+)
+def test_model_routing_snapshot_allows_ensemble_images_for_marker_degradation(
+    selection_mode: str,
+    router_enabled: bool,
+) -> None:
+    config = GatewayConfig(
+        squilla_router={"enabled": router_enabled, "rollout_phase": "full"},
+        llm_ensemble={"enabled": True, "selection_mode": selection_mode},
+    )
+
+    snapshot = model_routing_snapshot(config)
+
+    assert snapshot["mode"] == "ensemble"
+    assert snapshot["image_input"] == {
+        "admission": "allowed",
+        "reason": "ensemble_mode_unsupported",
+    }
 
 
 @pytest.mark.parametrize(
@@ -642,6 +768,7 @@ async def test_models_routing_set_persist_failure_never_reconciles_live_runtime(
 ) -> None:
     config = GatewayConfig(
         config_path=str(tmp_path / "routing-failure.toml"),
+        llm={"provider": "openrouter", "model": "test-model"},
         llm_ensemble={"enabled": False},
         squilla_router={"enabled": False, "rollout_phase": "observe"},
     )
@@ -836,6 +963,7 @@ async def test_onboarding_ensemble_configure_broadcasts_one_canonical_change(
 ) -> None:
     config = GatewayConfig(
         config_path=str(tmp_path / "ensemble.toml"),
+        llm={"provider": "openrouter", "model": "test-model"},
         llm_ensemble={"enabled": False, "selection_mode": "router_dynamic"},
         squilla_router={"enabled": False, "rollout_phase": "observe"},
     )
@@ -860,6 +988,46 @@ async def test_onboarding_ensemble_configure_broadcasts_one_canonical_change(
             },
         )
     ]
+
+
+async def test_ensemble_configure_persists_submitted_first_lineup_and_reenables(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from opensquilla.onboarding import config_store
+
+    path = tmp_path / "byteplus-ensemble.toml"
+    path.write_text(
+        '[llm]\nprovider = "byteplus"\nmodel = "seed-lite"\n'
+        '[squilla_router]\nenabled = false\ntier_profile = "byteplus"\n',
+        encoding="utf-8",
+    )
+    config = GatewayConfig.load(str(path))
+    ctx, events = _routing_event_ctx(config, monkeypatch)
+    persist = MagicMock(wraps=config_store.persist_config)
+    monkeypatch.setattr(config_store, "persist_config", persist)
+    candidates = [
+        {"provider": "byteplus", "model": "seed-lite", "role": "proposer"},
+        {"provider": "byteplus", "model": "seed-pro", "role": "proposer"},
+    ]
+
+    await _ensemble_configure({"enabled": True, "candidates": candidates}, ctx)
+
+    assert persist.call_count == 1
+    assert len(events) == 1
+    assert model_routing_snapshot(config)["mode"] == "ensemble"
+    reloaded = GatewayConfig.load(str(path))
+    assert reloaded.llm_ensemble.selection_mode == "custom_b5"
+    assert [row.model for row in reloaded.llm_ensemble.candidates] == ["seed-lite", "seed-pro"]
+    assert model_routing_snapshot(reloaded)["mode"] == "ensemble"
+
+    # A later mode-only reactivation must use the saved lineup rather than
+    # rediscovering the provider's one-model Router preset.
+    await _handle_models_routing_set({"mode": "router"}, ctx)
+    await _handle_models_routing_set({"mode": "ensemble"}, ctx)
+
+    assert model_routing_snapshot(config)["mode"] == "ensemble"
+    assert [row.model for row in config.llm_ensemble.candidates] == ["seed-lite", "seed-pro"]
 
 
 async def test_models_routing_set_reuses_safe_patch_broadcast_exactly_once(
@@ -930,6 +1098,8 @@ async def test_admin_config_hot_apply_does_not_broadcast_unchanged_routing(
         squilla_router={"enabled": False, "rollout_phase": "observe"},
     )
     ctx, events = _routing_event_ctx(config, monkeypatch)
+    before_fields = set(config.squilla_router.model_fields_set)
+    before_router = capture_model_routing_config(config, session_mode="router")
 
     response = await _apply_admin_routing_write(
         case,
@@ -940,6 +1110,10 @@ async def test_admin_config_hot_apply_does_not_broadcast_unchanged_routing(
 
     assert events == []
     assert "model_routing" not in response
+    assert config.squilla_router.model_fields_set == before_fields
+    assert capture_model_routing_config(config, session_mode="router").squilla_router.tiers == (
+        before_router.squilla_router.tiers
+    )
 
 
 async def test_inactive_router_capability_change_broadcasts_public_snapshot(
@@ -972,16 +1146,17 @@ async def test_inactive_router_capability_change_broadcasts_public_snapshot(
             "enabled": False,
             "rollout_phase": "observe",
             "tiers": {
-                "c1": {"model": "router-text", "supports_image": True},
+                "c1": {"model": "router-text"},
             },
         },
     )
     ctx, events = _routing_event_ctx(config, monkeypatch)
     before = model_routing_public_snapshot(config)
     assert before["mode"] == "ensemble"
-    assert before["capabilities_by_mode"]["router"]["image_input"][
-        "admission"
-    ] == "blocked"
+    assert before["capabilities_by_mode"]["router"]["image_input"] == {
+        "admission": "allowed",
+        "reason": "router_image_route_unavailable",
+    }
 
     response = await _handle_config_patch(
         {"patches": {"squilla_router.tiers.c1.model": "router-vision"}},
@@ -1024,6 +1199,37 @@ async def test_safe_patch_noop_does_not_broadcast_model_routing_change(
     assert "model_routing" not in response
 
 
+@pytest.mark.parametrize("case", ["config.set", "config.patch", "config.apply"])
+async def test_explicit_null_router_profile_keeps_operator_field_ownership(
+    case: str, tmp_path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = GatewayConfig(
+        config_path=str(tmp_path / f"explicit-null-{case}.toml"),
+        llm={"provider": "tokenrhythm", "model": "glm-5.1"},
+        llm_ensemble={"enabled": False},
+        squilla_router={"enabled": False},
+    )
+    original_tiers = config.squilla_router.tiers
+    assert "tier_profile" not in config.squilla_router.model_fields_set
+    ctx, _ = _routing_event_ctx(config, monkeypatch)
+
+    if case == "config.set":
+        await _handle_config_set({"path": "squilla_router.tier_profile", "value": None}, ctx)
+    elif case == "config.patch":
+        await _handle_config_patch({"patches": {"squilla_router.tier_profile": None}}, ctx)
+    else:
+        await _handle_config_apply({"config": {
+            "llm": {"provider": "tokenrhythm", "model": "glm-5.1"},
+            "llm_ensemble": {"enabled": False},
+            "squilla_router": {"enabled": False, "tier_profile": None},
+        }}, ctx)
+
+    assert "tier_profile" in config.squilla_router.model_fields_set
+    assert capture_model_routing_config(config, session_mode="router").squilla_router.tiers == (
+        original_tiers
+    )
+
+
 async def test_unrelated_router_patch_preserves_existing_rollout_fields(tmp_path) -> None:
     config = GatewayConfig(
         config_path=str(tmp_path / "router-detail.toml"),
@@ -1051,6 +1257,7 @@ async def test_legacy_safe_patch_ensemble_enable_repairs_router_dependency_once(
 ) -> None:
     config = GatewayConfig(
         config_path=str(tmp_path / "legacy-safe.toml"),
+        llm={"provider": "openrouter", "model": "test-model"},
         llm_ensemble={"enabled": False, "selection_mode": "router_dynamic"},
         squilla_router={"enabled": False, "rollout_phase": "observe"},
     )

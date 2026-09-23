@@ -1,3 +1,6 @@
+import { copySelectedSkills, isSelectedSkills } from '@/types/selectedSkills'
+import { SKILLS_CANDIDATES_METHOD } from '@/contracts/generated/v4/skillsCandidates'
+import { normalizePageContext } from '@/types/pageContext'
 import type { TransportCallOptions as RpcCallOptions } from './transportTypes'
 import { readTransportFailure } from './transportTypes'
 import {
@@ -5,19 +8,18 @@ import {
   type ChatAbortParams,
   type ChatAbortResult,
 } from '@/contracts/generated/v4/chatAbort'
-import { validateChatAbortParams, validateChatAbortResult } from '@/contracts/generated/v4/chatAbortValidators.mjs'
+import { validateChatAbortResult } from '@/contracts/generated/v4/chatAbortValidators.mjs'
 import {
   CHAT_SEND_METHOD,
   type ChatSendResult,
 } from '@/contracts/generated/v4/chatSend'
-import { validateChatSendParams, validateChatSendResult } from '@/contracts/generated/v4/chatSendValidators.mjs'
+import { validateChatSendResult } from '@/contracts/generated/v4/chatSendValidators.mjs'
 import {
   SESSIONS_PENDING_INPUTS_DISPATCH_METHOD,
   type SessionsPendingInputsDispatchParams,
   type SessionsPendingInputsDispatchResult,
 } from '@/contracts/generated/v4/pendingInputsDispatch'
 import {
-  validatePendingInputsDispatchParams,
   validatePendingInputsDispatchResult,
 } from '@/contracts/generated/v4/pendingInputsDispatchValidators.mjs'
 import {
@@ -26,7 +28,6 @@ import {
   type SessionsPendingInputsSteerResult,
 } from '@/contracts/generated/v4/pendingInputsSteer'
 import {
-  validatePendingInputsSteerParams,
   validatePendingInputsSteerResult,
 } from '@/contracts/generated/v4/pendingInputsSteerValidators.mjs'
 import {
@@ -35,7 +36,6 @@ import {
   type SessionsSteerV2Result,
 } from '@/contracts/generated/v4/sessionsSteerV2'
 import {
-  validateSessionsSteerV2Params,
   validateSessionsSteerV2Result,
 } from '@/contracts/generated/v4/sessionsSteerV2Validators.mjs'
 import {
@@ -230,9 +230,6 @@ function projectSendResult(raw: ChatSendResult | SessionsPendingInputsDispatchRe
       ? { terminalMessage: firstDefined(object, 'terminalMessage', 'terminal_message') as string }
       : {}),
     ...(optionalString(object.reason) !== undefined ? { reason: object.reason as string } : {}),
-    ...(Array.isArray(firstDefined(object, 'acceptedPromptAnnotationIds', 'accepted_prompt_annotation_ids'))
-      ? { acceptedPromptAnnotationIds: firstDefined(object, 'acceptedPromptAnnotationIds', 'accepted_prompt_annotation_ids') as string[] }
-      : {}),
   }
   const metadata = metadataFor(object, SEND_RESULT_KEYS)
   return metadata ? { ...result, metadata } : result
@@ -340,16 +337,21 @@ export function toWireSendParams(request: TurnSendParams): Record<string, unknow
     sessionKey,
     clientRequestId,
     clientMessageId,
-    promptAnnotationIds,
-    documentContext,
+    pageContext,
+    selectedSkills,
+    promptAnnotationIds: retiredAnnotationIds,
+    documentContext: retiredDocumentContext,
     source,
     intent,
     workspaceId,
     collaborationMode,
     initialRoutingMode,
+    initialModel,
+    initialProvider,
     forkBeforeMessageId,
     displayText,
     attachments,
+    workspaceFiles,
     queueMode,
     // Legacy aliases can exist in handoff WAL records written by an older
     // client. They are removed when a canonical value is present below, but
@@ -358,20 +360,33 @@ export function toWireSendParams(request: TurnSendParams): Record<string, unknow
     key: legacyKey,
     client_request_id: legacyClientRequestId,
     client_message_id: legacyClientMessageId,
-    prompt_annotation_ids: legacyPromptAnnotationIds,
-    document_context: legacyDocumentContext,
+    prompt_annotation_ids: retiredLegacyAnnotationIds,
+    document_context: retiredLegacyDocumentContext,
+    page_context: legacyPageContext,
     _source: legacySource,
     workspace_id: legacyWorkspaceId,
     collaboration_mode: legacyCollaborationMode,
     initial_routing_mode: legacyInitialRoutingMode,
+    initial_model: legacyInitialModel,
+    initial_provider: legacyInitialProvider,
     fork_before_message_id: legacyForkBeforeMessageId,
     display_text: legacyDisplayText,
     ...extensions
   } = sourceRecord
 
+  if (retiredDocumentContext || retiredLegacyDocumentContext
+    || [retiredAnnotationIds, retiredLegacyAnnotationIds].some(value => Array.isArray(value) && value.length > 0)) {
+    throw new TurnCommandError('rejected', 'Reopen the page and send its annotations again.', 'DOCUMENT_EDITING_RETIRED', false)
+  }
+  if (selectedSkills !== undefined && !isSelectedSkills(selectedSkills)) {
+    throw new TurnCommandError('rejected', 'Invalid selected skill references.', 'INVALID_REQUEST', false)
+  }
+  const context = normalizePageContext(pageContext ?? legacyPageContext)
+
   return {
     ...extensions,
     message,
+    ...(selectedSkills?.length ? { selectedSkills: copySelectedSkills(selectedSkills) } : {}),
     ...(sessionKey !== undefined
       ? { sessionKey }
       : legacySessionKey !== undefined
@@ -389,16 +404,7 @@ export function toWireSendParams(request: TurnSendParams): Record<string, unknow
       : legacyClientMessageId !== undefined
         ? { client_message_id: legacyClientMessageId }
         : {}),
-    ...(promptAnnotationIds !== undefined
-      ? { promptAnnotationIds }
-      : legacyPromptAnnotationIds !== undefined
-        ? { prompt_annotation_ids: legacyPromptAnnotationIds }
-        : {}),
-    ...(documentContext !== undefined
-      ? { documentContext }
-      : legacyDocumentContext !== undefined
-        ? { document_context: legacyDocumentContext }
-        : {}),
+    ...(context ? { pageContext: context } : {}),
     ...(source !== undefined
       ? { _source: source }
       : legacySource !== undefined
@@ -420,6 +426,12 @@ export function toWireSendParams(request: TurnSendParams): Record<string, unknow
       : legacyInitialRoutingMode !== undefined
         ? { initial_routing_mode: legacyInitialRoutingMode }
         : {}),
+    ...(initialModel !== undefined
+      ? { initialModel }
+      : legacyInitialModel !== undefined ? { initial_model: legacyInitialModel } : {}),
+    ...(initialProvider !== undefined
+      ? { initialProvider }
+      : legacyInitialProvider !== undefined ? { initial_provider: legacyInitialProvider } : {}),
     ...(forkBeforeMessageId !== undefined
       ? { forkBeforeMessageId }
       : legacyForkBeforeMessageId !== undefined
@@ -431,6 +443,7 @@ export function toWireSendParams(request: TurnSendParams): Record<string, unknow
         ? { display_text: legacyDisplayText }
         : {}),
     ...(attachments !== undefined ? { attachments } : {}),
+    ...(workspaceFiles !== undefined ? { workspaceFiles } : {}),
     ...(queueMode !== undefined ? { queueMode } : {}),
   }
 }
@@ -484,28 +497,6 @@ function forward<T>(
   })
 }
 
-/**
- * Validate request params without taking ownership of legacy rejection
- * semantics.  v4 historically forwards malformed values to the Gateway,
- * where the handler chooses the exact error code/message.  The Adapter still
- * runs the generated validator (and therefore exercises the Contract), but a
- * failed request check is advisory so old aliases and diagnostics remain
- * observable to existing callers.
- */
-function validateRequest(
-  _method: string,
-  validator: ContractValidator,
-  params: unknown,
-): void {
-  try {
-    validator(params)
-  } catch {
-    // A validator is an observer at this compatibility seam.  If a value is
-    // outside AJV's input domain (for example a host object), let the existing
-    // Gateway decide how to reject it instead of changing the v4 error path.
-  }
-}
-
 function response<T>(
   method: string,
   validator: ContractValidator,
@@ -527,11 +518,9 @@ function forwardContract<T>(
   transport: TurnCommandsTransport,
   method: string,
   params: Record<string, unknown>,
-  requestValidator: ContractValidator,
   responseValidator: ContractValidator,
   options?: TurnCommandRequestOptions,
 ): Promise<T> {
-  validateRequest(method, requestValidator, params)
   return forward<unknown>(transport, method, params, options).then(raw => (
     response<T>(method, responseValidator, raw)
   ))
@@ -555,13 +544,16 @@ export function createV4TurnCommands(transport: TurnCommandsTransport): TurnComm
       request: TurnSendRequest,
       options?: TurnCommandRequestOptions,
     ): Promise<TurnSendResponse> => {
+      if (request.kind === 'new-turn' && request.params.selectedSkills?.length
+        && !hasRpcMethod(SKILLS_CANDIDATES_METHOD)) {
+        throw new TurnCommandError('unavailable', 'Update the Gateway to use selected skills.', 'EXPLICIT_SKILLS_UNSUPPORTED', false)
+      }
       if (request.kind === 'pending-input') {
         const params = request.params as unknown as SessionsPendingInputsDispatchParams
         return forwardContract<SessionsPendingInputsDispatchResult>(
           transport,
           SESSIONS_PENDING_INPUTS_DISPATCH_METHOD,
           params as unknown as Record<string, unknown>,
-          validatePendingInputsDispatchParams,
           validatePendingInputsDispatchResult,
           options,
         ).then(projectSendResult) as Promise<TurnSendResponse>
@@ -571,7 +563,6 @@ export function createV4TurnCommands(transport: TurnCommandsTransport): TurnComm
         transport,
         CHAT_SEND_METHOD,
         params,
-        validateChatSendParams,
         validateChatSendResult,
         options,
       ).then(projectSendResult)
@@ -586,7 +577,6 @@ export function createV4TurnCommands(transport: TurnCommandsTransport): TurnComm
         transport,
         CHAT_ABORT_METHOD,
         params as unknown as Record<string, unknown>,
-        validateChatAbortParams,
         validateChatAbortResult,
         options,
       ).then(projectCancelResult)
@@ -602,7 +592,6 @@ export function createV4TurnCommands(transport: TurnCommandsTransport): TurnComm
           transport,
           SESSIONS_PENDING_INPUTS_STEER_METHOD,
           params as unknown as Record<string, unknown>,
-          validatePendingInputsSteerParams,
           validatePendingInputsSteerResult,
           options,
         ).then(projectSteerResult)
@@ -612,13 +601,13 @@ export function createV4TurnCommands(transport: TurnCommandsTransport): TurnComm
         transport,
         SESSIONS_STEER_V2_METHOD,
         params as unknown as Record<string, unknown>,
-        validateSessionsSteerV2Params,
         validateSessionsSteerV2Result,
         options,
       ).then(projectSteerResult)
     },
 
     supports: (capability: TurnCommandCapability): boolean => {
+      if (capability === 'explicit-skills') return hasRpcMethod(SKILLS_CANDIDATES_METHOD)
       if (capability === 'same-turn-steer') return hasRpcMethod(SESSIONS_STEER_V2_METHOD)
       return hasRpcMethod(SESSIONS_PENDING_INPUTS_STEER_METHOD)
     },

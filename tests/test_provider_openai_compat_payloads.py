@@ -18,6 +18,7 @@ from opensquilla.provider.openai import (
     _stream_timeout,
     _tool_schema_accepts_arguments,
 )
+from opensquilla.provider.preset_registry import get_preset
 from opensquilla.provider.selector import build_provider
 from opensquilla.provider.tokenrhythm_correlation import (
     is_tokenrhythm_correlation_target,
@@ -47,6 +48,7 @@ STRICT_SOURCE_EDIT_TOOL_NAMES = {
     "grep_search",
     "glob_search",
     "exec_command",
+    "process",
     "git_status",
     "git_diff",
     "retrieve_tool_result",
@@ -58,6 +60,7 @@ SOURCE_EDIT_V2_TOOL_NAMES = {
     "grep_search",
     "glob_search",
     "exec_command",
+    "process",
     "git_status",
     "git_diff",
     "retrieve_tool_result",
@@ -73,6 +76,7 @@ BALANCED_SOURCE_EDIT_TOOL_NAMES = {
     "glob_search",
     "list_dir",
     "exec_command",
+    "process",
     "git_status",
     "git_diff",
     "retrieve_tool_result",
@@ -80,6 +84,7 @@ BALANCED_SOURCE_EDIT_TOOL_NAMES = {
 PATCH_FALLBACK_SOURCE_EDIT_TOOL_NAMES = BALANCED_SOURCE_EDIT_TOOL_NAMES | {"apply_patch"}
 SCAFFOLD_EDIT_TOOL_NAMES = {
     "exec_command",
+    "process",
     "read_file",
     "edit_file",
     "write_file",
@@ -99,12 +104,10 @@ STRICT_SOURCE_EDIT_FORBIDDEN_TOOL_NAMES = {
     "apply_patch",
     "execute_code",
     "background_process",
-    "process",
     "git_log",
 }
 SCAFFOLD_FORBIDDEN_TOOL_NAMES = {
     "background_process",
-    "process",
     "execute_code",
     "git_log",
     "read_source",
@@ -317,6 +320,29 @@ def _collect(provider: OpenAIProvider, cfg: ChatConfig) -> DoneEvent:
     return asyncio.run(_run())
 
 
+def test_tokenrhythm_recommended_c1_keeps_neutral_request_dialect(monkeypatch: Any) -> None:
+    captured: dict[str, Any] = {}
+    _patch_transport(monkeypatch, captured)
+    preset = get_preset("tokenrhythm")
+    assert preset is not None
+    model = preset.tier_defaults()["c1"]["model"]
+    catalog = ModelCatalog()
+    provider = OpenAIProvider(
+        api_key="test-key", model=model,
+        base_url="https://tokenrhythm.studio/v1", provider_kind="tokenrhythm",
+    )
+    _collect(provider, ChatConfig(
+        max_tokens=catalog.resolve_max_tokens(model, provider="tokenrhythm"),
+        model_capabilities=catalog.get_capabilities(model, provider_name="tokenrhythm"),
+    ))
+    payload = captured["payload"]
+    assert payload["model"] == "deepseek-flash"
+    assert payload["max_tokens"] == 384_000
+    assert "thinking" not in payload
+    assert "reasoning_effort" not in payload
+    assert "reasoning" not in payload
+
+
 @pytest.mark.parametrize("provider_id", ["dashscope", "deepseek"])
 def test_registry_openai_compat_identity_survives_into_done_event(
     monkeypatch: Any,
@@ -378,6 +404,8 @@ def test_openrouter_stream_write_timeout_allows_env_override(
 def test_openrouter_stream_timeout_emits_heartbeat_before_non_stream_fallback(
     monkeypatch: Any,
 ) -> None:
+    fallback_started = False
+
     class TimeoutStream:
         async def __aenter__(self) -> Any:
             raise httpx.ReadTimeout("stream idle")
@@ -398,28 +426,42 @@ def test_openrouter_stream_timeout_emits_heartbeat_before_non_stream_fallback(
         def stream(self, *args: Any, **kwargs: Any) -> TimeoutStream:
             return TimeoutStream()
 
-    class SlowFallbackProvider(OpenAIProvider):
+    class OrderedFallbackProvider(OpenAIProvider):
         async def _complete_non_stream(self, **kwargs: Any):
-            await asyncio.sleep(0.05)
+            nonlocal fallback_started
+            fallback_started = True
             yield ErrorEvent(message="fallback finished", code="timeout")
 
     monkeypatch.setattr("opensquilla.provider.openai.httpx.AsyncClient", TimeoutClient)
-    provider = SlowFallbackProvider(
+    provider = OrderedFallbackProvider(
         api_key="test",
         model="deepseek/deepseek-v4-flash",
         base_url="https://openrouter.ai/api/v1",
         provider_kind="openrouter",
     )
 
-    async def _first_event() -> Any:
+    async def _check_fallback_order() -> Any:
         events = provider.chat(
             [Message(role="user", content="hi")],
             config=ChatConfig(timeout=1.0),
         )
-        return await asyncio.wait_for(anext(events), timeout=0.02)
+        try:
+            # Request preparation may await a worker before the stream starts.
+            # The heartbeat must reach the caller before fallback work begins.
+            first = await anext(events)
+            assert fallback_started is False
+            remaining = [event async for event in events]
+            assert fallback_started is True
+            assert len(remaining) == 1
+            assert isinstance(remaining[0], ErrorEvent)
+            assert remaining[0].message == "fallback finished"
+            assert remaining[0].code == "timeout"
+            return first
+        finally:
+            await events.aclose()
 
     with structlog.testing.capture_logs() as captured:
-        event = asyncio.run(_first_event())
+        event = asyncio.run(_check_fallback_order())
 
     assert isinstance(event, ProviderHeartbeatEvent)
     assert event.phase == "llm_fallback"
@@ -575,6 +617,8 @@ def test_stream_timeout_fallback_drops_stale_install_id_after_hot_disable(
 def test_dashscope_stream_timeout_emits_heartbeat_before_non_stream_fallback(
     monkeypatch: Any,
 ) -> None:
+    fallback_started = False
+
     class TimeoutStream:
         async def __aenter__(self) -> Any:
             raise httpx.ReadTimeout("stream idle")
@@ -595,28 +639,42 @@ def test_dashscope_stream_timeout_emits_heartbeat_before_non_stream_fallback(
         def stream(self, *args: Any, **kwargs: Any) -> TimeoutStream:
             return TimeoutStream()
 
-    class SlowFallbackProvider(OpenAIProvider):
+    class OrderedFallbackProvider(OpenAIProvider):
         async def _complete_non_stream(self, **kwargs: Any):
-            await asyncio.sleep(0.05)
+            nonlocal fallback_started
+            fallback_started = True
             yield ErrorEvent(message="fallback finished", code="timeout")
 
     monkeypatch.setattr("opensquilla.provider.openai.httpx.AsyncClient", TimeoutClient)
-    provider = SlowFallbackProvider(
+    provider = OrderedFallbackProvider(
         api_key="test",
         model="qwen3.6-flash",
         base_url="https://dashscope.aliyuncs.com/compatible-mode/v1",
         provider_kind="dashscope",
     )
 
-    async def _first_event() -> Any:
+    async def _check_fallback_order() -> Any:
         events = provider.chat(
             [Message(role="user", content="hi")],
             config=ChatConfig(timeout=1.0),
         )
-        return await asyncio.wait_for(anext(events), timeout=0.02)
+        try:
+            # Request preparation may await a worker before the stream starts.
+            # The heartbeat must reach the caller before fallback work begins.
+            first = await anext(events)
+            assert fallback_started is False
+            remaining = [event async for event in events]
+            assert fallback_started is True
+            assert len(remaining) == 1
+            assert isinstance(remaining[0], ErrorEvent)
+            assert remaining[0].message == "fallback finished"
+            assert remaining[0].code == "timeout"
+            return first
+        finally:
+            await events.aclose()
 
     with structlog.testing.capture_logs() as captured:
-        event = asyncio.run(_first_event())
+        event = asyncio.run(_check_fallback_order())
 
     assert isinstance(event, ProviderHeartbeatEvent)
     assert event.phase == "llm_fallback"
@@ -1019,6 +1077,7 @@ def test_openrouter_list_models_reports_openrouter_provider(monkeypatch: Any) ->
                         "name": "DeepSeek V4 Flash",
                         "context_length": 128000,
                         "top_provider": {"max_completion_tokens": 8192},
+                        "architecture": {"input_modalities": ["text", "image"]},
                     }
                 ]
             },
@@ -1037,6 +1096,7 @@ def test_openrouter_list_models_reports_openrouter_provider(monkeypatch: Any) ->
     assert captured["url"] == "https://openrouter.ai/api/v1/models"
     assert rows[0].provider == "openrouter"
     assert rows[0].model_id == "deepseek/deepseek-v4-flash"
+    assert rows[0].supports_vision is True
 
 
 def test_openrouter_http_error_names_provider_request(monkeypatch: Any) -> None:
@@ -1430,7 +1490,7 @@ def test_llm_trace_request_metadata_carries_compaction_proof(
     request_proof = rows[0]["metadata"]["request_proof"]
     assert request_proof["compaction_tier"] == 0
     assert request_proof["retry_count"] == 0
-    assert "compaction_tiny_guard_chars" in request_proof
+    assert "compaction_tiny_guard_chars" not in request_proof
     assert "compaction_protect_recent_assistant" in request_proof
 
 
@@ -1855,33 +1915,17 @@ def test_tool_input_schema_supports_explicit_additional_properties_false() -> No
     assert not _tool_schema_accepts_arguments(tool, {"q": "hi", "extra": "rejected"})
 
 
-def test_gemini_projects_only_create_csv_itemless_arrays_to_string_items(
-    monkeypatch: Any,
-) -> None:
-    create_csv = next(
-        tool
-        for tool in get_default_registry().to_tool_definitions()
-        if tool.name == "create_csv"
+def test_gemini_does_not_project_retired_csv_schema(monkeypatch: Any) -> None:
+    tool = ToolDefinition(
+        name="generic_table",
+        description="Synthetic generic table tool.",
+        input_schema=ToolInputSchema(
+            properties={"rows": {"type": "array", "items": {"type": "array"}}},
+            required=["rows"],
+        ),
     )
-    original_definition = create_csv.model_copy(deep=True)
-    assert create_csv.allow_string_item_schema_projection is True
-    assert "allow_string_item_schema_projection" not in create_csv.model_dump()
-    assert (
-        "allow_string_item_schema_projection"
-        not in ToolDefinition.model_json_schema()["properties"]
-    )
-    assert create_csv.model_copy(deep=True).allow_string_item_schema_projection is True
-    assert (
-        ToolDefinition.model_validate(create_csv.model_dump())
-        .allow_string_item_schema_projection
-        is False
-    )
-    assert create_csv.input_schema.properties["rows"]["items"] == {"type": "array"}
-    assert _tool_schema_accepts_arguments(
-        create_csv,
-        {"rows": [["text", 1, True, None, {"x": 1}, ["nested"]]]},
-    )
-
+    tool._enable_string_item_schema_projection()
+    original_definition = tool.model_copy(deep=True)
     captured: dict[str, Any] = {}
     _patch_transport(monkeypatch, captured)
     provider = OpenAIProvider(
@@ -1890,20 +1934,20 @@ def test_gemini_projects_only_create_csv_itemless_arrays_to_string_items(
         base_url="https://generativelanguage.googleapis.com/v1beta/openai",
         provider_kind="gemini",
     )
-    _collect_events(provider, ChatConfig(), tools=[create_csv])
+    _collect_events(provider, ChatConfig(), tools=[tool])
 
     wire_rows = captured["payload"]["tools"][0]["function"]["parameters"][
         "properties"
     ]["rows"]
-    assert wire_rows["items"] == {"type": "array", "items": {"type": "string"}}
-    assert create_csv == original_definition
+    assert wire_rows["items"] == {"type": "array"}
+    assert tool == original_definition
 
 
 @pytest.mark.parametrize(
     ("base_url", "tool_name"),
     [
-        ("https://relay.example/v1", "create_csv"),
-        ("https://openrouter.ai/api/v1", "create_csv"),
+        ("https://relay.example/v1", "generic_table"),
+        ("https://openrouter.ai/api/v1", "generic_table"),
         ("https://generativelanguage.googleapis.com/v1beta/openai", "mcp_csv"),
     ],
 )
@@ -1914,7 +1958,7 @@ def test_gemini_string_item_projection_is_endpoint_and_tool_allowlisted(
 ) -> None:
     tool = ToolDefinition(
         name=tool_name,
-        description="Create a CSV-like artifact.",
+        description="Process a generic table.",
         input_schema=ToolInputSchema(
             properties={"rows": {"type": "array", "items": {"type": "array"}}},
             required=["rows"],
@@ -1940,7 +1984,7 @@ def test_gemini_string_item_projection_is_endpoint_and_tool_allowlisted(
 def test_gemini_does_not_project_an_untrusted_same_named_tool(monkeypatch: Any) -> None:
     tool = ToolDefinition.model_validate(
         {
-            "name": "create_csv",
+            "name": "generic_table",
             "description": "Third-party tool with unrelated row semantics.",
             "input_schema": {
                 "properties": {
@@ -1994,10 +2038,13 @@ def test_gemini_does_not_project_create_csv_on_nonofficial_api_roots(
     monkeypatch: Any,
     base_url: str,
 ) -> None:
-    create_csv = next(
-        tool
-        for tool in get_default_registry().to_tool_definitions()
-        if tool.name == "create_csv"
+    create_csv = ToolDefinition(
+        name="generic_table",
+        description="Synthetic generic table tool.",
+        input_schema=ToolInputSchema(
+            properties={"rows": {"type": "array", "items": {"type": "array"}}},
+            required=["rows"],
+        ),
     )
     captured: dict[str, Any] = {}
     _patch_transport(monkeypatch, captured)
@@ -2019,8 +2066,8 @@ def test_gemini_does_not_project_create_csv_on_nonofficial_api_roots(
 def test_string_item_projection_preserves_schema_shaped_literals() -> None:
     literal = {"type": "array"}
     tool = ToolDefinition(
-        name="create_csv",
-        description="Create a CSV file.",
+        name="generic_table",
+        description="Process a generic table.",
         input_schema=ToolInputSchema(
             properties={
                 "value": {
@@ -2047,13 +2094,14 @@ def test_string_item_projection_preserves_schema_shaped_literals() -> None:
     assert tool == original_definition
 
 
-def test_gemini_projection_traverses_composed_schemas_without_mutating_source(
-    monkeypatch: Any,
-) -> None:
-    create_csv = next(
-        tool
-        for tool in get_default_registry().to_tool_definitions()
-        if tool.name == "create_csv"
+def test_string_item_projection_traverses_composed_schemas_without_mutating_source() -> None:
+    create_csv = ToolDefinition(
+        name="generic_table",
+        description="Synthetic generic table tool.",
+        input_schema=ToolInputSchema(
+            properties={"rows": {"type": "array", "items": {"type": "array"}}},
+            required=["rows"],
+        ),
     )
     tool = create_csv.model_copy(
         deep=True,
@@ -2077,20 +2125,11 @@ def test_gemini_projection_traverses_composed_schemas_without_mutating_source(
         },
     )
     original_definition = tool.model_copy(deep=True)
-    captured: dict[str, Any] = {}
-    _patch_transport(monkeypatch, captured)
-    provider = OpenAIProvider(
-        api_key="test",
-        model="gemini-2.5-flash",
-        base_url="https://generativelanguage.googleapis.com/v1beta/openai/",
-        provider_kind="gemini",
+    payload = _build_openai_tool(
+        tool,
+        complete_itemless_arrays_with_string_items=True,
     )
-
-    _collect_events(provider, ChatConfig(), tools=[tool])
-
-    properties = captured["payload"]["tools"][0]["function"]["parameters"][
-        "properties"
-    ]
+    properties = payload["function"]["parameters"]["properties"]
     assert properties["all_of"]["allOf"][0]["items"] == {"type": "string"}
     assert properties["any_of"]["anyOf"][0]["items"] == {"type": "string"}
     assert properties["one_of"]["oneOf"][0]["items"] == {"type": "string"}

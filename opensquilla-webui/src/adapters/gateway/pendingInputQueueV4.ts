@@ -1,3 +1,7 @@
+import { normalizeWorkspaceFileReferences } from '@/utils/chat/attachments'
+import { copySelectedSkills, isSelectedSkills } from '@/types/selectedSkills'
+import { SKILLS_CANDIDATES_METHOD } from '@/contracts/generated/v4/skillsCandidates'
+import { normalizePageContext } from '@/types/pageContext'
 import {
   readTransportFailure,
 } from './transportTypes'
@@ -72,14 +76,6 @@ function numberValue(value: unknown): number | undefined {
   return typeof value === 'number' && Number.isFinite(value) ? value : undefined
 }
 
-function stringListValue(value: unknown): string[] | undefined {
-  if (!Array.isArray(value)) return undefined
-  const values = value
-    .map(entry => String(entry ?? '').trim())
-    .filter(Boolean)
-  return values.length ? [...new Set(values)] : []
-}
-
 function projectServerAttachment(value: unknown): PendingInputServerAttachment | null {
   if (!isRecord(value)) return null
   const name = stringValue(value.name) || 'attachment'
@@ -100,15 +96,14 @@ function projectPendingInputItem(value: unknown): PendingInputServerItem | null 
   const clientMessageId = stringValue(firstValue(value, 'clientMessageId', 'client_message_id'))
   if (!pendingInputId || !clientRequestId || !clientMessageId) return null
 
+  if (value.selectedSkills !== undefined && !isSelectedSkills(value.selectedSkills)) return null
   const attachments = Array.isArray(value.attachments)
     ? value.attachments.flatMap(attachment => {
         const projected = projectServerAttachment(attachment)
         return projected ? [projected] : []
       })
     : undefined
-  const promptAnnotationIds = stringListValue(
-    firstValue(value, 'promptAnnotationIds', 'prompt_annotation_ids'),
-  )
+  const pageContext = normalizePageContext(firstValue(value, 'pageContext', 'page_context'))
   const message = typeof value.message === 'string' ? value.message : undefined
   const displayValue = firstValue(value, 'displayText', 'display_text')
   const displayText = typeof displayValue === 'string' ? displayValue : undefined
@@ -129,10 +124,13 @@ function projectPendingInputItem(value: unknown): PendingInputServerItem | null 
     ...(message !== undefined ? { message } : {}),
     ...(displayText !== undefined ? { displayText } : {}),
     ...(attachments !== undefined ? { attachments } : {}),
+    ...(Array.isArray(value.workspaceFiles)
+      ? { workspaceFiles: normalizeWorkspaceFileReferences(value.workspaceFiles) } : {}),
     ...(position !== undefined ? { position } : {}),
     ...(revision !== undefined ? { revision } : {}),
     ...(requestFingerprint !== undefined ? { requestFingerprint } : {}),
-    ...(promptAnnotationIds !== undefined ? { promptAnnotationIds } : {}),
+    ...(pageContext ? { pageContext } : {}),
+    ...(isSelectedSkills(value.selectedSkills) ? { selectedSkills: copySelectedSkills(value.selectedSkills) } : {}),
     ...(intent !== undefined ? { intent } : {}),
     ...(value.confirmedPlainText === true ? { confirmedPlainText: true } : {}),
   }
@@ -214,10 +212,16 @@ function createRawPendingInputQueuePort(
   return {
     supportsQueue: () => supports(methods.enqueue),
     supportsReorder: () => supports(methods.reorder),
-    enqueue: request => requestPending(source, methods.enqueue, {
-      ...request,
-      attachments: [...request.attachments],
-    }),
+    enqueue: request => {
+      if (request.selectedSkills?.length && !supports(SKILLS_CANDIDATES_METHOD)) {
+        return Promise.reject(new PendingInputQueueError('unsupported', 'Update the Gateway to use selected skills.', false))
+      }
+      return requestPending(source, methods.enqueue, {
+        ...request,
+        ...(request.selectedSkills?.length ? { selectedSkills: copySelectedSkills(request.selectedSkills) } : {}),
+        attachments: [...request.attachments],
+      })
+    },
     list: sessionKey => requestPending(source, methods.list, { key: sessionKey }),
     cancel: request => requestPending(source, methods.cancel, { ...request }),
     reorder: request => requestPending(source, methods.reorder, {

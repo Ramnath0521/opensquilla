@@ -1,6 +1,7 @@
+import assert from 'node:assert/strict'
 import { spawn, spawnSync } from 'node:child_process'
 import { createServer } from 'node:net'
-import { mkdtemp, mkdir, readdir, rm, writeFile } from 'node:fs/promises'
+import { mkdtemp, mkdir, readFile, readdir, rm, writeFile } from 'node:fs/promises'
 import { statSync } from 'node:fs'
 import { dirname, join, resolve } from 'node:path'
 import process from 'node:process'
@@ -18,6 +19,7 @@ const pollIntervalMs = 250
 const killGraceMs = 3_000
 const maxTailLines = 80
 const caProbeSuccessPattern = /\bopensquilla-desktop-ca-store-ok x509_ca=(\d+)\b/
+const documentFixtureText = 'OpenSquilla packaged document fixture'
 const strippedTlsEnvironmentKeys = new Set([
   'ALL_PROXY',
   'CURL_CA_BUNDLE',
@@ -204,6 +206,155 @@ function verifyGatewayFilesystemWorker(gatewayBinary, env, targetPath) {
         ),
     )
   }
+}
+
+function verifyGatewayToolSearch(gatewayBinary, env) {
+  const result = spawnSync(gatewayBinary, ['--_desktop-tool-search-probe'], {
+    cwd: dirname(gatewayBinary),
+    env,
+    encoding: 'utf8',
+    windowsHide: true,
+    timeout: 20_000,
+  })
+  if (result.error) throw result.error
+  if (
+    result.status !== 0
+    || result.stdout.trim() !== 'opensquilla-desktop-tool-search-ok'
+  ) {
+    throw new Error(
+      `Packaged gateway tool-search resource probe failed with exit ${result.status ?? 'null'}.`
+        + formatTail(
+          result.stdout ? result.stdout.trim().split(/\r?\n/) : [],
+          result.stderr ? result.stderr.trim().split(/\r?\n/) : [],
+        ),
+    )
+  }
+}
+
+function verifyGatewayPty(gatewayBinary, env) {
+  const result = functionalProbe(gatewayBinary, env, ['--_desktop-pty-probe'])
+  if (
+    result.probe !== 'opensquilla-desktop-pty'
+    || result.available !== true
+    || result.ioMode !== 'pty'
+    || result.returncode !== 0
+  ) {
+    throw new Error(`Packaged gateway PTY probe failed: ${JSON.stringify(result)}`)
+  }
+}
+
+function documentFixture() {
+  const stream = `BT /F1 24 Tf 72 720 Td (${documentFixtureText}) Tj ET`
+  const objects = [
+    '<< /Type /Catalog /Pages 2 0 R >>',
+    '<< /Type /Pages /Kids [3 0 R] /Count 1 >>',
+    '<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 4 0 R >> >> /Contents 5 0 R >>',
+    '<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>',
+    `<< /Length ${Buffer.byteLength(stream)} >>\nstream\n${stream}\nendstream`,
+  ]
+  let body = '%PDF-1.4\n'
+  const offsets = [0]
+  for (const [index, object] of objects.entries()) {
+    offsets.push(Buffer.byteLength(body))
+    body += `${index + 1} 0 obj\n${object}\nendobj\n`
+  }
+  const xref = Buffer.byteLength(body)
+  body += `xref\n0 ${objects.length + 1}\n0000000000 65535 f \n`
+  for (const offset of offsets.slice(1)) body += `${String(offset).padStart(10, '0')} 00000 n \n`
+  body += `trailer\n<< /Root 1 0 R /Size ${objects.length + 1} >>\nstartxref\n${xref}\n%%EOF\n`
+  return Buffer.from(body, 'ascii')
+}
+
+function functionalProbe(gatewayBinary, env, args, options = {}) {
+  const { label = args[0], ...spawnOptions } = options
+  const result = spawnSync(gatewayBinary, args, {
+    cwd: dirname(gatewayBinary), env, encoding: 'utf8', windowsHide: true, timeout: 60_000,
+    ...spawnOptions,
+  })
+  if (result.error) throw new Error(`Packaged ${label} failed: ${result.error.message}`)
+  if (result.status !== 0) {
+    throw new Error(`Packaged ${args[0]} failed with exit ${result.status ?? 'null'}.`
+      + formatTail(result.stdout?.trim().split(/\r?\n/) || [], result.stderr?.trim().split(/\r?\n/) || []))
+  }
+  return JSON.parse(result.stdout)
+}
+
+function verifyGatewayDocument(gatewayBinary, env, path) {
+  assert.deepEqual(functionalProbe(gatewayBinary, env, ['--_desktop-document-probe', path]), {
+    probe: 'opensquilla-desktop-document', pages: 1, text: documentFixtureText,
+    imageMime: 'image/png', imageSize: [1224, 1584],
+  })
+}
+
+async function verifyGatewayCodeExecution(gatewayBinary, env, tempHome) {
+  const code = await readFile(join(scriptDir, 'probe-code-execution.py'), 'utf8')
+  const inheritedKeys = new Set([
+    'PATH', 'SYSTEMROOT', 'WINDIR', 'COMSPEC', 'PATHEXT',
+    'LD_LIBRARY_PATH', 'DYLD_LIBRARY_PATH', 'HOME', 'USERPROFILE',
+    'PYTHONUNBUFFERED', 'PYTHONUTF8', 'PYTHONIOENCODING',
+  ])
+  const probeEnv = Object.fromEntries(Object.entries(env).filter(([key]) => (
+    inheritedKeys.has(key.toUpperCase()) || key.startsWith('OPENSQUILLA_')
+  )))
+  probeEnv.APPDATA = join(tempHome, 'AppData', 'Roaming')
+  probeEnv.LOCALAPPDATA = join(tempHome, 'AppData', 'Local')
+  probeEnv.TMP = probeEnv.TEMP = probeEnv.TMPDIR = join(tempHome, 'code-execution-temp')
+  await mkdir(probeEnv.APPDATA, { recursive: true })
+  await mkdir(probeEnv.LOCALAPPDATA, { recursive: true })
+  await mkdir(probeEnv.TMP, { recursive: true })
+  assert.deepEqual(functionalProbe(gatewayBinary, probeEnv, [
+    '--internal-child', 'python-code', code,
+  ], { label: 'code-execution' }), {
+    probe: 'opensquilla-desktop-code-execution', frozen: true,
+    pythonExit: 0, errorExit: 7, pages: 1, title: 'Packaged Python tool smoke',
+    documents: { csvRows: 2, xlsxValue: 42, pdfText: '中文文件验收 样本 42' },
+    published: 4,
+  })
+}
+
+async function verifyGatewaySafeExecution(gatewayBinary, env, tempHome) {
+  const code = await readFile(join(scriptDir, 'probe-safe-execution.py'), 'utf8')
+  const probeEnv = { ...env, PYTHONDONTWRITEBYTECODE: '1' }
+  // Provision only on an explicitly opted-in disposable Windows CI runner.
+  // This gate is never invoked by application startup or capability polling.
+  delete probeEnv.OPENSQUILLA_SMOKE_PROVISION_SANDBOX
+  const provisionRequested = process.platform === 'win32' && (
+    process.argv.includes('--provision-windows-sandbox')
+    || process.env.OPENSQUILLA_SMOKE_PROVISION_SANDBOX === '1'
+  )
+  if (provisionRequested) {
+    console.log('Windows Safe smoke provisioning is explicitly enabled for this disposable runner.')
+    probeEnv.OPENSQUILLA_SMOKE_PROVISION_SANDBOX = '1'
+    // The elevated helper deliberately accepts only profile-scoped marker
+    // paths. Exercise the Safe child in that same profile-scoped workspace so
+    // its offline identity receives the ACL traversal grant that production
+    // workspaces use. This branch is limited to the disposable CI provision
+    // gate above.
+    const profileHome = process.env.USERPROFILE || process.env.HOME
+    if (!profileHome) throw new Error('Windows Safe smoke requires a user profile home.')
+    probeEnv.OPENSQUILLA_STATE_DIR = join(profileHome, '.opensquilla')
+    probeEnv.OPENSQUILLA_SMOKE_WORKSPACE_ROOT = join(profileHome, '.opensquilla')
+  }
+  const backend = { darwin: 'seatbelt', win32: 'windows_default', linux: 'bubblewrap' }[process.platform]
+  assert.deepEqual(functionalProbe(gatewayBinary, probeEnv, [
+    '--internal-child', 'python-code', code,
+  ], { label: 'safe-execution', cwd: tempHome, timeout: 180_000 }), {
+    probe: 'opensquilla-desktop-safe-execution', frozen: true, backend,
+    read: true, write: true, readonlyChild: true, writeDenied: true, networkDenied: true,
+  })
+  console.log(`Packaged Safe execution passed with ${backend}; write and network denials verified.`)
+}
+
+function verifyGatewayMcp(gatewayBinary, env, port) {
+  const { protocolVersion, ...result } = functionalProbe(gatewayBinary, env, [
+    '--_desktop-mcp-probe', `ws://127.0.0.1:${port}/ws`,
+  ])
+  // The Python probe verifies this against the bundled SDK's latest version.
+  assert.match(protocolVersion, /^\d{4}-\d{2}-\d{2}$/)
+  assert.deepEqual(result, {
+    probe: 'opensquilla-desktop-mcp', sessions: 0, resources: ['opensquilla://sessions'],
+    tools: ['conversations_list', 'events_wait', 'messages_read', 'messages_send', 'session_resolve', 'transcript_export'],
+  })
 }
 
 async function findFreePort() {
@@ -421,6 +572,8 @@ async function main() {
     await mkdir(stateDir, { recursive: true })
     await mkdir(workspaceDir, { recursive: true })
     await writeFile(join(workspaceDir, 'SOUL.md'), 'synthetic packaged gateway smoke\n', 'utf8')
+    const documentPath = join(workspaceDir, 'document-fixture.pdf')
+    await writeFile(documentPath, documentFixture())
     await writeFile(
       config,
       [
@@ -433,7 +586,12 @@ async function main() {
 
     const env = smokeEnv(tempHome, config, runtimeGatewayDir)
     verifyGatewayCaStore(gatewayBinary, env)
+    verifyGatewayToolSearch(gatewayBinary, env)
+    verifyGatewayPty(gatewayBinary, env)
     verifyGatewayFilesystemWorker(gatewayBinary, env, join(workspaceDir, 'SOUL.md'))
+    verifyGatewayDocument(gatewayBinary, env, documentPath)
+    await verifyGatewayCodeExecution(gatewayBinary, env, tempHome)
+    await verifyGatewaySafeExecution(gatewayBinary, env, tempHome)
 
     const port = await findFreePort()
     child = spawn(gatewayBinary, ['gateway', 'run', '--port', String(port), '--bind', '127.0.0.1', '--config', config], {
@@ -458,6 +616,7 @@ async function main() {
 
     await waitForGateway(port, childExit, stdoutTail, stderrTail)
     await verifyControlUi(port, stdoutTail, stderrTail)
+    verifyGatewayMcp(gatewayBinary, env, port)
     console.log('OpenSquilla packaged gateway smoke passed.')
   } finally {
     if (child) await terminateChild(child, childClosed)

@@ -1,3 +1,5 @@
+import { copySelectedSkills, isSelectedSkills } from '@/types/selectedSkills'
+import { normalizePageContext } from '@/types/pageContext'
 import type { TransportCallOptions as RpcCallOptions } from './transportTypes'
 import {
   CHAT_HISTORY_METHOD,
@@ -23,7 +25,7 @@ import {
 import { mapSessionReadError } from './sessionReadErrorMapping'
 import { projectConversationRoutingSnapshot } from './conversationContentV4'
 
-const DEFAULT_HISTORY_BUDGET_MS = 15_000
+const DEFAULT_HISTORY_BUDGET_MS = 7_000
 
 export interface SessionHistoryV4Transport {
   request<T = unknown>(
@@ -132,7 +134,8 @@ const MESSAGE_FIELDS = new Set([
   'id', 'message_id', 'transcript_id', 'role', 'text', 'timestamp', 'ts',
   'reasoning_content', 'reasoningContent', 'router_decision', 'routerDecision',
   'artifacts', 'tool_calls', 'toolCalls', 'timeline', 'attachments',
-  'prompt_annotations', 'promptAnnotations', 'provenance_kind',
+  'prompt_annotations', 'promptAnnotations', 'page_context', 'pageContext', 'provenance_kind',
+  'selectedSkills', 'selected_skills',
   'provenance_source_session_key', 'provenance_source_tool', 'turn_context',
   'turnContext', 'usage', 'turn_usage', 'turnUsage', 'model', 'model_id',
   'input', 'input_tokens', 'inputTokens', 'output', 'output_tokens', 'outputTokens',
@@ -165,6 +168,9 @@ function projectMessage(value: ChatHistoryMessage, index: number): SessionReadMe
     timeline: projectUnknownArray(raw.timeline),
     attachments: projectObjectArray(raw.attachments),
     promptAnnotations: projectUnknownArray(raw.prompt_annotations ?? raw.promptAnnotations),
+    pageContext: normalizePageContext(raw.page_context ?? raw.pageContext) ?? undefined,
+    selectedSkills: isSelectedSkills(raw.selectedSkills ?? raw.selected_skills)
+      ? copySelectedSkills((raw.selectedSkills ?? raw.selected_skills) as import('@/types/selectedSkills').SelectedSkillRef[]) : undefined,
     provenance: Object.freeze({
       kind: textValue(value.provenance_kind),
       sourceSessionKey: textValue(value.provenance_source_session_key),
@@ -352,9 +358,11 @@ export async function requestV4SessionHistory(
   }
   const callOptions: RpcCallOptions = {
     signal: request.signal,
+    cancelOnAbort: true,
     timeoutMs: timeoutMs(request, options.policy),
     timeoutAction: options.policy.concurrentHistoryReads() ? 'reject' : 'reconnect',
     abortAction: 'reject',
+    recoveryClass: 'safe-read',
     ...(options.expectedGeneration === undefined
       ? {}
       : { expectedGeneration: options.expectedGeneration }),

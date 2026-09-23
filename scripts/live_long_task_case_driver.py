@@ -46,6 +46,7 @@ if str(REPO_ROOT) not in sys.path:
 if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
 
+from opensquilla.config_version import LATEST_CONFIG_VERSION  # noqa: E402
 from opensquilla.gateway_client import GatewayRPCClient  # noqa: E402
 from opensquilla.provider.registry import get_provider_spec  # noqa: E402
 from scripts.live_harness_security import (  # noqa: E402
@@ -96,6 +97,11 @@ _MAX_CASE_FILE_BYTES: Final = 64 * 1024
 _MAX_BROWSER_RESULT_BYTES: Final = 64 * 1024
 _HISTORY_SETTLE_TIMEOUT_SECONDS: Final = 5.0
 _HISTORY_SETTLE_EVENT_WAIT_SECONDS: Final = 0.05
+_STARTUP_PHASES: Final = frozenset({
+    "config", "ownership", "services", "profile_recovery", "app",
+    "runtime_state", "listener", "gateway_ready",
+})
+_STARTUP_LOG_TAIL_BYTES: Final = 64 * 1024
 _PERFORMANCE_FIXTURE: Final = {
     "historyMessages": 200,
     "reasoningDeltas": 20_000,
@@ -459,6 +465,7 @@ def render_gateway_config(
     lines = [
         'host = "127.0.0.1"',
         "debug = false",
+        f"config_version = {LATEST_CONFIG_VERSION}",
         "log_file_enabled = false",
         f"workspace_dir = {_toml_string(workspace_dir)}",
         "llm_request_timeout_seconds = 900",
@@ -553,10 +560,11 @@ class GatewayProcess:
             self.turn_log_dir,
         ):
             directory.mkdir(mode=0o700)
-        self.port = _free_port()
+        self.port = 0
         self.proc: subprocess.Popen[bytes] | None = None
         self._stdout: Any = None
         self._stderr: Any = None
+        self._startup_log_offsets: dict[str, int] = {}
 
     @property
     def http_url(self) -> str:
@@ -605,8 +613,19 @@ class GatewayProcess:
     def start(self) -> None:
         if self.proc is not None and self.proc.poll() is None:
             raise RuntimeError("Gateway is already running")
+        if not self.port:
+            # Fault proxies bind between construction and the first start.
+            # Select afterward so they cannot take our released ephemeral
+            # port; retain it on restart for existing browser/RPC clients.
+            self.port = _free_port()
         self._stdout = (self.root / "gateway.stdout.log").open("ab")
         self._stderr = (self.root / "gateway.stderr.log").open("ab")
+        # Restarts append to the raw logs so cleanup can scan every attempt.
+        # Diagnostics must only describe the process launched by this start().
+        self._startup_log_offsets = {
+            "gateway.stdout.log": self._stdout.tell(),
+            "gateway.stderr.log": self._stderr.tell(),
+        }
         self.proc = subprocess.Popen(
             [
                 sys.executable,
@@ -625,19 +644,82 @@ class GatewayProcess:
             stdout=self._stdout,
             stderr=self._stderr,
         )
-        deadline = time.monotonic() + 45
+        started_at = time.monotonic()
+        deadline = started_at + 45
+        last_health_status: int | None = None
         while time.monotonic() < deadline:
-            if self.proc.poll() is not None:
-                raise DriverConfigurationError("Gateway exited during startup")
+            exit_code = self.proc.poll()
+            if exit_code is not None:
+                raise self._startup_failure(
+                    "Gateway exited during startup", started_at, exit_code, last_health_status,
+                )
             try:
                 with urllib.request.urlopen(f"{self.http_url}/health", timeout=1) as response:
+                    last_health_status = response.status
                     if response.status == 200:
                         return
+            except urllib.error.HTTPError as exc:
+                last_health_status = exc.code
             except (urllib.error.URLError, TimeoutError, OSError):
                 # The Gateway may still be binding; retry until the bounded deadline.
                 pass
             time.sleep(0.25)
-        raise DriverConfigurationError("Gateway did not become healthy")
+        raise self._startup_failure(
+            "Gateway did not become healthy", started_at, self.proc.poll(), last_health_status,
+        )
+
+    def _startup_failure(
+        self,
+        reason: str,
+        started_at: float,
+        exit_code: int | None,
+        last_health_status: int | None,
+    ) -> DriverConfigurationError:
+        # Raw live-case logs must still be scanned and deleted by cleanup().
+        # Retain only known startup states and bounded numeric evidence.
+        phases: dict[str, dict[str, int | str]] = {}
+        for name in ("gateway.stdout.log", "gateway.stderr.log"):
+            try:
+                with (self.root / name).open("rb") as stream:
+                    stream.seek(0, os.SEEK_END)
+                    stream.seek(max(
+                        self._startup_log_offsets.get(name, 0),
+                        stream.tell() - _STARTUP_LOG_TAIL_BYTES,
+                    ))
+                    tail = stream.read(_STARTUP_LOG_TAIL_BYTES)
+            except OSError:
+                continue
+            for line in tail.splitlines():
+                # PrivateLogFormatter prefixes its JSON with timestamp/level/logger.
+                _, prefix, payload = line.partition(b"] opensquilla.gateway.boot: ")
+                try:
+                    record = json.loads(payload if prefix else line)
+                except (ValueError, RecursionError):
+                    continue
+                if (
+                    not isinstance(record, dict)
+                    or record.get("event") != "gateway.startup_phase"
+                    or not isinstance(record.get("phase"), str)
+                    or record["phase"] not in _STARTUP_PHASES
+                    or record.get("status") != "ready"
+                ):
+                    continue
+                durations = {
+                    key: record.get(key) for key in ("duration_ms", "startup_elapsed_ms")
+                }
+                if any(type(value) is not int or not 0 <= value <= 3_600_000
+                       for value in durations.values()):
+                    continue
+                phases[record["phase"]] = {"status": "ready", **durations}
+        evidence = {
+            "elapsed_ms": min(3_600_000, max(0, int((time.monotonic() - started_at) * 1000))),
+            "exit_code": exit_code if type(exit_code) is int and -(2**31) <= exit_code < 2**32
+            else None,
+            "last_health_status": last_health_status
+            if type(last_health_status) is int and 100 <= last_health_status <= 599 else None,
+            "phases": phases,
+        }
+        return DriverConfigurationError(f"{reason}; startup={json.dumps(evidence, sort_keys=True)}")
 
     def stop(self, *, force: bool = False) -> None:
         proc = self.proc
@@ -999,7 +1081,7 @@ async def _manual_compaction(gateway: GatewayProcess, session_key: str) -> bool:
     await client.connect(gateway.ws_url)
     try:
         payload = await client.call(
-            "sessions.compact",
+            "sessions.contextCompact",
             {
                 "key": session_key,
                 "wait": True,
@@ -1694,21 +1776,22 @@ def _run_rpc_case(
     )
     counts["output_bytes"] = assistant_bytes
     counts["compactions"] = observation.compactions
+    if case.scenario == "fault_429_retry_after":
+        proxy_records = proxy.records if proxy is not None else ()
+        retry_wait_ms = 0.0
+        if (
+            len(proxy_records) >= 2
+            and proxy_records[0].scenario == FaultScenario.RATE_LIMITED.value
+        ):
+            retry_wait_ms = (
+                proxy_records[1].received_monotonic_ns - proxy_records[0].received_monotonic_ns
+            ) / 1_000_000
+        # This synthetic fault sends Retry-After: 8. Arrival timestamps prove
+        # the HTTP retry respected it, independently of UI activity labels.
+        metrics["retry_wait_ms"] = max(0.0, retry_wait_ms)
+        counts["retry_after_honored"] = int(retry_wait_ms >= 8_000)
     if case.scenario == "router":
         counts["router_decisions"] = asyncio.run(_router_decision_count(gateway, session_key))
-    if case.scenario == "fault_429_retry_after" and proxy is not None:
-        records_snapshot = proxy.records
-        if len(records_snapshot) >= 2:
-            retry_wait_ms = max(
-                0.0,
-                (
-                    records_snapshot[1].received_monotonic_ns
-                    - records_snapshot[0].received_monotonic_ns
-                )
-                / 1_000_000,
-            )
-            metrics["retry_wait_ms"] = retry_wait_ms
-            counts["retry_after_honored"] = int(retry_wait_ms >= 8_000)
     if case.scenario == "fallback":
         assert case.fallback_provider is not None
         counts["fallback_before_request"] = int(
@@ -1744,6 +1827,8 @@ def _run_rpc_case(
         and observation.text_chunks > 0
     )
     if not partial_terminal_is_expected and assistant_markers < 1:
+        passed = False
+    if case.scenario == "fault_429_retry_after" and not counts["retry_after_honored"]:
         passed = False
     if case.scenario == "tool_compaction" and observation.compactions < 1:
         passed = False

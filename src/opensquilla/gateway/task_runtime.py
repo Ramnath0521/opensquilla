@@ -61,14 +61,17 @@ from opensquilla.gateway.terminal_activity import (
 from opensquilla.safety.injection_guard import xml_escape
 from opensquilla.session.goals import (
     GOAL_OBJECTIVE_UPDATE_DETAIL_KEY,
+    GoalClaimCandidate,
     GoalObjectiveUpdate,
     effective_goal_turn_context,
 )
 from opensquilla.session.keys import canonicalize_session_key, normalize_agent_id, parse_agent_id
 from opensquilla.session.models import AgentTaskRecord, AgentTaskStatus, QueueMode
 from opensquilla.session.terminal_reply import (
+    append_error_ref,
     build_terminal_reply,
     is_context_payload_too_large,
+    safe_error_id,
     safe_provider_failure_code,
     safe_provider_failure_message,
     sanitize_agent_error,
@@ -78,6 +81,13 @@ if TYPE_CHECKING:
     from opensquilla.provider.types import ProviderRequestCorrelation
 
 log = structlog.get_logger(__name__)
+
+_TERMINAL_DETAIL_KEYS = frozenset({
+    "activity_snapshot", "applied_steer_evidence", "cancellation", "turn_outcome",
+    "terminal_assistant_message_content", "terminal_assistant_message_id",
+    "usage_call_index", "no_prior_provider_dispatch", "replay_safe", "retry_after_ms",
+    "subagent_group_outcome", "runtime_partial_failure_disclosure_required",
+})
 
 # ---------------------------------------------------------------------------
 # Core metrics — names are LOCKED. Do not rename without updating
@@ -155,16 +165,51 @@ async def _complete_terminal_settlement[T](awaitable: Coroutine[Any, Any, T]) ->
                 return task.result()
 
 
+def _task_session_owner_payload(envelope: RouteEnvelope) -> dict[str, Any]:
+    """Return the flat durable owner fields for an admitted task."""
+
+    payload: dict[str, Any] = {}
+    session_id = getattr(envelope, "session_id", None)
+    if isinstance(session_id, str) and session_id:
+        payload["session_id"] = session_id
+    session_epoch = getattr(envelope, "session_epoch", None)
+    if (
+        isinstance(session_epoch, int)
+        and not isinstance(session_epoch, bool)
+        and session_epoch >= 0
+    ):
+        payload["session_epoch"] = session_epoch
+    return payload
+
+
+def _validate_route_session_owner(envelope: RouteEnvelope) -> None:
+    """Reject malformed partial owners while retaining id-only legacy routes."""
+
+    session_id = getattr(envelope, "session_id", None)
+    if session_id is not None and (
+        not isinstance(session_id, str) or not session_id
+    ):
+        raise ValueError("session_id must be a non-empty string when present")
+    session_epoch = getattr(envelope, "session_epoch", None)
+    if session_epoch is None:
+        return
+    if (
+        not isinstance(session_id, str)
+        or not session_id
+        or not isinstance(session_epoch, int)
+        or isinstance(session_epoch, bool)
+        or session_epoch < 0
+    ):
+        raise ValueError("session_epoch requires a valid session_id and non-negative epoch")
+
+
 def _task_identity_payload(
     envelope: RouteEnvelope,
     task_id: str,
     *,
     user_message_id: str | None = None,
-) -> dict[str, str]:
-    payload = {"turn_id": task_id}
-    session_id = getattr(envelope, "session_id", None)
-    if isinstance(session_id, str) and session_id:
-        payload["session_id"] = session_id
+) -> dict[str, Any]:
+    payload = {"turn_id": task_id, **_task_session_owner_payload(envelope)}
     metadata = getattr(envelope, "metadata", None)
     if isinstance(metadata, dict):
         for field in ("client_message_id", "surface_id"):
@@ -174,6 +219,119 @@ def _task_identity_payload(
     if isinstance(user_message_id, str) and user_message_id:
         payload["user_message_id"] = user_message_id
     return payload
+
+
+def _task_event_identity_payload(
+    envelope: RouteEnvelope,
+    task_id: str,
+    *,
+    user_message_id: str | None = None,
+) -> dict[str, Any]:
+    """Project durable task identity onto the public event field names."""
+
+    payload = _task_identity_payload(
+        envelope,
+        task_id,
+        user_message_id=user_message_id,
+    )
+    session_epoch = payload.pop("session_epoch", None)
+    if session_epoch is not None:
+        payload["epoch"] = session_epoch
+    return payload
+
+
+def _durable_task_session_owner(
+    details: Mapping[str, Any],
+    *,
+    fallback_session_id: str | None = None,
+) -> tuple[str, int | None] | None:
+    """Read an admitted session owner without relabeling legacy records.
+
+    New task rows persist both fields. Older rows may carry only a session id,
+    or rely on their admitted transcript entry. Their missing epoch remains
+    unknown instead of being filled from the mutable current session.
+    """
+
+    has_session_id = "session_id" in details
+    has_session_epoch = "session_epoch" in details
+    if has_session_epoch and not has_session_id:
+        return None
+    session_id = details.get("session_id")
+    if has_session_id and (not isinstance(session_id, str) or not session_id):
+        return None
+    if not isinstance(session_id, str) or not session_id:
+        session_id = fallback_session_id
+    if not isinstance(session_id, str) or not session_id:
+        return None
+    if not has_session_epoch:
+        return session_id, None
+    session_epoch = details.get("session_epoch")
+    if (
+        not isinstance(session_epoch, int)
+        or isinstance(session_epoch, bool)
+        or session_epoch < 0
+    ):
+        return None
+    return session_id, session_epoch
+
+
+def _storage_owner_cas_kwargs(
+    operation: Any,
+    envelope: RouteEnvelope,
+) -> dict[str, Any]:
+    """Build compatible owner-CAS kwargs without downgrading modern owners."""
+
+    session_id = getattr(envelope, "session_id", None)
+    session_epoch = getattr(envelope, "session_epoch", None)
+    if session_epoch is None:
+        if not isinstance(session_id, str) or not session_id:
+            return {}
+        if _accepts_keyword_arg(operation, "expected_session_id"):
+            return {"expected_session_id": session_id}
+        return {}
+
+    supports_session_id = _accepts_explicit_keyword_arg(
+        operation,
+        "expected_session_id",
+    )
+    supports_session_epoch = _accepts_explicit_keyword_arg(
+        operation,
+        "expected_session_epoch",
+    )
+    if (
+        not isinstance(session_id, str)
+        or not session_id
+        or not supports_session_id
+        or not supports_session_epoch
+    ):
+        raise RuntimeError(
+            "Modern task ownership requires an exact session-owner storage CAS"
+        )
+    return {
+        "expected_session_id": session_id,
+        "expected_session_epoch": session_epoch,
+    }
+
+
+def _accepts_keyword_arg(callable_obj: Any, name: str) -> bool:
+    try:
+        params = inspect.signature(callable_obj).parameters
+    except (TypeError, ValueError):
+        return False
+    if name in params:
+        return True
+    return any(param.kind is inspect.Parameter.VAR_KEYWORD for param in params.values())
+
+
+def _accepts_explicit_keyword_arg(callable_obj: Any, name: str) -> bool:
+    try:
+        parameter = inspect.signature(callable_obj).parameters.get(name)
+    except (TypeError, ValueError):
+        return False
+    return parameter is not None and parameter.kind in {
+        inspect.Parameter.POSITIONAL_OR_KEYWORD,
+        inspect.Parameter.KEYWORD_ONLY,
+    }
 
 
 def _accepted_run_mode_payload(override: Any) -> dict[str, str] | None:
@@ -379,6 +537,7 @@ def _reusable_route_envelope(envelope: RouteEnvelope) -> RouteEnvelope:
     """Detach one route for reuse without execution-scoped freshness."""
 
     metadata = dict(envelope.metadata)
+    metadata.pop("selected_skills", None)
     if metadata.get("guest_safe") is True:
         for key in (
             "guest_profile_root",
@@ -389,12 +548,8 @@ def _reusable_route_envelope(envelope: RouteEnvelope) -> RouteEnvelope:
         ):
             metadata.pop(key, None)
     runtime_services = dict(envelope.runtime_services)
-    for key in (
-        "desktop_artifact_bridge",
-        "turn_authority_cleanup",
-        "turn_cleanup_callbacks",
-    ):
-        runtime_services.pop(key, None)
+    runtime_services.pop("suspend_compute_slot", None)
+    runtime_services.pop("update_progress", None)
     return replace(
         envelope,
         metadata=metadata,
@@ -559,15 +714,14 @@ class TaskRun:
         repr=False,
     )
     # Synchronous finalizer callback carrying the exact assistant transcript
-    # row and content produced by this turn. Channel tasks persist it for
-    # durable delivery after terminal commit; other run kinds leave it unset.
+    # row and content produced by this turn. Channel and cron tasks persist it
+    # for durable delivery after terminal commit; other run kinds leave it unset.
     assistant_message_sink: Callable[[str | None, str], None] | None = None
     input_mode: str = "user"
     persist_input: bool = False
     history_has_persisted_user: bool = True
     goal_context: Mapping[str, Any] | None = field(default=None, repr=False)
     # Internal-only sink for the runtime-owned document mutation receipt.
-    document_mutation_outcome_sink: Callable[[dict[str, Any]], None] | None = None
 
     @property
     def session_key(self) -> str:
@@ -576,6 +730,18 @@ class TaskRun:
     @property
     def agent_id(self) -> str:
         return self.envelope.agent_id
+
+    @property
+    def session_id(self) -> str | None:
+        value = getattr(self.envelope, "session_id", None)
+        return value if isinstance(value, str) and value else None
+
+    @property
+    def session_epoch(self) -> int | None:
+        value = getattr(self.envelope, "session_epoch", None)
+        if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
+            return value
+        return None
 
     @property
     def input_provenance(self) -> dict[str, Any]:
@@ -595,6 +761,12 @@ class SubagentCompletionEvent:
     parent_task_id: str | None = None
     error_class: str | None = None
     error_message: str | None = None
+    # Immutable child and parent incarnations captured at durable admission.
+    # Optional fields retain ownerless and id-only event compatibility.
+    child_session_id: str | None = None
+    child_session_epoch: int | None = None
+    parent_session_id: str | None = None
+    parent_session_epoch: int | None = None
 
     def to_payload(self) -> dict[str, Any]:
         payload: dict[str, Any] = {
@@ -639,6 +811,8 @@ class _RuntimeTask:
     queue_mode: str
     run_kind: str
     no_memory_capture: bool
+    record_snapshot: AgentTaskRecord | None = field(default=None, repr=False)
+    terminal_details_loaded: bool = False
     input_mode: str = "user"
     persist_input: bool = False
     history_has_persisted_user: bool = True
@@ -658,8 +832,6 @@ class _RuntimeTask:
     fresh_user_session: bool = False
     terminal_assistant_message_id: str | None = None
     terminal_assistant_message_content: str | None = None
-    document_mutation_outcome: dict[str, Any] | None = None
-    turn_authority_cleanup: Any | None = field(default=None, repr=False)
     stream_event_sink: TaskStreamEventSink | None = None
     finalizer_completed: bool = False
     accepted_config: Any | None = None
@@ -726,8 +898,6 @@ class _RuntimeTask:
         self.terminal_assistant_message_id = message_id
         self.terminal_assistant_message_content = content
 
-    def capture_document_mutation_outcome(self, outcome: dict[str, Any]) -> None:
-        self.document_mutation_outcome = dict(outcome)
 
     def capture_finalizer_receipt(self) -> None:
         self.finalizer_completed = True
@@ -801,28 +971,13 @@ def _cleanup_guest_profile(task: _RuntimeTask) -> None:
     )
 
 
-async def _cleanup_turn_authority(task: _RuntimeTask) -> None:
-    """Release one task's process-local turn authority exactly once."""
-
-    authority = task.turn_authority_cleanup
-    if authority is None:
-        return
-    try:
-        await authority.aclose()
-    except asyncio.CancelledError:
-        raise
-    except Exception:  # noqa: BLE001 - terminal cleanup must continue
-        log.warning(
-            "task_runtime.turn_authority_cleanup_failed",
-            task_id=task.task_id,
-            session_key=task.envelope.session_key,
-            exc_info=True,
-        )
 
 
 @dataclass(frozen=True)
 class _SteeredInput:
     text: str
+    # Internal notices may be consumed by this turn without creating another.
+    allow_followup: bool = True
     semantic_message: str | None = None
     persisted_user_message_id: str | None = None
     client_request_id: str | None = None
@@ -1306,6 +1461,9 @@ class TaskRuntime:
         self._closing = False
         self._shutdown_task: asyncio.Task[TaskRuntimeShutdownResult] | None = None
         self._terminal_fallback_records: dict[str, AgentTaskRecord] = {}
+        self._terminal_pending_updates: dict[str, dict[str, Any]] = {}
+        self._terminal_retry_task: asyncio.Task[None] | None = None
+        self._recent_terminal_records: deque[AgentTaskRecord] = deque(maxlen=128)
         self._pending_by_session: dict[str, list[_RuntimeTask]] = {}
         self._running_by_session: dict[str, _RuntimeTask] = {}
         self._reservations_by_session: dict[str, list[TaskReservation]] = {}
@@ -1317,6 +1475,10 @@ class TaskRuntime:
         self._reserved_overflow_victims: set[str] = set()
         self._last_envelope_by_session: dict[str, RouteEnvelope] = {}
         self._last_envelope_task_id_by_session: dict[str, str] = {}
+        # Process completion deduplication is intentionally in-memory. Notices
+        # are owner-routed control input; durable process recovery is out of
+        # scope for the managed execution API.
+        self._process_completion_seen: dict[tuple[str, str], None] = {}
         self._state_lock = asyncio.Lock()
         # Admission is per session so durable RPC ingress crosses reserve,
         # commit, and activation in order. This prevents resets from overtaking
@@ -1421,6 +1583,12 @@ class TaskRuntime:
                     ]
                     if entry.message_id not in persisted_ids:
                         persisted_ids.insert(0, entry.message_id)
+                    owner = _durable_task_session_owner(
+                        details,
+                        fallback_session_id=entry.session_id,
+                    )
+                    if owner is None or owner[0] != entry.session_id:
+                        raise ValueError("invalid durable MetaSkill session owner")
                     envelope = RouteEnvelope(
                         source_kind=SourceKind(task.source_kind),
                         source_name=(
@@ -1430,40 +1598,50 @@ class TaskRuntime:
                         ),
                         agent_id=task.agent_id,
                         session_key=task.session_key,
-                        session_id=entry.session_id,
+                        session_id=owner[0],
                         input_provenance=(
                             dict(input_provenance)
                             if isinstance(input_provenance, dict)
                             else {}
                         ),
                         metadata=dict(metadata),
+                        session_epoch=owner[1],
                     )
                     from opensquilla.engine.start_turn import reserve_turn_via_runtime
 
-                    reservation = await reserve_turn_via_runtime(
-                        self,
-                        envelope,
-                        message,
-                        attachments=[],
-                        mode="followup",
-                        run_kind=task.run_kind,
-                        no_memory_capture=bool(details.get("no_memory_capture", False)),
-                        semantic_message=semantic_message,
-                        persisted_user_message_id=entry.message_id,
-                        fresh_user_session=bool(details.get("fresh_user_session", False)),
-                        turn_id=task.task_id,
-                        bypass_pending_limit=True,
-                    )
-                    await self._restore_durable_accepted_model_routing(
-                        reservation,
-                        task,
-                    )
-                    await self.activate(
-                        reservation,
-                        persisted_user_message_id=entry.message_id,
-                        persisted_user_message_ids=persisted_ids,
-                        fresh_user_session=bool(details.get("fresh_user_session", False)),
-                    )
+                    async with self.collect_admission(envelope.session_key):
+                        if not await self._recovered_route_owner_is_current(envelope):
+                            raise ValueError("durable MetaSkill session owner is stale")
+                        reservation = await reserve_turn_via_runtime(
+                            self,
+                            envelope,
+                            message,
+                            attachments=[],
+                            mode="followup",
+                            run_kind=task.run_kind,
+                            no_memory_capture=bool(
+                                details.get("no_memory_capture", False)
+                            ),
+                            semantic_message=semantic_message,
+                            persisted_user_message_id=entry.message_id,
+                            fresh_user_session=bool(
+                                details.get("fresh_user_session", False)
+                            ),
+                            turn_id=task.task_id,
+                            bypass_pending_limit=True,
+                        )
+                        await self._restore_durable_accepted_model_routing(
+                            reservation,
+                            task,
+                        )
+                        await self.activate(
+                            reservation,
+                            persisted_user_message_id=entry.message_id,
+                            persisted_user_message_ids=persisted_ids,
+                            fresh_user_session=bool(
+                                details.get("fresh_user_session", False)
+                            ),
+                        )
                     recovered += 1
                 except Exception as exc:  # noqa: BLE001 - preserve accepted work.
                     batch_failed = True
@@ -1521,6 +1699,7 @@ class TaskRuntime:
             agent_id=normalize_agent_id(envelope.agent_id),
             session_key=canonicalize_session_key(envelope.session_key),
         )
+        _validate_route_session_owner(envelope)
         queue_mode = mode or QueueMode.FOLLOWUP.value
         if not self.supports_queue_mode(queue_mode):
             valid = ", ".join(sorted(self.supported_queue_modes))
@@ -1767,6 +1946,9 @@ class TaskRuntime:
     async def quiesce_sessions(
         self,
         session_keys: Iterable[str],
+        *,
+        cancel_source: str = "workspace_history_delete",
+        cancel_reason: str = "project_history_deleted",
     ) -> AsyncIterator[None]:
         """Fence runtime work for a stable, ordered set of sessions.
 
@@ -1795,7 +1977,12 @@ class TaskRuntime:
             await asyncio.gather(
                 *(self.cancel_auxiliary(key) for key in keys),
             )
-            await self._cancel_and_drain_session_drivers(keys, key_set)
+            await self._cancel_and_drain_session_drivers(
+                keys,
+                key_set,
+                cancel_source=cancel_source,
+                cancel_reason=cancel_reason,
+            )
 
             async with contextlib.AsyncExitStack() as fences:
                 for session_key in keys:
@@ -1807,6 +1994,8 @@ class TaskRuntime:
                         execution_lock,
                         keys,
                         key_set,
+                        cancel_source=cancel_source,
+                        cancel_reason=cancel_reason,
                     )
                     fences.callback(execution_lock.release)
                 for session_key in keys:
@@ -1840,6 +2029,9 @@ class TaskRuntime:
         execution_lock: asyncio.Lock,
         keys: Sequence[str],
         key_set: frozenset[str],
+        *,
+        cancel_source: str = "workspace_history_delete",
+        cancel_reason: str = "project_history_deleted",
     ) -> None:
         """Acquire one execution fence without waiting behind an uncancelled driver."""
 
@@ -1852,7 +2044,12 @@ class TaskRuntime:
                 # this one, so concurrent quiescers cannot erase each other's
                 # wake-up by clearing shared state.
                 driver_state_changed = self._driver_state_changed
-                await self._cancel_and_drain_session_drivers(keys, key_set)
+                await self._cancel_and_drain_session_drivers(
+                    keys,
+                    key_set,
+                    cancel_source=cancel_source,
+                    cancel_reason=cancel_reason,
+                )
                 if acquiring.done():
                     break
                 if driver_state_changed.is_set():
@@ -1900,6 +2097,9 @@ class TaskRuntime:
         self,
         keys: Sequence[str],
         key_set: frozenset[str],
+        *,
+        cancel_source: str = "workspace_history_delete",
+        cancel_reason: str = "project_history_deleted",
     ) -> None:
         async with self._state_lock:
             runtime_tasks = [
@@ -1921,8 +2121,8 @@ class TaskRuntime:
         if runtime_tasks:
             await self._cancel_runtime_tasks(
                 runtime_tasks,
-                source="workspace_history_delete",
-                reason="project_history_deleted",
+                source=cancel_source,
+                reason=cancel_reason,
             )
         if drivers:
             await asyncio.gather(*drivers, return_exceptions=True)
@@ -1942,6 +2142,44 @@ class TaskRuntime:
         if not drivers:
             self._driver_tasks_by_session.pop(session_key, None)
         self._signal_driver_state_changed()
+
+    async def _completion_goal_candidate(
+        self, envelope: RouteEnvelope, run_kind: str
+    ) -> Mapping[str, Any] | None:
+        """Carry only a completed child's durable parent Goal into normal claim CAS."""
+        provenance = envelope.input_provenance
+        if (
+            run_kind != "runtime_send"
+            or not isinstance(provenance, Mapping)
+            or provenance.get("kind") != "internal_system"
+            or provenance.get("source_tool") != "subagent_completion"
+        ):
+            return None
+        parent_task_id = provenance.get("parent_task_id")
+        if not isinstance(parent_task_id, str) or not parent_task_id:
+            return None
+        parent = await self._storage.get_agent_task(parent_task_id)
+        if parent is None or parent.session_key != envelope.session_key:
+            return None
+        details = parent.details or {}
+        context = effective_goal_turn_context(details)
+        if (
+            context is None
+            or context.task_id != parent_task_id
+            or context.session_id != envelope.session_id
+            or context.epoch != envelope.session_epoch
+            or details.get("session_id") != context.session_id
+            or details.get("session_epoch") != context.epoch
+        ):
+            return None
+        # A later Goal in the same session must never inherit this old group's
+        # authority. The existing activation claim checks this frozen identity
+        # against the live Goal and keeps paused/complete/replaced Goals closed.
+        return GoalClaimCandidate(
+            session_id=context.session_id,
+            epoch=context.epoch,
+            goal_id=context.goal_id,
+        ).as_task_detail()
 
     async def _reserve_persist_and_activate(
         self,
@@ -1967,42 +2205,47 @@ class TaskRuntime:
     ) -> TaskHandle:
         """Persist and activate one direct enqueue without cancellation drift."""
 
-        turn_authority_cleanup = envelope.runtime_services.get(
-            "turn_authority_cleanup"
+        goal_candidate = await self._completion_goal_candidate(envelope, run_kind)
+        reservation = await self.reserve(
+            envelope,
+            message,
+            attachments=attachments,
+            mode=mode,
+            run_kind=run_kind,
+            no_memory_capture=no_memory_capture,
+            ingress_pipeline_steps=ingress_pipeline_steps,
+            semantic_message=semantic_message,
+            persisted_user_message_id=persisted_user_message_id,
+            persisted_user_message_ids=persisted_user_message_ids,
+            message_count=message_count,
+            fresh_user_session=fresh_user_session,
+            stream_event_sink=stream_event_sink,
+            accepted_run_mode_override=accepted_run_mode_override,
+            task_id=task_id,
+            provider_request_correlation=provider_request_correlation,
+            update_envelope_cache=update_envelope_cache,
+            overflow_policy=overflow_policy,
+            goal_candidate=goal_candidate,
         )
         try:
-            reservation = await self.reserve(
-                envelope,
-                message,
-                attachments=attachments,
-                mode=mode,
-                run_kind=run_kind,
-                no_memory_capture=no_memory_capture,
-                ingress_pipeline_steps=ingress_pipeline_steps,
-                semantic_message=semantic_message,
-                persisted_user_message_id=persisted_user_message_id,
-                persisted_user_message_ids=persisted_user_message_ids,
-                message_count=message_count,
-                fresh_user_session=fresh_user_session,
-                stream_event_sink=stream_event_sink,
-                accepted_run_mode_override=accepted_run_mode_override,
-                task_id=task_id,
-                provider_request_correlation=provider_request_correlation,
-                turn_authority_cleanup=turn_authority_cleanup,
-                update_envelope_cache=update_envelope_cache,
-                overflow_policy=overflow_policy,
-            )
-        except BaseException:
-            # Queue rejection and shutdown can happen before a reservation
-            # exists. Runtime admission still owns releasing any one-turn
-            # Desktop authority supplied to this enqueue operation.
-            if turn_authority_cleanup is not None:
-                await turn_authority_cleanup.aclose()
-            raise
-        try:
-            if self._accepted_config_provider is not None:
+            if (
+                self._accepted_config_provider is not None
+                or str(reservation.runtime_task.envelope.source_kind) == "subagent"
+                or goal_candidate is not None
+            ):
                 await self.freeze_acceptance(reservation)
-            await self._storage.create_agent_task(reservation.task_record)
+            # ``enqueue`` holds the per-session admission gate across this
+            # owner CAS, task commit, and activation. Reset takes the same
+            # gate, so either the old task becomes visible for drain or this
+            # transaction observes the replacement owner and rejects it.
+            create_agent_task = self._storage.create_agent_task
+            await create_agent_task(
+                reservation.task_record,
+                **_storage_owner_cas_kwargs(
+                    create_agent_task,
+                    reservation.runtime_task.envelope,
+                ),
+            )
         except asyncio.CancelledError:
             # The shared storage layer may finish COMMIT after its caller is
             # cancelled. Settle the operation, read back by task_id, and cross
@@ -2085,7 +2328,7 @@ class TaskRuntime:
         *,
         task_id: str | None = None,
         provider_request_correlation: ProviderRequestCorrelation | None = None,
-        turn_authority_cleanup: Any | None = None,
+
         update_envelope_cache: bool = True,
         overflow_policy: PendingOverflowPolicy | str | None = None,
         bypass_pending_limit: bool = False,
@@ -2098,6 +2341,7 @@ class TaskRuntime:
             agent_id=normalize_agent_id(envelope.agent_id),
             session_key=canonicalize_session_key(envelope.session_key),
         )
+        _validate_route_session_owner(envelope)
         queue_mode = mode or "followup"
         normalized_message_ids = _ordered_message_ids(
             persisted_user_message_id,
@@ -2168,6 +2412,7 @@ class TaskRuntime:
             record.details["accepted_run_mode"] = accepted_run_mode_payload
         runtime_task = _RuntimeTask(
             task_id=record.task_id,
+            record_snapshot=record.model_copy(deep=True),
             envelope=envelope,
             message=message,
             attachments=list(attachments or []),
@@ -2185,11 +2430,7 @@ class TaskRuntime:
             persisted_user_message_ids=normalized_message_ids,
             message_count=message_count,
             fresh_user_session=fresh_user_session,
-            turn_authority_cleanup=(
-                turn_authority_cleanup
-                if turn_authority_cleanup is not None
-                else envelope.runtime_services.get("turn_authority_cleanup")
-            ),
+
             stream_event_sink=stream_event_sink,
             accepted_run_mode_override=accepted_run_mode_override,
             provider_request_correlation=provider_request_correlation,
@@ -2310,9 +2551,6 @@ class TaskRuntime:
                 reservation
             )
             self._signal_driver_state_changed()
-        authority = runtime_task.turn_authority_cleanup
-        if authority is not None:
-            authority.handoff()
         try:
             runtime_task.envelope = _materialize_guest_task_envelope(
                 runtime_task.envelope,
@@ -2344,7 +2582,6 @@ class TaskRuntime:
                 )
             reservation.aborted = True
             self._signal_driver_state_changed()
-        await _cleanup_turn_authority(reservation.runtime_task)
         _cleanup_guest_profile(reservation.runtime_task)
 
     async def _emit_queued_activation(
@@ -2367,7 +2604,7 @@ class TaskRuntime:
                 "session_key": envelope.session_key,
                 "queue_depth": queue_depth,
                 "queue_position": queue_position,
-                **_task_identity_payload(
+                **_task_event_identity_payload(
                     envelope,
                     task_id,
                     user_message_id=user_message_id,
@@ -2381,6 +2618,8 @@ class TaskRuntime:
                 task_id=task_id,
                 task_status=AgentTaskStatus.QUEUED,
                 run_kind=run_kind,
+                session_id=envelope.session_id,
+                session_epoch=envelope.session_epoch,
             )
         )
 
@@ -2425,6 +2664,31 @@ class TaskRuntime:
         accepted_config: Any = _USE_ACCEPTED_CONFIG_PROVIDER,
     ) -> None:
         """Capture once, optionally backfilling callers that already committed."""
+
+        task = reservation.runtime_task
+        metadata = dict(task.envelope.metadata)
+        parent_task_id = metadata.get("parent_task_id")
+        if str(task.envelope.source_kind) == "subagent" and isinstance(parent_task_id, str):
+            parent = await self._storage.get_agent_task(parent_task_id)
+            if parent is None:
+                raise ValueError("Subagent usage attribution requires its durable parent task")
+            parent_details = parent.details or {}
+            if (
+                metadata.get("parent_session_key") != parent.session_key
+                or metadata.get("parent_session_id") != parent_details.get("session_id")
+                or metadata.get("parent_session_epoch") != parent_details.get("session_epoch")
+            ):
+                raise ValueError("Subagent parent generation changed before admission")
+            parent_metadata = parent_details.get("metadata") or {}
+            metadata["usage_root_turn_id"] = (
+                parent_metadata.get("usage_root_turn_id") or parent_task_id
+            )
+        else:
+            metadata["usage_root_turn_id"] = task.task_id
+        task.envelope = replace(task.envelope, metadata=metadata)
+        details = dict(reservation.task_record.details or {})
+        details["metadata"] = metadata
+        reservation.task_record.details = details
 
         await self.validate_acceptance(
             reservation.runtime_task.envelope,
@@ -2928,6 +3192,14 @@ class TaskRuntime:
             running_task_id=running_task_id,
             queued_task_ids=queued_task_ids,
             cancel_requested_task_ids=cancel_requested_task_ids,
+            terminal_tasks=tuple(
+                record.model_copy(deep=True)
+                for record in (
+                    *self._recent_terminal_records,
+                    *self._terminal_fallback_records.values(),
+                )
+                if record.session_key == key and record.task_id != excluding_task_id
+            ),
         )
 
     @staticmethod
@@ -3102,6 +3374,39 @@ class TaskRuntime:
                 persisted=persisted,
                 capability=capability,
             )
+
+    async def adopt_created_goal(
+        self,
+        session_key: str,
+        task_id: str,
+        *,
+        persist: Callable[[RouteEnvelope], Awaitable[dict[str, Any]]],
+    ) -> dict[str, Any]:
+        """Attach Goal control to an admitted turn under its existing steer gate."""
+        from opensquilla.session.goals import GoalConflictError
+
+        key = canonicalize_session_key(session_key)
+        async with self._state_lock:
+            task = self._running_by_session.get(key)
+        if task is None or task.task_id != task_id:
+            raise GoalConflictError("STALE_GOAL", "The creating task is no longer running")
+        async with task.steer_claim:
+            async with self._state_lock:
+                if (
+                    self._running_by_session.get(key) is not task
+                    or task.terminal_closing
+                    or task.cancel_requested
+                    or task.status is not AgentTaskStatus.RUNNING
+                ):
+                    raise GoalConflictError("STALE_GOAL", "The creating task is closing")
+            result = await persist(task.envelope)
+            context = result["context"]
+            task.goal_context = dict(context)
+            task.goal_candidate = None
+            services = dict(task.envelope.runtime_services)
+            services["goal_context"] = dict(context)
+            task.envelope = replace(task.envelope, runtime_services=services)
+            return result
 
     async def apply_goal_objective_edit(
         self,
@@ -3486,6 +3791,68 @@ class TaskRuntime:
             update_envelope_cache=False,
         )
 
+    async def _deliver_process_completion(
+        self, task: _RuntimeTask, payload: dict[str, Any],
+    ) -> None:
+        """Deliver once to the originating active turn, without starting another."""
+        from opensquilla.tools.builtin.shell import is_background_process_completion_consumed
+
+        envelope = task.envelope
+        execution_id = str(payload["execution_id"])
+        key = (envelope.session_key, execution_id)
+
+        def consumed() -> bool:
+            return payload.get("completion_consumed") is True or (
+                is_background_process_completion_consumed(
+                    execution_id, session_key=envelope.session_key, task_id=task.task_id,
+                )
+            )
+
+        def accepted() -> None:
+            self._process_completion_seen[key] = None
+            if len(self._process_completion_seen) > 4096:
+                self._process_completion_seen.pop(next(iter(self._process_completion_seen)))
+
+        async with self.collect_admission(envelope.session_key):
+            if (
+                self._closing
+                or task.cancel_requested
+                or task.terminal_closing
+                or task.status is not AgentTaskStatus.RUNNING
+                or key in self._process_completion_seen
+            ):
+                return
+            if consumed():
+                return
+            if not await self._recovered_route_owner_is_current(envelope):
+                return
+            status = str(payload.get("status") or "done")
+            notice = (
+                "[Managed process completed]\n"
+                f"execution_id={execution_id} status={status} "
+                f"returncode={payload.get('returncode')}"
+            )
+            tail = str(payload.get("output_tail") or payload.get("output") or "")[-2000:]
+            if tail:
+                notice += f"\noutput_tail:\n{tail}"
+            async with self._state_lock:
+                running = self._running_by_session.get(envelope.session_key)
+                if (
+                    self._closing
+                    or running is not task
+                    or task.status is not AgentTaskStatus.RUNNING
+                    or task.terminal_closing
+                    or task.cancel_requested
+                    or consumed()
+                ):
+                    return
+                # No await between the terminal guard and append: terminal
+                # settlement claims this same lock before draining steers.
+                task.pending_input_provider.append(
+                    _SteeredInput(text=notice, allow_followup=False),
+                )
+                accepted()
+
     async def wait(self, task_id: str, timeout: float | None = None) -> AgentTaskRecord:
         runtime_task = self._tasks.get(task_id)
         if runtime_task is None:
@@ -3691,6 +4058,8 @@ class TaskRuntime:
                 auxiliaries = {
                     task for task in self._auxiliary_tasks_by_session.values()
                 }
+                if self._terminal_retry_task is not None and not self._terminal_retry_task.done():
+                    auxiliaries.add(self._terminal_retry_task)
             if not drivers and reservations == 0 and not auxiliaries:
                 return True
 
@@ -3724,6 +4093,8 @@ class TaskRuntime:
                 len(items) for items in self._reservations_by_session.values()
             )
             auxiliaries = len(self._auxiliary_tasks_by_session)
+            if self._terminal_pending_updates:
+                auxiliaries += 1
         return drivers, reservations, auxiliaries
 
     async def _shutdown_result(
@@ -3732,6 +4103,15 @@ class TaskRuntime:
         abandoned_task_count: int,
     ) -> TaskRuntimeShutdownResult:
         drivers, reservations, auxiliaries = await self._shutdown_counts()
+        retry_task = self._terminal_retry_task
+        if retry_task is not None and not retry_task.done():
+            retry_task.cancel()
+            await asyncio.gather(retry_task, return_exceptions=True)
+        if self._terminal_pending_updates:
+            log.warning(
+                "task_runtime.terminal_persistence_unresolved_at_shutdown",
+                task_count=len(self._terminal_pending_updates),
+            )
         return TaskRuntimeShutdownResult(
             clean=drivers == 0 and reservations == 0 and auxiliaries == 0,
             elapsed_ms=max(0, int((time.monotonic() - started) * 1000)),
@@ -4000,6 +4380,7 @@ class TaskRuntime:
             agent_id=normalize_agent_id(envelope.agent_id),
             session_key=canonicalize_session_key(envelope.session_key),
         )
+        _validate_route_session_owner(envelope)
         async with self._state_lock:
             pending = self._pending_by_session.get(envelope.session_key, [])
             candidate = next(
@@ -4025,6 +4406,36 @@ class TaskRuntime:
                     or candidate.status != AgentTaskStatus.QUEUED
                 ):
                     return None
+                candidate_session_id = getattr(candidate.envelope, "session_id", None)
+                incoming_session_id = getattr(envelope, "session_id", None)
+                if candidate_session_id != incoming_session_id:
+                    return None
+                candidate_session_epoch = getattr(
+                    candidate.envelope,
+                    "session_epoch",
+                    None,
+                )
+                incoming_session_epoch = getattr(envelope, "session_epoch", None)
+                collected_owner_envelope = candidate.envelope
+                if candidate_session_epoch != incoming_session_epoch:
+                    if (
+                        candidate_session_epoch is None
+                        and isinstance(candidate_session_id, str)
+                        and candidate_session_id
+                        and isinstance(incoming_session_epoch, int)
+                        and not isinstance(incoming_session_epoch, bool)
+                        and incoming_session_epoch >= 0
+                    ):
+                        # The candidate is an id-bound legacy task. The collect
+                        # persistence transaction below proves that the incoming
+                        # owner is still current; update memory only after that
+                        # commit succeeds.
+                        collected_owner_envelope = replace(
+                            candidate.envelope,
+                            session_epoch=incoming_session_epoch,
+                        )
+                    else:
+                        return None
                 if (
                     candidate.accepted_run_mode_override
                     != accepted_run_mode_override
@@ -4098,6 +4509,7 @@ class TaskRuntime:
                     ),
                     "persisted_user_message_ids": collected_message_ids,
                     "fresh_user_session": candidate.fresh_user_session,
+                    **_task_session_owner_payload(collected_owner_envelope),
                 }
                 handle = TaskHandle(
                     task_id=candidate.task_id,
@@ -4142,6 +4554,7 @@ class TaskRuntime:
                             if accepted_goal_candidate is not None
                             else None
                         )
+                    candidate.envelope = collected_owner_envelope
                     candidate.no_memory_capture = collected_no_memory_capture
                     candidate.message = collected_message
                     candidate.attachments.extend(list(attachments or []))
@@ -4283,12 +4696,10 @@ class TaskRuntime:
                         provider_request_correlation=task.provider_request_correlation,
                         assistant_message_sink=(
                             task.capture_terminal_assistant_message
-                            if task.run_kind == "channel_turn"
+                            if task.run_kind in {"channel_turn", "cron_turn"}
                             else None
                         ),
-                        document_mutation_outcome_sink=(
-                            task.capture_document_mutation_outcome
-                        ),
+
                     )
                     from opensquilla.session.turn_context import turn_context_scope
 
@@ -4424,6 +4835,7 @@ class TaskRuntime:
                 error_class=str(getattr(exc, "code", None) or type(exc).__name__),
                 error_message=str(exc),
                 failure_kind=failure_kind,
+                error_id=safe_error_id(getattr(exc, "error_id", None)),
                 retry_after_ms=safe_retry_after_ms(getattr(exc, "retry_after_ms", None)),
                 activity_snapshot=getattr(exc, "activity_snapshot", None),
                 usage_call_index=getattr(exc, "usage_call_index", None),
@@ -4435,8 +4847,6 @@ class TaskRuntime:
             )
         finally:
             self._user_input_broker.cancel_task(task.task_id)
-            await self._settle_attached_plan_run(task)
-            await _cleanup_turn_authority(task)
             _cleanup_guest_profile(task)
 
     async def _freeze_collaboration_context(self, task: _RuntimeTask) -> None:
@@ -4486,16 +4896,95 @@ class TaskRuntime:
                 raise RuntimeError("Invalid required collaboration revision")
             metadata["collaboration_revision"] = required_revision
         metadata["task_id"] = task.task_id
+        async def update_progress(
+            steps: list[dict[str, Any]], explanation: str | None = None,
+        ) -> dict[str, Any]:
+            progress = await self._storage.update_task_progress(
+                task.task_id, session_key=task.envelope.session_key,
+                session_id=task.envelope.session_id,
+                session_epoch=task.envelope.session_epoch,
+                steps=steps, explanation=explanation,
+            )
+            task.envelope.metadata["progress"] = progress
+            try:
+                await self._emit(task.envelope.session_key, "session.event.progress", {
+                    "session_key": task.envelope.session_key,
+                    "sessionKey": task.envelope.session_key,
+                    "epoch": task.envelope.session_epoch,
+                    "task_id": task.task_id, "progress": progress,
+                })
+                run_id = str(task.envelope.metadata.get("plan_run_id") or "")
+                if run_id:
+                    run = await self._storage.get_plan_run(run_id)
+                    if run is not None:
+                        await self._emit_plan_run(task.envelope.session_key, run)
+                if self._goal_service is not None and task.goal_context:
+                    await self._goal_service.progress_updated(
+                        task.goal_context, session_key=task.envelope.session_key,
+                    )
+            except Exception:
+                log.warning("task_runtime.progress_projection_failed", task_id=task.task_id)
+            return cast(dict[str, Any], progress)
+
+        async def emit_process_event(event: dict[str, Any]) -> None:
+            payload = dict(event)
+            execution_id = str(payload.get("execution_id") or payload.get("session_id") or "")
+            # The shell's legacy session_id aliases execution_id. Gateway
+            # projections must carry the actual admitted session generation.
+            payload.update(
+                session_key=task.envelope.session_key,
+                session_id=task.envelope.session_id,
+                session_epoch=task.envelope.session_epoch,
+                epoch=task.envelope.session_epoch,
+                task_id=task.task_id,
+                execution_id=execution_id,
+            )
+            try:
+                await self._emit(
+                    task.envelope.session_key,
+                    "session.event.process_completed",
+                    payload,
+                )
+            except Exception:
+                log.warning("task_runtime.process_completion_projection_failed", exc_info=True)
+            if payload.get("notify_on_exit") is not True or not execution_id:
+                return
+            # The shell finalizer calls once. Retry transient admission failures
+            # here, without keeping a separate producer or durable queue alive.
+            for attempt in range(3):
+                try:
+                    await self._deliver_process_completion(task, payload)
+                    return
+                except Exception:
+                    log.warning(
+                        "task_runtime.process_completion_delivery_failed",
+                        session_key=task.envelope.session_key,
+                        execution_id=execution_id,
+                        attempt=attempt + 1,
+                        exc_info=True,
+                    )
+                    if attempt < 2:
+                        await asyncio.sleep(0.05 * (2 ** attempt))
+
         runtime_services = {
             **task.envelope.runtime_services,
+            "update_progress": update_progress,
             "plan_storage": self._storage,
+            "goal_service": self._goal_service,
             "plan_event_emitter": self._emit,
+            "process_event_emitter": emit_process_event,
+            "suspend_compute_slot": lambda: self._suspend_compute_slot(task),
         }
-        # WebChat has a request-id response RPC and reconnect hydration. Other
-        # interactive surfaces retain the terminating compatibility protocol
-        # until they expose the same reply transport; injecting a waiter there
-        # would strand the turn behind its own session execution lock.
-        if task.envelope.source_kind is SourceKind.WEB:
+        # WebChat and the gateway CLI resolve request IDs outside the session
+        # execution lane and hydrate pending questions on reconnect. Keep the
+        # task alive while waiting, so Goal cannot mistake a question for an
+        # idle turn and start a continuation before the user answers.
+        # Other surfaces retain the terminating compatibility protocol until
+        # they expose that reply transport.
+        if task.envelope.source_kind is SourceKind.WEB or (
+            task.envelope.source_kind is SourceKind.CLI
+            and metadata.get("structured_user_input") is True
+        ):
             runtime_services["user_input_provider"] = self._user_input_broker
         attached_run_id = str(metadata.get("plan_run_id") or "").strip()
         if attached_run_id and not str(
@@ -4631,7 +5120,7 @@ class TaskRuntime:
         return updated
 
     async def _settle_attached_plan_run(self, task: _RuntimeTask) -> None:
-        """Pause an unfinished manual run when its single turn terminates."""
+        """Project the ordinary task outcome onto its attached plan run."""
 
         run_id = str(task.envelope.metadata.get("plan_run_id") or "").strip()
         if not run_id:
@@ -4656,20 +5145,8 @@ class TaskRuntime:
                 )
             elif status == "running" and callable(pause):
                 driver_kind = str(getattr(current, "driver_kind", "manual"))
-                step_states = list(getattr(current, "step_states", []) or [])
-                delivery_ready = (
-                    getattr(current, "current_step_id", None) is None
-                    and bool(step_states)
-                    and all(
-                        isinstance(state, dict)
-                        and str(state.get("status") or "")
-                        in {"completed", "skipped"}
-                        for state in step_states
-                    )
-                )
                 if (
                     task.status == AgentTaskStatus.SUCCEEDED
-                    and delivery_ready
                     and callable(complete)
                 ):
                     updated = await complete(
@@ -4725,40 +5202,43 @@ class TaskRuntime:
         )
 
     async def _emit_plan_revision_if_changed(self, task: _RuntimeTask) -> None:
+        # A normal successful answer in Plan mode may be discussion. Persist
+        # that distinction without making submit_plan a completion gate.
+        task.envelope.metadata.pop("plan_result", None)
+        if (
+            task.run_kind == "subagent"
+            or task.envelope.metadata.get("collaboration_mode") != "plan"
+        ):
+            return
         getter = getattr(self._storage, "get_session", None)
         get_revision = getattr(self._storage, "get_plan_revision", None)
         if not callable(getter) or not callable(get_revision):
             return
         try:
             node_candidate = getter(task.envelope.session_key)
-            node = (
-                await node_candidate
-                if inspect.isawaitable(node_candidate)
-                else node_candidate
-            )
-            if getattr(node, "active_plan_revision_id", None) is not None and not isinstance(
-                getattr(node, "active_plan_revision_id", None),
-                str,
-            ):
+            node = await node_candidate if inspect.isawaitable(node_candidate) else node_candidate
+            current_id = getattr(node, "active_plan_revision_id", None)
+            if current_id is not None and not isinstance(current_id, str):
                 return
-            current_id = (
-                str(getattr(node, "active_plan_revision_id", "") or "")
-                if node is not None
-                else ""
+            starting_id = str(task.envelope.metadata.get("active_plan_revision_id") or "")
+            revision = None
+            if current_id and current_id != starting_id:
+                candidate = get_revision(current_id)
+                revision = await candidate if inspect.isawaitable(candidate) else candidate
+            submitted = (
+                revision is not None
+                and revision.source_turn_id == task.task_id
+                and revision.source_session_id == getattr(node, "session_id", None)
+                and revision.source_epoch == getattr(node, "epoch", None)
             )
-            starting_id = str(
-                task.envelope.metadata.get("active_plan_revision_id") or ""
-            )
-            if not current_id or current_id == starting_id:
+            task.envelope.metadata["plan_result"] = {
+                "status": "submitted" if submitted else "discussion",
+                "previousRevisionId": starting_id or None,
+                "revisionId": current_id or None,
+            }
+            if not submitted:
                 return
-            revision_candidate = get_revision(current_id)
-            revision = (
-                await revision_candidate
-                if inspect.isawaitable(revision_candidate)
-                else revision_candidate
-            )
-            if revision is None:
-                return
+            assert revision is not None
             from opensquilla.session.plans import plan_revision_snapshot
 
             await self._emit(
@@ -4851,6 +5331,35 @@ class TaskRuntime:
             }
         return False
 
+    async def _recovered_route_owner_is_current(
+        self,
+        envelope: RouteEnvelope,
+    ) -> bool:
+        """Fence restart recovery to the exact generation admitted before exit."""
+
+        session_id = getattr(envelope, "session_id", None)
+        if not isinstance(session_id, str) or not session_id:
+            return False
+        get_session = getattr(self._storage, "get_session", None)
+        if not callable(get_session):
+            # Compatibility-only embedders may expose transcript-backed legacy
+            # recovery without a SessionNode reader. Never accept a modern
+            # epoch-bearing owner without the authoritative current-row check.
+            return getattr(envelope, "session_epoch", None) is None
+        current = await get_session(envelope.session_key)
+        if current is None or getattr(current, "session_id", None) != session_id:
+            return False
+        session_epoch = getattr(envelope, "session_epoch", None)
+        if session_epoch is None:
+            return True
+        if (
+            not isinstance(session_epoch, int)
+            or isinstance(session_epoch, bool)
+            or session_epoch < 0
+        ):
+            return False
+        return getattr(current, "epoch", None) == session_epoch
+
     @staticmethod
     def _restart_recovery_envelope(
         target_task: AgentTaskRecord,
@@ -4907,14 +5416,23 @@ class TaskRuntime:
         )
         source_name = str(details.get("source_name") or "steer_restart_recovery")
         first_entry = entries[0]
+        owner = _durable_task_session_owner(
+            details,
+            fallback_session_id=getattr(first_entry, "session_id", None),
+        )
+        if owner is None or any(
+            getattr(entry, "session_id", None) != owner[0] for entry in entries
+        ):
+            return None
         return RouteEnvelope(
             source_kind=source_kind,
             source_name=source_name,
             agent_id=target_task.agent_id,
             session_key=target_task.session_key,
-            session_id=getattr(first_entry, "session_id", None),
+            session_id=owner[0],
             input_provenance=input_provenance,
             metadata=metadata,
+            session_epoch=owner[1],
         )
 
     async def _recovery_entries_for_task(
@@ -4969,38 +5487,40 @@ class TaskRuntime:
             message_ids = [entry.message_id for entry in entries]
             reservation: TaskReservation | None = None
             try:
-                reservation = await self.reserve(
-                    envelope,
-                    "\n\n".join(texts),
-                    mode="followup",
-                    run_kind=task.run_kind,
-                    no_memory_capture=bool(details.get("no_memory_capture", False)),
-                    semantic_message="\n\n".join(texts),
-                    persisted_user_message_id=message_ids[0],
-                    persisted_user_message_ids=message_ids,
-                    message_count=len(message_ids),
-                    fresh_user_session=False,
-                    task_id=task.task_id,
-                    update_envelope_cache=False,
-                )
-                await self._restore_durable_accepted_model_routing(
-                    reservation,
-                    task,
-                )
+                async with self.collect_admission(envelope.session_key):
+                    if not await self._recovered_route_owner_is_current(envelope):
+                        result["rejected"] += len(entries)
+                        continue
+                    reservation = await self.reserve(
+                        envelope,
+                        "\n\n".join(texts),
+                        mode="followup",
+                        run_kind=task.run_kind,
+                        no_memory_capture=bool(
+                            details.get("no_memory_capture", False)
+                        ),
+                        semantic_message="\n\n".join(texts),
+                        persisted_user_message_id=message_ids[0],
+                        persisted_user_message_ids=message_ids,
+                        message_count=len(message_ids),
+                        fresh_user_session=False,
+                        task_id=task.task_id,
+                        update_envelope_cache=False,
+                    )
+                    await self._restore_durable_accepted_model_routing(
+                        reservation,
+                        task,
+                    )
+                    owner_kwargs = _storage_owner_cas_kwargs(requeue, envelope)
+                    if not await requeue(task.task_id, **owner_kwargs):
+                        await self.abort_reservation(reservation)
+                        continue
+                    handle = await self.activate(reservation)
             except TaskQueueFullError:
                 result["rejected"] += len(entries)
                 continue
             except BaseException:
                 if reservation is not None and not reservation.activated:
-                    await self.abort_reservation(reservation)
-                raise
-            if not await requeue(task.task_id):
-                await self.abort_reservation(reservation)
-                continue
-            try:
-                handle = await self.activate(reservation)
-            except BaseException:
-                if not reservation.activated:
                     await self.abort_reservation(reservation)
                 raise
             result["resumed"] += len(entries)
@@ -5122,6 +5642,17 @@ class TaskRuntime:
                 target_task.details if isinstance(target_task.details, dict) else {}
             )
             async with self.collect_admission(envelope.session_key):
+                if not await self._recovered_route_owner_is_current(envelope):
+                    changed = await close_inputs(
+                        target_task_id=target_task_id,
+                        message_ids=message_ids,
+                        disposition="rejected",
+                        failure_code="STEER_RESTART_ROUTE_UNAVAILABLE",
+                        retryable=True,
+                        recovery="resend_as_followup",
+                    )
+                    result["rejected"] += len(changed)
+                    continue
                 try:
                     reservation = await self.reserve(
                         envelope,
@@ -5154,6 +5685,7 @@ class TaskRuntime:
                         target_task_id=target_task_id,
                         message_ids=message_ids,
                         task_record=reservation.task_record,
+                        **_storage_owner_cas_kwargs(promote_inputs, envelope),
                     )
                 except BaseException:
                     if not reservation.activated:
@@ -5202,6 +5734,9 @@ class TaskRuntime:
     ) -> _SteerPromotionResult | None:
         """Turn a too-late steer into one durable follow-up task."""
 
+        # Unread process notices expire with their originating turn. Output
+        # remains queryable through process; user steering still promotes.
+        items = [item for item in items if item.allow_followup]
         if not items:
             return None
         last = items[-1]
@@ -5311,6 +5846,10 @@ class TaskRuntime:
                     message_ids=message_ids,
                     task_record=reservation.task_record,
                     recovery="late_steer_followup",
+                    **_storage_owner_cas_kwargs(
+                        promote_inputs_fn,
+                        reservation.runtime_task.envelope,
+                    ),
                 )
                 if len(claimed) != len(message_ids):
                     await self.abort_reservation(reservation)
@@ -5322,7 +5861,14 @@ class TaskRuntime:
                     )
                     return None
             else:
-                await self._storage.create_agent_task(reservation.task_record)
+                create_agent_task = self._storage.create_agent_task
+                await create_agent_task(
+                    reservation.task_record,
+                    **_storage_owner_cas_kwargs(
+                        create_agent_task,
+                        reservation.runtime_task.envelope,
+                    ),
+                )
             promotion_committed = True
             promoted_task_id = reservation.task_id
         except Exception as exc:  # noqa: BLE001 - accepted input must leave evidence
@@ -5637,7 +6183,44 @@ class TaskRuntime:
             self._fair_cond = asyncio.Condition()
         return self._fair_cond
 
-    async def _acquire_fair_slot(self, task: _RuntimeTask) -> None:
+    @contextlib.asynccontextmanager
+    async def _suspend_compute_slot(
+        self, task: _RuntimeTask,
+    ) -> AsyncIterator[Callable[[], None]]:
+        """Lend capacity during an external wait while retaining the session lane.
+
+        The task, frozen context and execution lock remain owned by the same
+        turn. Only a successful wait rejoins the ordinary capacity queue; an
+        error or cancellation goes directly to the existing terminal cleanup.
+        A wait that decides the turn must end can call the yielded function;
+        that path may only report the terminal outcome, never resume execution.
+        """
+
+        if task.cancel_requested or task.terminal_closing:
+            raise asyncio.CancelledError
+        if task.status is not AgentTaskStatus.RUNNING or not task.acquired_slot:
+            raise RuntimeError("Only a running task holding capacity can suspend it")
+        resume_compute = True
+
+        def finish_without_compute() -> None:
+            nonlocal resume_compute
+            resume_compute = False
+
+        await self._release_slot(task)
+        yield finish_without_compute
+        if task.cancel_requested or task.terminal_closing:
+            raise asyncio.CancelledError
+        if not resume_compute:
+            return
+        await self._wait_for_subagent_slot(task)
+        await self._acquire_fair_slot(task, mark_running=False)
+
+    async def _acquire_fair_slot(
+        self,
+        task: _RuntimeTask,
+        *,
+        mark_running: bool = True,
+    ) -> None:
         """Acquire one global slot with round-robin among genuine slot waiters.
 
         A task must satisfy one predicate before it is granted a slot:
@@ -5666,6 +6249,8 @@ class TaskRuntime:
             waiters.add(session_key)
             try:
                 while True:
+                    if task.cancel_requested or task.terminal_closing:
+                        raise asyncio.CancelledError
                     # Predicate 1: global slot available.
                     if self._global_in_flight >= self._max_concurrency:
                         await cond.wait()
@@ -5702,6 +6287,11 @@ class TaskRuntime:
                 # Cancellation or a successful grant changes the genuine RR
                 # head. Wake peers even when no global slot count changed.
                 cond.notify_all()
+
+        if not mark_running:
+            # Resuming a suspended turn must not repeat task activation, Goal
+            # claims, context freezing, started_at writes or running events.
+            return
 
         # Update storage and emit running metric outside the condition lock. A
         # collect claim can keep this await open; if cancellation or persistence
@@ -5829,11 +6419,14 @@ class TaskRuntime:
             task.status = AgentTaskStatus.RUNNING
             self._remove_pending(task)
             self._running_by_session[task.envelope.session_key] = task
+        started_at = _epoch_time_ms()
         await self._storage.update_agent_task(
             task.task_id,
             status=AgentTaskStatus.RUNNING,
-            started_at=_epoch_time_ms(),
+            started_at=started_at,
         )
+        if task.record_snapshot is not None:
+            task.record_snapshot.started_at = started_at
         await self._emit(
             task.envelope.session_key,
             "task.running",
@@ -5841,7 +6434,7 @@ class TaskRuntime:
                 "task_id": task.task_id,
                 "session_key": task.envelope.session_key,
                 "steer_capability": self._steer_capability_for_task(task),
-                **_task_identity_payload(
+                **_task_event_identity_payload(
                     task.envelope,
                     task.task_id,
                     user_message_id=task.persisted_user_message_id,
@@ -5855,6 +6448,8 @@ class TaskRuntime:
                 task_id=task.task_id,
                 task_status=AgentTaskStatus.RUNNING,
                 run_kind=task.run_kind,
+                session_id=task.envelope.session_id,
+                session_epoch=task.envelope.session_epoch,
             )
         )
         return True
@@ -5946,6 +6541,7 @@ class TaskRuntime:
         error_class: str | None = None,
         error_message: str | None = None,
         failure_kind: str | None = None,
+        error_id: str | None = None,
         retry_after_ms: int | None = None,
         activity_snapshot: object = None,
         usage_call_index: int | None = None,
@@ -5972,6 +6568,7 @@ class TaskRuntime:
                         error_class=error_class,
                         error_message=error_message,
                         failure_kind=failure_kind,
+                        error_id=error_id,
                         retry_after_ms=retry_after_ms,
                         activity_snapshot=activity_snapshot,
                         usage_call_index=usage_call_index,
@@ -5992,7 +6589,6 @@ class TaskRuntime:
             # A driver cancelled before its first event-loop step never enters
             # ``_execute`` and therefore has no execution ``finally`` block.
             if not task.execution_started:
-                await _cleanup_turn_authority(task)
                 _cleanup_guest_profile(task)
         if not claimed:
             return
@@ -6022,6 +6618,7 @@ class TaskRuntime:
         error_class: str | None = None,
         error_message: str | None = None,
         failure_kind: str | None = None,
+        error_id: str | None = None,
         retry_after_ms: int | None = None,
         activity_snapshot: object = None,
         usage_call_index: int | None = None,
@@ -6089,10 +6686,13 @@ class TaskRuntime:
             "terminal_reason": terminal_reason,
             "error_class": error_class,
             "error_message": error_message,
+            "failure_kind": failure_kind,
         }
         if failure_kind:
             error_class = safe_provider_failure_code(error_class, failure_kind)
-            error_message = safe_provider_failure_message(failure_kind)
+            error_message = safe_provider_failure_message(
+                failure_kind, code=error_class, message=error_message
+            )
             terminal_payload["error_class"] = error_class
             terminal_payload["error_message"] = error_message
         elif (
@@ -6124,6 +6724,7 @@ class TaskRuntime:
                     error_class=error_class,
                     error_message=error_message,
                     failure_kind=failure_kind,
+                    error_id=error_id,
                     retry_after_ms=retry_after_ms,
                     activity_snapshot=activity_snapshot,
                     terminal_at=terminal_update["finished_at"],
@@ -6142,25 +6743,30 @@ class TaskRuntime:
         terminal_persisted = False
         promotion_result: _SteerPromotionResult | None = None
         try:
-            try:
-                await self._storage.update_agent_task(
-                    task.task_id,
-                    **terminal_update,
-                )
-                terminal_persisted = True
-            except Exception as exc:  # noqa: BLE001 - do not strand the UI in running.
-                log.warning(
-                    "task_runtime.terminal_persist_failed",
-                    task_id=task.task_id,
-                    session_key=task.envelope.session_key,
-                    status=status,
-                    error=str(exc),
-                )
-                await self._cache_terminal_fallback_record(
+            if task.terminal_details_loaded:
+                try:
+                    await self._persist_terminal_update(
+                        task.task_id, task.envelope.session_key, terminal_update,
+                    )
+                    terminal_persisted = True
+                except Exception as exc:  # noqa: BLE001 - do not strand the UI in running.
+                    log.warning(
+                        "task_runtime.terminal_persist_failed",
+                        task_id=task.task_id,
+                        session_key=task.envelope.session_key,
+                        status=status,
+                        error=str(exc),
+                    )
+            if not terminal_persisted:
+                self._cache_terminal_fallback_record(
                     task,
                     status=status,
                     terminal_update=terminal_update,
                 )
+            if terminal_persisted:
+                # Settle the plan before observers can admit another turn.
+                # A busy writer must still receive its fallback event first.
+                await self._settle_attached_plan_run(task)
             if terminal_persisted and promote_pending_steers:
                 # The terminal AgentTask row is now durable, but no public
                 # terminal/idle signal has escaped. Close every accepted steer
@@ -6180,14 +6786,40 @@ class TaskRuntime:
                 "task_id": task.task_id,
                 "session_key": task.envelope.session_key,
                 "terminal_reason": terminal_reason,
-                **_task_identity_payload(
+                **_task_event_identity_payload(
                     task.envelope,
                     task.task_id,
                     user_message_id=task.persisted_user_message_id,
                 ),
             }
+            plan_result = task.envelope.metadata.get("plan_result")
+            if status == AgentTaskStatus.SUCCEEDED and isinstance(plan_result, dict):
+                payload["plan_result"] = dict(plan_result)
             if status != AgentTaskStatus.SUCCEEDED:
-                payload["terminal_message"] = build_terminal_reply(terminal_payload)
+                payload["terminal_message"] = append_error_ref(
+                    build_terminal_reply(terminal_payload), safe_error_id(error_id)
+                )
+                # Classification is a runtime fact, independent of best-effort
+                # diagnostic persistence. Keep it when no error reference exists.
+                details = terminal_update.get("details")
+                turn_outcome = (
+                    details.get("turn_outcome") if isinstance(details, dict) else None
+                )
+                if not isinstance(turn_outcome, dict):
+                    turn_outcome = outcome_from_error(
+                        code=terminal_reason if terminal_reason != "error" else error_class,
+                        error_class=error_class,
+                        failure_kind=failure_kind,
+                    ).to_dict()
+                    if safe_error_id(error_id):
+                        turn_outcome["error_id"] = error_id
+                payload["code"] = error_class or terminal_reason
+                payload["turn_outcome"] = {
+                    **turn_outcome,
+                    # Do not publish internal exception prose with the newly
+                    # unconditional classification. The durable record retains it.
+                    "error_message": build_terminal_reply(terminal_payload),
+                }
             if status != AgentTaskStatus.SUCCEEDED and is_usage_accounting_barrier(error_class):
                 details = terminal_update.get("details")
                 details = details if isinstance(details, dict) else {}
@@ -6207,7 +6839,9 @@ class TaskRuntime:
                 )
                 payload.update(replay_proof)
                 terminal_payload.update(replay_proof)
-                payload["terminal_message"] = build_terminal_reply(terminal_payload)
+                payload["terminal_message"] = append_error_ref(
+                    build_terminal_reply(terminal_payload), safe_error_id(error_id)
+                )
                 if not isinstance(turn_outcome, dict):
                     turn_outcome = outcome_from_error(
                         code=error_class,
@@ -6218,6 +6852,8 @@ class TaskRuntime:
                     if retry_after_ms is not None:
                         turn_outcome["retry_after_ms"] = retry_after_ms
                 turn_outcome.update(replay_proof)
+                if safe_error_id(error_id):
+                    turn_outcome["error_id"] = error_id
                 payload["turn_outcome"] = dict(turn_outcome)
                 if not isinstance(snapshot, dict):
                     snapshot = terminal_activity_snapshot(
@@ -6242,8 +6878,8 @@ class TaskRuntime:
                     task.terminal_emitted = True
             finally:
                 if not terminal_persisted:
-                    # The first write already exhausted the storage layer's bounded
-                    # busy budget.  Publish the terminal event before making one
+                    # The first read or write exhausted the storage layer's bounded
+                    # busy budget. Publish the terminal event before making one
                     # more bounded, idempotent update of the same task row so a
                     # lock released by an observer cannot leave startup recovery
                     # looking at RUNNING.  This does not append transcript or usage
@@ -6256,12 +6892,16 @@ class TaskRuntime:
                         error_class=error_class,
                         error_message=error_message,
                         failure_kind=failure_kind,
+                        error_id=error_id,
                         retry_after_ms=retry_after_ms,
                         activity_snapshot=activity_snapshot,
                         usage_call_index=usage_call_index,
                         no_prior_provider_dispatch=no_prior_provider_dispatch,
                         replay_safe=replay_safe,
                     )
+                    if not terminal_persisted:
+                        self._schedule_terminal_retry(task, terminal_update)
+                    await self._settle_attached_plan_run(task)
             if (
                 status == AgentTaskStatus.SUCCEEDED
                 and terminal_reason == "completed"
@@ -6279,7 +6919,7 @@ class TaskRuntime:
                             "status": AgentTaskStatus.SUCCEEDED.value,
                             "terminal_reason": "completed",
                             "finished_at": terminal_update["finished_at"],
-                            **_task_identity_payload(
+                            **_task_event_identity_payload(
                                 task.envelope,
                                 task.task_id,
                                 user_message_id=task.persisted_user_message_id,
@@ -6300,6 +6940,8 @@ class TaskRuntime:
                     task_id=task.task_id,
                     task_status=status,
                     run_kind=task.run_kind,
+                    session_id=task.envelope.session_id,
+                    session_epoch=task.envelope.session_epoch,
                     terminal_reason=terminal_reason,
                     error_class=error_class,
                     error_message=error_message,
@@ -6668,6 +7310,10 @@ class TaskRuntime:
             parent_task_id=task.envelope.metadata.get("parent_task_id"),
             error_class=error_class,
             error_message=error_message,
+            child_session_id=task.envelope.session_id,
+            child_session_epoch=task.envelope.session_epoch,
+            parent_session_id=task.envelope.metadata.get("parent_session_id"),
+            parent_session_epoch=task.envelope.metadata.get("parent_session_epoch"),
         )
         try:
             await self._terminal_listener(event)
@@ -6689,11 +7335,45 @@ class TaskRuntime:
         usage_call_index: int | None,
         no_prior_provider_dispatch: bool,
         replay_safe: bool,
+        error_id: str | None = None,
     ) -> dict[str, Any]:
         outcome = _subagent_group_outcome_from_provenance(task.envelope.input_provenance)
-        existing = await self._storage.get_agent_task(task.task_id)
+        from opensquilla.session.storage import bounded_interactive_storage_reads
+
+        # Terminal feedback must remain available while another operation owns
+        # the shared storage gate. The compensation path uses this same bound.
+        existing = task.record_snapshot
+        task.terminal_details_loaded = False
+        loaded_current_details = False
+        try:
+            if callable(getattr(type(self._storage), "settle_agent_task", None)):
+                # The storage API merges our owned fields with the current
+                # details inside its transaction. No pre-write read is needed.
+                latest = existing
+                loaded_current_details = True
+            else:
+                with bounded_interactive_storage_reads():
+                    latest = await self._storage.get_agent_task(task.task_id)
+            if latest is not None:
+                existing = latest
+                task.record_snapshot = latest.model_copy(deep=True)
+                loaded_current_details = True
+        except Exception as exc:  # noqa: BLE001 - preserve in-memory terminal evidence.
+            log.warning(
+                "task_runtime.terminal_details_read_failed",
+                task_id=task.task_id,
+                session_key=task.envelope.session_key,
+                error=str(exc),
+            )
         current_details = getattr(existing, "details", None)
         details = dict(current_details) if isinstance(current_details, dict) else {}
+        metadata = dict(details.get("metadata") or {})
+        metadata.pop("plan_result", None)
+        plan_result = task.envelope.metadata.get("plan_result")
+        if status == AgentTaskStatus.SUCCEEDED and isinstance(plan_result, dict):
+            metadata["plan_result"] = dict(plan_result)
+        if metadata or "metadata" in details:
+            details["metadata"] = metadata
         durable_activity_snapshot: dict[str, Any] | None = None
         try:
             from opensquilla.gateway.session_streams import get_session_streams
@@ -6752,10 +7432,6 @@ class TaskRuntime:
         details.pop("cancellation_requested", None)
         if status == AgentTaskStatus.SUCCEEDED:
             turn_outcome = completed_outcome().to_dict()
-            if task.document_mutation_outcome is not None:
-                turn_outcome["documentMutationOutcome"] = dict(
-                    task.document_mutation_outcome
-                )
             details["turn_outcome"] = turn_outcome
             if task.terminal_assistant_message_content is not None:
                 # This is a compact durable channel outbox payload. It keeps
@@ -6775,12 +7451,10 @@ class TaskRuntime:
                 error_class=error_class,
                 failure_kind=failure_kind,
             ).to_dict()
+            if safe_error_id(error_id):
+                turn_outcome["error_id"] = error_id
             if cancellation is not None:
                 turn_outcome["cancellation_source"] = cancellation["source"]
-            if task.document_mutation_outcome is not None:
-                turn_outcome["documentMutationOutcome"] = dict(
-                    task.document_mutation_outcome
-                )
             if is_usage_accounting_barrier(error_class):
                 replay_proof = usage_barrier_replay_proof(
                     usage_call_index=usage_call_index,
@@ -6813,25 +7487,19 @@ class TaskRuntime:
             )
             if disclosure_required is True:
                 details["runtime_partial_failure_disclosure_required"] = True
+        task.terminal_details_loaded = loaded_current_details
         return {"details": details}
 
-    async def _cache_terminal_fallback_record(
+    def _cache_terminal_fallback_record(
         self,
         task: _RuntimeTask,
         *,
         status: AgentTaskStatus,
         terminal_update: dict[str, Any],
     ) -> None:
-        try:
-            existing = await self._storage.get_agent_task(task.task_id)
-        except Exception as exc:  # noqa: BLE001 - fallback must not fail terminalization.
-            log.warning(
-                "task_runtime.terminal_fallback_read_failed",
-                task_id=task.task_id,
-                session_key=task.envelope.session_key,
-                error=str(exc),
-            )
-            existing = None
+        # Do not re-enter the storage gate after a failed terminal write. This
+        # fallback is required before the public event and must be memory-only.
+        existing = task.record_snapshot
         if existing is not None:
             record = existing.model_copy(deep=True)
         else:
@@ -6867,6 +7535,7 @@ class TaskRuntime:
         usage_call_index: int | None,
         no_prior_provider_dispatch: bool,
         replay_safe: bool,
+        error_id: str | None = None,
     ) -> bool:
         """Retry one terminal task-row update after its public fallback event."""
 
@@ -6886,6 +7555,7 @@ class TaskRuntime:
                     error_class=error_class,
                     error_message=error_message,
                     failure_kind=failure_kind,
+                    error_id=error_id,
                     retry_after_ms=retry_after_ms,
                     activity_snapshot=preserved_activity_snapshot,
                     terminal_at=int(terminal_update["finished_at"]),
@@ -6901,8 +7571,14 @@ class TaskRuntime:
                 session_key=task.envelope.session_key,
                 error=str(exc),
             )
+        if not task.terminal_details_loaded:
+            # An admission snapshot is sufficient for public fallback feedback,
+            # but cannot replace details written by later audit/steer activity.
+            return False
         try:
-            await self._storage.update_agent_task(task.task_id, **terminal_update)
+            await self._persist_terminal_update(
+                task.task_id, task.envelope.session_key, terminal_update,
+            )
         except Exception as exc:  # noqa: BLE001 - the in-memory terminal stays usable.
             log.warning(
                 "task_runtime.terminal_persist_compensation_failed",
@@ -6911,13 +7587,92 @@ class TaskRuntime:
                 error=str(exc),
             )
             return False
-        self._terminal_fallback_records.pop(task.task_id, None)
+        self._remember_compensated_terminal(task.task_id)
         log.info(
             "task_runtime.terminal_persist_compensated",
             task_id=task.task_id,
             session_key=task.envelope.session_key,
         )
         return True
+
+    async def _persist_terminal_update(
+        self, task_id: str, session_key: str, update: dict[str, Any],
+    ) -> None:
+        if not callable(getattr(type(self._storage), "settle_agent_task", None)):
+            await self._storage.update_agent_task(task_id, **update)
+            return
+        details = update.get("details") or {}
+        remove_keys = ["cancellation_requested"]
+        if "applied_steer_evidence" not in details:
+            remove_keys.append("applied_steer_evidence")
+        await self._storage.settle_agent_task(
+            task_id,
+            session_key=session_key,
+            details_patch={
+                key: value for key, value in details.items() if key in _TERMINAL_DETAIL_KEYS
+            },
+            remove_detail_keys=remove_keys,
+            plan_result=(details.get("metadata") or {}).get("plan_result"),
+            **{key: value for key, value in update.items() if key != "details"},
+        )
+
+    def _remember_compensated_terminal(self, task_id: str) -> None:
+        record = self._terminal_fallback_records.pop(task_id, None)
+        if record is not None:
+            # Covers a hydrate that read the old ledger immediately before
+            # compensation committed. Status()/list() still use the fresh DB.
+            self._recent_terminal_records.append(record)
+
+    def _schedule_terminal_retry(self, task: _RuntimeTask, update: dict[str, Any]) -> None:
+        if not callable(getattr(type(self._storage), "settle_agent_task", None)):
+            return
+        self._terminal_pending_updates[task.task_id] = dict(update)
+        if self._terminal_retry_task is None or self._terminal_retry_task.done():
+            self._terminal_retry_task = asyncio.create_task(self._retry_terminal_updates())
+
+    async def _retry_terminal_updates(self) -> None:
+        """Drain terminal writes without holding a session lane or execution slot."""
+        from opensquilla.session.storage import AgentTaskTerminalConflictError
+
+        delay = 0.05
+        attempt = 0
+        try:
+            while self._terminal_pending_updates:
+                await asyncio.sleep(delay)
+                attempt += 1
+                for task_id, update in list(self._terminal_pending_updates.items()):
+                    record = self._terminal_fallback_records.get(task_id)
+                    if record is None:
+                        self._terminal_pending_updates.pop(task_id, None)
+                        continue
+                    try:
+                        await self._persist_terminal_update(task_id, record.session_key, update)
+                    except AgentTaskTerminalConflictError as exc:
+                        # Goal fail-closed compensation may have settled this
+                        # task already. Retire the stale retry and projection.
+                        self._terminal_pending_updates.pop(task_id, None)
+                        self._terminal_fallback_records[task_id] = exc.record
+                        self._remember_compensated_terminal(task_id)
+                        continue
+                    except KeyError:
+                        # Explicit session deletion may remove the task while
+                        # this retry waits. Never recreate deleted runtime data.
+                        self._terminal_pending_updates.pop(task_id, None)
+                        self._terminal_fallback_records.pop(task_id, None)
+                        continue
+                    except Exception as exc:
+                        if attempt & (attempt - 1) == 0:
+                            log.warning(
+                                "task_runtime.terminal_persist_retry_failed",
+                                task_id=task_id, attempt=attempt, error_class=type(exc).__name__,
+                            )
+                        continue
+                    self._terminal_pending_updates.pop(task_id, None)
+                    self._remember_compensated_terminal(task_id)
+                    log.info("task_runtime.terminal_persist_recovered", task_id=task_id)
+                delay = min(2.0, delay * 2)
+        finally:
+            self._signal_driver_state_changed()
 
 
 def _subagent_group_outcome_from_provenance(

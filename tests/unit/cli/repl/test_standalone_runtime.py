@@ -81,6 +81,12 @@ async def test_standalone_runtime_mirrors_turn_model_update_to_legacy_scope(
 ) -> None:
     from opensquilla.cli.repl import standalone_runtime
 
+    activity: list[dict[str, Any]] = []
+
+    async def record_active(**kwargs: Any) -> bool:
+        activity.append(kwargs)
+        return True
+
     class _FakeSessionManager:
         async def get_or_create(self, session_key: str, agent_id: str = "main") -> object:
             return SimpleNamespace(session_key=session_key, agent_id=agent_id)
@@ -89,6 +95,7 @@ async def test_standalone_runtime_mirrors_turn_model_update_to_legacy_scope(
         def __init__(self) -> None:
             self.config = None
             self.session_manager = _FakeSessionManager()
+            self.growth_event_sink = SimpleNamespace(record_product_active=record_active)
 
         async def close(self) -> None:
             return None
@@ -99,7 +106,8 @@ async def test_standalone_runtime_mirrors_turn_model_update_to_legacy_scope(
     pending_provider = SimpleNamespace(drain_pending=lambda: [])
     captured: dict[str, Any] = {}
 
-    async def fake_build_services() -> _FakeServices:
+    async def fake_build_services(*, start_standalone_telemetry: bool) -> _FakeServices:
+        assert start_standalone_telemetry is True
         return services
 
     def fake_build_turn_runner_from_services(_services: object) -> object:
@@ -139,11 +147,15 @@ async def test_standalone_runtime_mirrors_turn_model_update_to_legacy_scope(
         surface: Surface,
         scope: standalone_runtime.StandaloneRuntimeScope,
         dispatch,
+        on_surface_ready=None,
+        on_user_activity=None,
     ) -> None:
         captured["surface"] = surface
         captured["initial_scope"] = dict(scope)
         scope["pending_input_provider"] = pending_provider
 
+        await on_surface_ready()
+        await on_user_activity()
         assert await dispatch("hello") is True
 
         captured["scope_after_message"] = dict(scope)
@@ -186,6 +198,7 @@ async def test_standalone_runtime_mirrors_turn_model_update_to_legacy_scope(
     assert captured["state_after_message"].model == "standalone/after"
     assert captured["state_after_message"].usage.input_tokens == 5
     assert captured["state_after_message"].usage.output_tokens == 8
+    assert activity == [{"surface": "tui"}, {"surface": "tui"}]
 
 
 @pytest.mark.asyncio
@@ -212,7 +225,8 @@ async def test_standalone_runtime_matches_exit_with_standalone_surface(
         surfaces.append(surface)
         return value == "/exit"
 
-    async def fake_build_services() -> _FakeServices:
+    async def fake_build_services(*, start_standalone_telemetry: bool) -> _FakeServices:
+        assert start_standalone_telemetry is True
         return _FakeServices()
 
     async def fake_run_concurrent_repl(

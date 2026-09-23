@@ -20,7 +20,7 @@ import pytest
 
 import opensquilla.gateway.config as config_module
 from opensquilla.gateway.config import GatewayConfig
-from opensquilla.gateway.config_migration import migrate_config_payload
+from opensquilla.gateway.config_migration import LATEST_CONFIG_VERSION, migrate_config_payload
 from opensquilla.migration.opensquilla_home import (
     OpenSquillaHomeMigrator,
     OpenSquillaMigrationOptions,
@@ -108,13 +108,32 @@ def test_cli_01_era_migrates_with_expected_strips() -> None:
     assert cfg.port == 18790
 
 
-def test_modern_era_configs_load_without_changes() -> None:
+def test_modern_era_configs_strip_retired_skill_filter_and_memory_flush_settings() -> None:
     for era in ("cli-0.3", "cli-0.4"):
         data = tomllib.loads(
             (FIXTURES_ROOT / era / "config.toml").read_text(encoding="utf-8")
         )
         result = migrate_config_payload(data)
-        assert not result.changed, (era, result.changes, result.removed_fields)
+        assert result.changed, (era, result.changes, result.removed_fields)
+        retired_memory = {
+            "flush_enabled", "flush_timeout_seconds", "flush_background_timeout_seconds",
+            "flush_backoff_initial_seconds", "flush_backoff_max_seconds", "flush_archive_max_bytes",
+            "flush_compaction_requires_safe_receipt", "flush_compaction_safety_mode",
+            "repair_enabled", "repair_interval_seconds", "repair_max_items_per_tick",
+        }
+        if era == "cli-0.4":
+            retired_memory.update({"flush_triggers", "flush_pre_compaction"})
+        assert set(result.removed_fields) == {
+            *(f"memory.{key}" for key in retired_memory),
+            "skills.filter_embedding_model",
+            "skills.filter_enabled",
+            "skills.filter_lexical_top_n",
+            "skills.filter_rrf_k",
+            "skills.filter_semantic_top_n",
+            "skills.filter_strategy",
+            "skills.filter_top_k",
+            "squilla_router.upgrade_to_c3_compaction_enabled",
+        }
 
 
 @pytest.mark.parametrize("auto_setup", [True, False])
@@ -202,6 +221,7 @@ def test_mismatched_tier_profile_is_cleared_not_fatal() -> None:
 def test_matching_tier_profile_is_untouched() -> None:
     result = migrate_config_payload(
         {
+            "config_version": LATEST_CONFIG_VERSION,
             "llm": {"provider": "openrouter", "model": "dummy/model"},
             "squilla_router": {"tier_profile": "openrouter"},
         }

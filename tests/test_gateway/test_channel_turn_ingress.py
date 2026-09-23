@@ -19,6 +19,7 @@ import opensquilla.gateway.channel_dispatch as channel_dispatch_module
 from opensquilla.channels.types import IncomingMessage, OutgoingMessage
 from opensquilla.gateway._debounce import _DefaultDebounceCoordinator
 from opensquilla.gateway.attachment_ingest import AttachmentIngestResult
+from opensquilla.gateway.auth import Principal
 from opensquilla.gateway.channel_dispatch import (
     _accept_channel_runtime_turn,
     _apply_saved_channel_run_context,
@@ -363,6 +364,8 @@ async def test_channel_turn_atomically_creates_delivery_session_message_task_and
         assert task.details["fresh_user_session"] is True
         assert task.details["accepted_model_routing"]["effective_mode"] == "direct"
         assert task.details["accepted_model_routing"]["source"] == "session"
+        assert task.details["session_id"] == session.session_id
+        assert task.details["session_epoch"] == session.epoch
 
         receipt_result = await stack.storage.get_turn_ingress_receipt(
             source_scope=f"channel:slack:{ACCOUNT_ID}",
@@ -377,9 +380,12 @@ async def test_channel_turn_atomically_creates_delivery_session_message_task_and
         assert receipt.task_id == task.task_id
 
         assert len(stack.received_runs) == 1
-        assert stack.received_runs[0].persisted_user_message_id == message.message_id
-        assert stack.received_runs[0].fresh_user_session is True
-        assert stack.received_runs[0].accepted_config.session_mode == "direct"
+        run = stack.received_runs[0]
+        assert run.persisted_user_message_id == message.message_id
+        assert run.fresh_user_session is True
+        assert run.accepted_config.session_mode == "direct"
+        assert run.envelope.session_id == session.session_id
+        assert run.envelope.session_epoch == session.epoch
         assert _table_counts(stack.db_path) == {
             # The accepted channel session plus the post-acceptance main-delivery fallback.
             "sessions": 2,
@@ -995,10 +1001,10 @@ async def test_channel_default_turn_claims_goal_without_replacing_web_lease(
     async with _open_stack(tmp_path / "channel-goal-claim.sqlite") as stack:
         goal = await _seed_idle_active_goal(stack)
         service = _install_channel_goal_service(stack)
-        principal = SimpleNamespace(
-            token_public_id="web-owner",
-            guest_owner_id=None,
+        principal = Principal(
+            token_public_id="desktop",
             is_owner=True,
+            authenticated=True,
             role="operator",
             scopes=frozenset({"operator.admin"}),
         )
@@ -1007,7 +1013,9 @@ async def test_channel_default_turn_claims_goal_without_replacing_web_lease(
             owner_connection_id
         }
         get_registry().register(
-            SimpleNamespace(conn_id=owner_connection_id, principal=principal)
+            SimpleNamespace(
+                conn_id=owner_connection_id, principal=principal, client_caps=frozenset(),
+            )
         )
         owner_lease = service._install_lease(
             SimpleNamespace(

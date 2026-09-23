@@ -1,4 +1,5 @@
 import { expect, test, type Page } from '@playwright/test'
+import { helloOkResponse } from './support/gateway-fixture'
 
 const CONTROL_URL = '/control/cron'
 
@@ -44,9 +45,7 @@ async function installCronRpc(page: Page, jobs: CronFixtureJob[]) {
       if (frame.type !== 'req' || frame.id === undefined) return
 
       if (frame.method === 'connect') {
-        ws.send(JSON.stringify({
-          protocol: 3,
-          policy: { tick_interval_ms: 30_000 },
+        ws.send(helloOkResponse({
           auth: { principal: { isOwner: true } },
           features: { methods: ['cron.list', 'workspaces.list'] },
         }))
@@ -57,10 +56,13 @@ async function installCronRpc(page: Page, jobs: CronFixtureJob[]) {
         'agents.list': { agents: [] },
         'commands.list_for_surface': { commands: [] },
         'config.get': {},
-        'cron.list': { jobs },
-        'sessions.list': { sessions: [], has_more: false },
+        'cron.list': jobs,
+        'sessions.list': { sessions: [], count: 0, ts: 1_800_000_000, has_more: false },
         'usage.status': { sessions: [] },
         'workspaces.list': { workspaces: [] },
+        'cron.subscribe': { ok: true },
+        'cron.unsubscribe': { ok: true },
+        'cron.runs': [],
       }
       respond(frame.id, payloads[String(frame.method)] ?? {})
     })
@@ -94,7 +96,7 @@ test('existing jobs render the compact automation status and task list together'
 
   const launch = page.locator('.automation-launch')
   await expect(launch).toHaveClass(/automation-launch--compact/)
-  await expect(launch.getByRole('heading', { name: 'Automations are running' })).toBeVisible()
+  await expect(launch.getByRole('heading', { name: 'Active schedules' })).toBeVisible()
   await expect(launch).toContainText('1 of 2 jobs enabled')
   await expect(launch.getByText('1 / 2')).toBeVisible()
   await expect(launch.getByRole('heading', { name: 'Start your first automation' })).toHaveCount(0)
@@ -110,7 +112,7 @@ test('a loaded empty list keeps the full animation and opens the create panel', 
   const launch = page.locator('.automation-launch')
   await expect(launch).not.toHaveClass(/automation-launch--compact/)
   await expect(launch.getByRole('heading', { name: 'Start your first automation' })).toBeVisible()
-  await expect(launch.getByRole('heading', { name: 'Automations are running' })).toHaveCount(0)
+  await expect(launch.getByRole('heading', { name: 'Active schedules' })).toHaveCount(0)
   await expect(page.locator('[data-cron-row]')).toHaveCount(0)
 
   await launch.getByRole('button', { name: 'Add automation' }).click()

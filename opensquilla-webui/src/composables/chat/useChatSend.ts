@@ -1,3 +1,6 @@
+import { copySelectedSkills, sameSelectedSkills, type SelectedSkillRef } from '@/types/selectedSkills'
+import type { AttachmentDraftConsumption } from '@/utils/chat/attachmentDrafts'
+import { normalizePageContext, pageContextForAnnotations, pageAnnotationSnapshots, type ChatPageContext } from '@/types/pageContext'
 import { computed, ref, watch, type ComputedRef, type Ref } from 'vue'
 import i18n from '@/i18n'
 import { useToasts } from '@/composables/useToasts'
@@ -18,7 +21,6 @@ import type { PromptAnnotationSnapshot } from '@/types/promptAnnotations'
 import type { SandboxRunMode } from '@/types/sandbox'
 import { normalizeSandboxRunMode } from '@/types/sandbox'
 import type {
-  TurnDocumentContext,
   TurnSendParams,
   TurnSendSource,
 } from '@/modules/turnCommands'
@@ -49,10 +51,12 @@ import {
   hasSendableModelInputImageAttachment,
   isSendableAttachment,
   serializeDisplayAttachment,
-  serializeSendableAttachment,
+  serializeChatFiles,
+  snapshotAttachment,
   type SendableAttachment,
 } from '@/utils/chat/attachments'
 import { localizedChatErrorMessage } from '@/utils/chat/errors'
+import { dedupeTerminalErrorNotices } from '@/utils/chat/terminalErrorNotices'
 import {
   classifyArtifactProductError,
   isKnownArtifactProductErrorCode,
@@ -65,6 +69,7 @@ import {
 } from '@/utils/chat/messageIdentity'
 import {
   type HiddenControlStorage,
+  type HiddenControlInitialSettings,
   listHiddenControls,
   persistHiddenControlResult,
   removeHiddenControl,
@@ -83,7 +88,6 @@ import {
   FINISHED_STREAM_TASK_ID,
   PENDING_STREAM_TASK_ID,
   STOPPED_STREAM_TASK_ID,
-  taskTerminalMessage,
 } from '@/utils/chat/streamEvents'
 
 /**
@@ -165,16 +169,23 @@ interface SendAttempt {
   clientMessageId: string
   composerText: string
   requestSessionKey: string
-  promptAnnotationIds: string[]
+  deliveryIdentity?: string | null
+  draftIds: string[]
   promptAnnotations: PromptAnnotationSnapshot[]
   promptAnnotationsAcknowledged?: boolean
-  documentContext: TurnDocumentContext | null
+  selectedSkills: SelectedSkillRef[]
+  composerSkillRefs?: SelectedSkillRef[]
+  unconsumedComposer?: ComposerSnapshot
+  consumeAttachmentDraft?: AttachmentDraftConsumption
+  pageContext: ChatPageContext | null
   queueMode?: 'steer'
   text: string
   attachments: SendableAttachment[]
   intent: string | null
   initialCollaborationMode: CollaborationMode | null
   initialRoutingMode: GatewayModelRoutingMode | null
+  initialModel: string | null
+  initialProvider: string | null
   forkBeforeMessageId: string | null
   workspaceId: string | null
   restoreComposerOnHandoffFailure?: boolean
@@ -207,15 +218,19 @@ interface ExplicitSendPayload {
   forkBeforeMessageId: string | null
   workspaceId?: string | null
   initialCollaborationMode?: CollaborationMode | null
-  documentContext?: TurnDocumentContext | null
+  selectedSkills?: SelectedSkillRef[]
+  pageContext?: ChatPageContext | null
   initialRoutingMode?: GatewayModelRoutingMode | null
+  initialModel?: string | null
+  initialProvider?: string | null
 }
 
 interface ComposerSnapshot {
   revision: number | null
   inputText: string
-  promptAnnotationIds: string[]
-  documentContext: TurnDocumentContext | null
+  draftIds: string[]
+  selectedSkills: SelectedSkillRef[]
+  pageContext: ChatPageContext | null
   attachmentRefs: Attachment[]
   payloadAttachments: Attachment[]
   intent: string | null
@@ -223,12 +238,14 @@ interface ComposerSnapshot {
   workspaceId: string | null
   initialCollaborationMode: CollaborationMode | null
   initialRoutingMode: GatewayModelRoutingMode | null
+  initialModel: string | null
+  initialProvider: string | null
   queueOwnerRequestId: string | null
 }
 
 interface DispatchSendOptions {
   composerText?: string
-  promptAnnotationIds?: readonly string[]
+  draftIds?: readonly string[]
   queueMode?: 'steer'
   payload?: ExplicitSendPayload
   preserveComposer?: boolean
@@ -257,6 +274,7 @@ interface DispatchSendOptions {
 }
 
 export interface UsageBarrierReplayPayload {
+  selectedSkills?: SelectedSkillRef[]
   text: string
   forkBeforeMessageId: string
 }
@@ -314,29 +332,24 @@ function turnCommandFailure(err: unknown): TurnCommandError | null {
 }
 
 function errorCode(err: unknown): string | undefined {
-  return turnCommandFailure(err)?.failureCode
+  const failure = turnCommandFailure(err)
+  const artifact = failure?.artifactFailure
+  return artifact?.artifactScoped && isKnownArtifactProductErrorCode(artifact.code)
+    ? artifact.code
+    : failure?.failureCode
 }
 
-function paramsHaveArtifactContext(
-  params: Pick<TurnSendParams, 'promptAnnotationIds' | 'documentContext'>,
-): boolean {
-  return Boolean(params.promptAnnotationIds?.length || params.documentContext)
-}
-
-function sendFailureMessage(err: unknown, artifactContext = false): string {
+function sendFailureMessage(err: unknown): string {
   const code = errorCode(err)
   const artifactFailure = turnCommandFailure(err)?.artifactFailure
-  if (
-    artifactContext
-    || (artifactFailure?.artifactScoped && isKnownArtifactProductErrorCode(artifactFailure.code))
-  ) {
+  if (artifactFailure?.artifactScoped && isKnownArtifactProductErrorCode(artifactFailure.code)) {
     const classified = classifyArtifactProductError(artifactFailure)
     const translated = String(i18n.global.t(classified.messageKey))
     return translated === classified.messageKey
       ? classified.fallbackMessage
       : translated
   }
-  return localizedChatErrorMessage(code, 'Send failed: ' + errorMessage(err))
+  return localizedChatErrorMessage(code, '')
 }
 
 function shouldRestoreSendAttempt(err: unknown): boolean {
@@ -402,74 +415,59 @@ function terminalResponseStatus(response: TurnSendResponse | null | undefined): 
   return TERMINAL_TASK_STATUSES.has(status) ? status : ''
 }
 
-function terminalReplayMessage(response: TurnSendResponse, status: string): string {
-  const supplied = response.terminalMessage || response.terminalReason || response.reason
-  if (typeof supplied === 'string' && supplied.trim()) return supplied.trim()
-  return taskTerminalMessage(status, {})
-}
-
-function terminalReplayErrorCode(response: TurnSendResponse, status: string): string {
+function terminalReplayErrorCode(response: TurnSendResponse, status: string): string | undefined {
   const reason = response.terminalReason || response.reason
   const normalized = typeof reason === 'string' ? reason.trim().toLowerCase() : ''
-  return /^[a-z][a-z0-9_.-]*$/.test(normalized) ? normalized : status
+  const code = /^[a-z][a-z0-9_.-]*$/.test(normalized) ? normalized : status
+  // A scheduler's generic terminal reason is not a new cause and must not
+  // replace a provider/engine classification already received for this turn.
+  return code === 'error' || code === 'failed' ? undefined : code
 }
 
 function sameSendableAttachments(
   attachments: SendableAttachment[],
-  attempt: SendAttempt,
+  attempt: Pick<SendAttempt, 'attachments'>,
 ): boolean {
   if (attachments.length !== attempt.attachments.length) return false
   return attachments.every((attachment, index) => {
     const prior = attempt.attachments[index]
     return (
       prior?.local_id === attachment.local_id &&
-      JSON.stringify(serializeSendableAttachment(prior)) ===
-        JSON.stringify(serializeSendableAttachment(attachment))
+      JSON.stringify(serializeChatFiles([prior])) ===
+        JSON.stringify(serializeChatFiles([attachment]))
     )
   })
-}
-
-function normalizeDocumentContext(value: unknown): TurnDocumentContext | null {
-  if (!value || typeof value !== 'object') return null
-  const raw = value as Record<string, unknown>
-  const documentId = typeof raw.documentId === 'string' ? raw.documentId.trim() : ''
-  const headRevisionId = typeof raw.headRevisionId === 'string'
-    ? raw.headRevisionId.trim()
-    : ''
-  return documentId && headRevisionId ? { documentId, headRevisionId } : null
-}
-
-function sameDocumentContext(
-  left: TurnDocumentContext | null,
-  right: TurnDocumentContext | null,
-): boolean {
-  return left?.documentId === right?.documentId
-    && left?.headRevisionId === right?.headRevisionId
 }
 
 function matchesRecoveredDraft(
   attempt: SendAttempt,
   input: {
     requestSessionKey: string
-    promptAnnotationIds: readonly string[]
-    documentContext: TurnDocumentContext | null
+    draftIds: readonly string[]
+    selectedSkills: SelectedSkillRef[]
+    pageContext: ChatPageContext | null
     text: string
     attachments: SendableAttachment[]
     intent: string | null
     initialCollaborationMode: CollaborationMode | null
     initialRoutingMode: GatewayModelRoutingMode | null
+    initialModel: string | null
+    initialProvider: string | null
     forkBeforeMessageId: string | null
     workspaceId: string | null
   },
 ): boolean {
   return (
     attempt.requestSessionKey === input.requestSessionKey &&
-    JSON.stringify(attempt.promptAnnotationIds) === JSON.stringify(input.promptAnnotationIds) &&
-    sameDocumentContext(attempt.documentContext, input.documentContext) &&
+    JSON.stringify(attempt.draftIds) === JSON.stringify(input.draftIds) &&
+    JSON.stringify(attempt.pageContext) === JSON.stringify(input.pageContext) &&
+    sameSelectedSkills(attempt.selectedSkills, input.selectedSkills) &&
     attempt.text === input.text &&
     attempt.intent === input.intent &&
     attempt.initialCollaborationMode === input.initialCollaborationMode &&
     attempt.initialRoutingMode === input.initialRoutingMode &&
+    attempt.initialModel === input.initialModel &&
+    attempt.initialProvider === input.initialProvider &&
     attempt.forkBeforeMessageId === input.forkBeforeMessageId &&
     attempt.workspaceId === input.workspaceId &&
     sameSendableAttachments(input.attachments, attempt)
@@ -490,6 +488,12 @@ export interface UseChatSendOptions {
   turnCommands: TurnCommands
   activeSteerCapability?: Readonly<Ref<ChatSteerCapability | null>>
   inputText: Ref<string>
+  selectedSkills?: Ref<SelectedSkillRef[]>
+  captureAttachmentDraftConsumption?: (attachments: readonly Attachment[]) => AttachmentDraftConsumption | undefined
+  consumeAcceptedDraft?: (
+    sessionKey: string,
+    snapshot: { text: string; selectedSkills: SelectedSkillRef[] },
+  ) => boolean | void | Promise<boolean | void>
   messages: Ref<ChatMessage[]>
   sessionKey: Ref<string>
   pendingQueueOwnerContext: Ref<PendingQueueOwnerContext | null>
@@ -506,24 +510,22 @@ export interface UseChatSendOptions {
   pendingSessionIntent: Ref<string | null>
   initialCollaborationMode: Readonly<Ref<CollaborationMode>>
   initialRoutingMode: Readonly<Ref<GatewayModelRoutingMode | null>>
+  initialModel?: Readonly<Ref<string | null>>
+  initialProvider?: Readonly<Ref<string | null>>
+  restoreInitialModel?: (selection: { model: string; provider: string } | null) => void
   pendingForkBeforeMessageId: Ref<string | null>
-  promptAnnotationIds?: Readonly<Ref<readonly string[]>>
+  draftIds?: Readonly<Ref<readonly string[]>>
   promptAnnotationSnapshots?: (ids: readonly string[]) => PromptAnnotationSnapshot[]
   acknowledgePromptAnnotations?: (
-    requestedIds: readonly string[],
-    acceptedIds: readonly string[],
+    snapshots: readonly PromptAnnotationSnapshot[],
     sessionKey: string,
     requestSessionKey?: string,
   ) => void
-  /** Synchronous, session-scoped identity used to avoid replaying against another document/head. */
-  currentDocumentContext?: (sessionKey: string) => TurnDocumentContext | null
-  /** Flushes the active editor and returns the exact head to bind to a fresh send. */
-  prepareDocumentContextForSend?: (
-    sessionKey: string,
-    options?: { isCurrent?: () => boolean },
-  ) => Promise<TurnDocumentContext | null | false>
   pendingWorkspaceId?: Ref<string | null>
   sendBlockedReason?: Readonly<Ref<string | null>>
+  /** Proven identity supplied only for an eligible, never-sent offline click. */
+  offlineQueueIdentity?: Readonly<Ref<string | null>>
+  deliveryIdentity?: Readonly<Ref<string | null>>
   /** Transport/admission-only gate used by exact replays after unknown acceptance. */
   idempotentReplayBlockedReason?: Readonly<Ref<string | null>>
   validateActiveProjectBeforeSend?: () => Promise<string | null>
@@ -574,13 +576,19 @@ export interface UseChatSendOptions {
     owner?: PendingQueueOwner,
     enqueueOptions?: {
       confirmedPlainText?: boolean
-      promptAnnotationIds?: readonly string[]
+      draftIds?: readonly string[]
+      selectedSkills?: SelectedSkillRef[]
+      pageContext?: ChatPageContext
+      attachments?: Attachment[]
+      deliveryIdentity?: string
     },
   ) => boolean | Promise<boolean>
   enqueuePendingPayload?: (
     payload: {
       text: string
-      promptAnnotationIds?: readonly string[]
+      draftIds?: readonly string[]
+      selectedSkills?: SelectedSkillRef[]
+      pageContext?: ChatPageContext
       attachments?: Attachment[]
       intent?: string | null
       confirmedPlainText?: boolean
@@ -639,6 +647,12 @@ export function useChatSend(options: UseChatSendOptions) {
   const hiddenDispatchInFlight = new Map<string, Promise<HiddenControlDispatchResult>>()
   const renderedHiddenControls = new Set<string>()
   const acceptanceRecoveryVersion = ref(0)
+  const composerSubmissions = new Map<symbol, { sessionKey: string; snapshot: ComposerSnapshot }>()
+  const composerSubmissionVersion = ref(0)
+  const sendPending = computed(() => {
+    composerSubmissionVersion.value
+    return [...composerSubmissions.values()].some(entry => entry.sessionKey === options.sessionKey.value)
+  })
 
   function noteAcceptanceRecoveryChanged() {
     acceptanceRecoveryVersion.value += 1
@@ -670,73 +684,31 @@ export function useChatSend(options: UseChatSendOptions) {
 
   const recoveredQueuedAttempts = new WeakMap<ChatPendingItem, SendAttempt>()
 
-  function currentPromptAnnotationIds(): string[] {
-    return [...(options.promptAnnotationIds?.value || [])]
+  function currentAnnotationDraftIds(): string[] {
+    return [...(options.draftIds?.value || [])]
       .map(value => String(value || '').trim())
       .filter((value, index, values) => Boolean(value) && values.indexOf(value) === index)
       .slice(0, 16)
-  }
-
-  function acceptedPromptAnnotationIds(response: TurnSendResponse): string[] {
-    const values = response.acceptedPromptAnnotationIds || []
-    return Array.isArray(values)
-      ? values
-          .map(value => String(value || '').trim())
-          .filter((value, index, ids) => Boolean(value) && ids.indexOf(value) === index)
-          .slice(0, 16)
-      : []
   }
 
   function acknowledgeAttemptPromptAnnotations(
     attempt: SendAttempt,
     response: TurnSendResponse,
   ) {
-    if (
-      attempt.promptAnnotationIds.length === 0
-      || attempt.promptAnnotationsAcknowledged === true
-    ) return
-    const requested = new Set(attempt.promptAnnotationIds)
-    const accepted = acceptedPromptAnnotationIds(response)
-      .filter(id => requested.has(id))
-    // A mixed-version/pending-dispatch replay may prove ingress acceptance
-    // without carrying the annotation ids. Do not burn the one-shot local
-    // acknowledgement in that case: a later receipt recovery can still carry
-    // the canonical ids and must be allowed to close the draft/picker.
-    if (accepted.length === 0) return
-    // A direct response and the bounded receipt-recovery worker can race to
-    // observe the same accepted request. Consume the Gateway acknowledgement
-    // exactly once so drafts and the native annotation picker transition as
-    // one idempotent UI operation.
+    if (!attempt.promptAnnotations.length || attempt.promptAnnotationsAcknowledged) return
     attempt.promptAnnotationsAcknowledged = true
-    const acceptedSet = new Set(accepted)
-    const acceptedSnapshots = attempt.promptAnnotations.filter(snapshot => (
-      acceptedSet.has(snapshot.annotationId)
-    ))
-    setAttemptPromptAnnotations(attempt, acceptedSnapshots)
-    // A first send from a provisional draft can be accepted under a different
-    // canonical session key. Publish both identities so Workbench can finish
-    // the native annotation lifecycle regardless of which descriptor wins the
-    // render race. Keep the legacy three-argument call when they are equal.
+    setAttemptPromptAnnotations(attempt, attempt.promptAnnotations)
     const acceptedSessionKey = String(
       response.sessionKey
         || attempt.acceptedSessionKey
         || attempt.requestSessionKey,
     ).trim() || attempt.requestSessionKey
     attempt.acceptedSessionKey = acceptedSessionKey
-    if (acceptedSessionKey === attempt.requestSessionKey) {
-      options.acknowledgePromptAnnotations?.(
-        attempt.promptAnnotationIds,
-        accepted,
-        acceptedSessionKey,
-      )
-    } else {
-      options.acknowledgePromptAnnotations?.(
-        attempt.promptAnnotationIds,
-        accepted,
-        acceptedSessionKey,
-        attempt.requestSessionKey,
-      )
-    }
+    options.acknowledgePromptAnnotations?.(
+      attempt.promptAnnotations,
+      acceptedSessionKey,
+      acceptedSessionKey === attempt.requestSessionKey ? undefined : attempt.requestSessionKey,
+    )
   }
 
   function setAttemptPromptAnnotations(
@@ -757,25 +729,18 @@ export function useChatSend(options: UseChatSendOptions) {
     }
   }
 
-  function promptAnnotationSendIsBusy(ids: readonly string[]): boolean {
-    return Boolean(
-      ids.length > 0
-      && (
-        options.stream.isStreaming.value
-        || options.isCompactInFlightForCurrentSession()
-        || responseHandoffBlocksCurrentSession()
-      ),
-    )
-  }
-
-  function rejectBusyPromptAnnotationSend(): void {
-    pushToast(i18n.global.t('chat.toast.promptAnnotationBusy'), { tone: 'info' })
-  }
-
   function pendingWorkspaceForIntent(intent: string | null): string | null {
     return intent === 'new_chat'
       ? options.pendingWorkspaceId?.value || null
       : null
+  }
+
+  function composerAttachments(): Attachment[] {
+    const attachments = options.pendingAttachments.value
+    return attachments.filter((item, index) => attachments.findIndex(candidate => (
+      candidate.local_id === item.local_id
+      || (item.file_uuid && candidate.file_uuid === item.file_uuid)
+    )) === index)
   }
 
   function captureComposerSnapshot(): ComposerSnapshot {
@@ -785,17 +750,20 @@ export function useChatSend(options: UseChatSendOptions) {
     return {
       revision: options.composerRevision?.value ?? null,
       inputText: options.inputText.value,
-      promptAnnotationIds: currentPromptAnnotationIds(),
-      documentContext: normalizeDocumentContext(
-        options.currentDocumentContext?.(options.sessionKey.value),
+      selectedSkills: copySelectedSkills(options.selectedSkills?.value),
+      draftIds: currentAnnotationDraftIds(),
+      pageContext: pageContextForAnnotations(
+        options.promptAnnotationSnapshots?.(currentAnnotationDraftIds()) || [],
       ),
       attachmentRefs,
-      payloadAttachments: attachmentRefs.map(attachment => ({ ...attachment })),
+      payloadAttachments: composerAttachments().map(snapshotAttachment),
       intent,
       forkBeforeMessageId: options.pendingForkBeforeMessageId.value,
       workspaceId: pendingWorkspaceForIntent(intent),
       initialCollaborationMode: initialModeForIntent(intent),
       initialRoutingMode: initialRoutingModeForIntent(intent),
+      initialModel: initialModelForIntent(intent),
+      initialProvider: initialProviderForIntent(intent),
       queueOwnerRequestId: queueOwnerContext?.sessionKey === options.sessionKey.value
         ? queueOwnerContext.ownerRequestId
         : null,
@@ -822,16 +790,23 @@ export function useChatSend(options: UseChatSendOptions) {
       && options.composerRevision
       && options.composerRevision.value !== snapshot.revision
     ) return false
-    return (
-      options.inputText.value === snapshot.inputText
-      && JSON.stringify(currentPromptAnnotationIds()) === JSON.stringify(snapshot.promptAnnotationIds)
-      && options.pendingSessionIntent.value === snapshot.intent
-      && options.pendingForkBeforeMessageId.value === snapshot.forkBeforeMessageId
-      && pendingWorkspaceForIntent(options.pendingSessionIntent.value) === snapshot.workspaceId
+    return composerValuesMatchSnapshot(snapshot)
       && options.pendingAttachments.value.length === snapshot.attachmentRefs.length
       && options.pendingAttachments.value.every(
         (attachment, index) => attachment === snapshot.attachmentRefs[index],
       )
+  }
+
+  function composerValuesMatchSnapshot(snapshot: ComposerSnapshot): boolean {
+    return (
+      options.inputText.value === snapshot.inputText
+      && sameSelectedSkills(options.selectedSkills?.value, snapshot.selectedSkills)
+      && JSON.stringify(currentAnnotationDraftIds()) === JSON.stringify(snapshot.draftIds)
+      && options.pendingSessionIntent.value === snapshot.intent
+      && initialModelForIntent(snapshot.intent) === snapshot.initialModel
+      && initialProviderForIntent(snapshot.intent) === snapshot.initialProvider
+      && options.pendingForkBeforeMessageId.value === snapshot.forkBeforeMessageId
+      && pendingWorkspaceForIntent(options.pendingSessionIntent.value) === snapshot.workspaceId
     )
   }
 
@@ -842,8 +817,11 @@ export function useChatSend(options: UseChatSendOptions) {
       forkBeforeMessageId: snapshot.forkBeforeMessageId,
       workspaceId: snapshot.workspaceId,
       initialCollaborationMode: snapshot.initialCollaborationMode,
-      documentContext: snapshot.documentContext,
+      pageContext: snapshot.pageContext,
+      selectedSkills: copySelectedSkills(snapshot.selectedSkills),
       initialRoutingMode: snapshot.initialRoutingMode,
+      initialModel: snapshot.initialModel,
+      initialProvider: snapshot.initialProvider,
     }
   }
 
@@ -851,10 +829,6 @@ export function useChatSend(options: UseChatSendOptions) {
     if (!hasModelInputImageAttachment(attachments)) return false
     return options.modelRoutingSettingsBusy.value
       || options.imageInputAdmission?.value === 'blocked'
-      || (
-        options.imageInputAdmission === undefined
-        && options.modelRoutingMode.value === 'llm_ensemble'
-      )
   }
 
   function activeSteerCapability(): ChatSteerCapability | null {
@@ -1107,6 +1081,7 @@ export function useChatSend(options: UseChatSendOptions) {
     attempt: SendAttempt,
     response: TurnSendResponse,
   ): Promise<boolean> {
+    consumeAcceptedComposer(attempt)
     acknowledgeAttemptPromptAnnotations(attempt, response)
     attempt.acceptanceResolved = true
     attempt.acceptedTaskId = acceptedTaskId(response)
@@ -1233,10 +1208,88 @@ export function useChatSend(options: UseChatSendOptions) {
   }
 
   function initialRoutingModeForIntent(intent: string | null): GatewayModelRoutingMode | null {
-    return intent === 'new_chat' ? options.initialRoutingMode.value : null
+    if (intent !== 'new_chat') return null
+    // A pin selected while routing is Off also freezes that effective strategy.
+    // This does not mutate either the visible selector or the gateway default.
+    return options.initialRoutingMode.value
+      ?? (options.initialModel?.value && options.modelRoutingMode.value === 'off' ? 'direct' : null)
+  }
+
+  function initialModelForIntent(intent: string | null): string | null {
+    return intent === 'new_chat' ? options.initialModel?.value ?? null : null
+  }
+
+  function initialProviderForIntent(intent: string | null): string | null {
+    return intent === 'new_chat' ? options.initialProvider?.value ?? null : null
+  }
+
+  function consumeAcceptedComposer(attempt: SendAttempt): void {
+    if (options.sessionKey.value !== attempt.requestSessionKey) {
+      if (attempt.unconsumedComposer && !attempt.hiddenControl) {
+        const snapshot = attempt.unconsumedComposer
+        attempt.unconsumedComposer = undefined
+        void attempt.consumeAttachmentDraft?.consume().catch(() => {})
+        attempt.consumeAttachmentDraft = undefined
+        void Promise.resolve(options.consumeAcceptedDraft?.(attempt.requestSessionKey, {
+          text: snapshot.inputText,
+          selectedSkills: copySelectedSkills(snapshot.selectedSkills),
+        })).catch(() => {})
+      }
+      return
+    }
+    if (!attempt.hiddenControl && options.selectedSkills && attempt.unconsumedComposer
+      && !attempt.consumeAttachmentDraft
+      && options.selectedSkills.value === attempt.composerSkillRefs
+      && composerMatchesSnapshot(attempt.unconsumedComposer)) {
+      const sentAttachmentIds = new Set(attempt.attachments.map(attachment => attachment.local_id))
+      options.inputText.value = ''
+      options.selectedSkills.value = []
+      options.pendingAttachments.value = options.pendingAttachments.value.filter(
+        attachment => !sentAttachmentIds.has(attachment.local_id),
+      )
+      if (options.pendingForkBeforeMessageId.value === attempt.forkBeforeMessageId) {
+        options.pendingForkBeforeMessageId.value = null
+      }
+      options.autoResizeTextarea()
+      attempt.unconsumedComposer = undefined
+      attempt.consumeAttachmentDraft = undefined
+    } else if (!attempt.hiddenControl && attempt.unconsumedComposer && attempt.consumeAttachmentDraft) {
+      const snapshot = attempt.unconsumedComposer
+      const consumption = attempt.consumeAttachmentDraft
+      const isOriginal = () => options.sessionKey.value === attempt.requestSessionKey
+        && options.selectedSkills?.value === attempt.composerSkillRefs && composerMatchesSnapshot(snapshot)
+      void consumption.consumeCurrent(
+        () => options.sessionKey.value === attempt.requestSessionKey && (
+          isOriginal()
+          || (consumption.isRestoredCurrent() && composerValuesMatchSnapshot(snapshot))
+        ),
+        () => {
+          options.inputText.value = ''
+          if (options.selectedSkills) options.selectedSkills.value = []
+          if (options.pendingForkBeforeMessageId.value === attempt.forkBeforeMessageId) {
+            options.pendingForkBeforeMessageId.value = null
+          }
+          options.autoResizeTextarea()
+          attempt.unconsumedComposer = undefined
+          attempt.consumeAttachmentDraft = undefined
+        },
+        isOriginal,
+      ).catch(() => {})
+    }
+  }
+
+  function explicitComposerChanged(attempt: SendAttempt): boolean {
+    return Boolean(attempt.selectedSkills.length && attempt.unconsumedComposer
+      && (options.selectedSkills?.value !== attempt.composerSkillRefs
+        || !composerMatchesSnapshot(attempt.unconsumedComposer)))
   }
 
   function consumeAcceptedSessionIntent(attempt: SendAttempt): void {
+    consumeAcceptedComposer(attempt)
+    consumeAcceptedSessionState(attempt)
+  }
+
+  function consumeAcceptedSessionState(attempt: Pick<SendAttempt, 'requestSessionKey' | 'intent' | 'workspaceId'>): void {
     if (options.sessionKey.value !== attempt.requestSessionKey) return
     if (attempt.intent === 'new_chat') {
       options.materializeDraftSession?.(attempt.requestSessionKey)
@@ -1297,7 +1350,7 @@ export function useChatSend(options: UseChatSendOptions) {
       clientMessageId: attempt.clientMessageId,
       params: structuredClone(attempt.params),
       composerText: attempt.composerText,
-      recoveryAttachments: attempt.attachments.map(attachment => ({ ...attachment })),
+      recoveryAttachments: attempt.attachments.map(snapshotAttachment),
       ...(attempt.restoreComposerOnHandoffFailure === false
         ? { restoreComposerOnFailure: false }
         : {}),
@@ -1654,11 +1707,54 @@ export function useChatSend(options: UseChatSendOptions) {
     }
   }
 
+  function consumeRecoveredComposer(record: ResponseHandoffWalRecord): void {
+    const skills = record.params.selectedSkills
+    if (record.restoreComposerOnFailure === false || !skills?.length) return
+    if (options.sessionKey.value !== record.requestSessionKey) {
+      void Promise.resolve(options.consumeAcceptedDraft?.(record.requestSessionKey, {
+        text: record.composerText,
+        selectedSkills: copySelectedSkills(skills),
+      })).catch(() => {})
+      return
+    }
+    // Explicit skill drafts survive until admission. Recovery has no live
+    // SendAttempt, so consume only the exact accepted composer snapshot.
+    if (!options.selectedSkills || options.inputText.value !== record.composerText
+      || !sameSelectedSkills(options.selectedSkills.value, skills)
+      || options.pendingForkBeforeMessageId.value !== (record.params.forkBeforeMessageId ?? null)
+      || options.pendingAttachments.value.some(attachment => !isSendableAttachment(attachment))
+      || !sameSendableAttachments(options.pendingAttachments.value.filter(isSendableAttachment), {
+        attachments: record.recoveryAttachments.filter(isSendableAttachment),
+      })) return
+    if (options.pendingSessionIntent.value === 'new_chat' && (
+      initialRoutingModeForIntent('new_chat') !== (record.params.initialRoutingMode ?? null)
+      || initialModelForIntent('new_chat') !== (record.params.initialModel ?? null)
+      || initialProviderForIntent('new_chat') !== (record.params.initialProvider ?? null)
+      || pendingWorkspaceForIntent('new_chat') !== (record.params.workspaceId ?? null)
+    )) return
+    options.inputText.value = ''
+    options.selectedSkills.value = []
+    const sentAttachmentIds = new Set(record.recoveryAttachments.map(attachment => attachment.local_id))
+    options.pendingAttachments.value = options.pendingAttachments.value.filter(
+      attachment => !sentAttachmentIds.has(attachment.local_id),
+    )
+    if (options.pendingForkBeforeMessageId.value === (record.params.forkBeforeMessageId ?? null)) {
+      options.pendingForkBeforeMessageId.value = null
+    }
+    options.autoResizeTextarea()
+  }
+
   async function finalizeRecoveredHandoff(
     record: ResponseHandoffWalRecord,
     targetSessionKey: string,
   ): Promise<void> {
+    consumeRecoveredComposer(record)
     if (options.sessionKey.value === record.requestSessionKey) {
+      consumeAcceptedSessionState({
+        requestSessionKey: record.requestSessionKey,
+        intent: record.params.intent ?? null,
+        workspaceId: record.params.workspaceId ?? null,
+      })
       const gate = beginResponseHandoff(
         record.requestSessionKey,
         record.ownerRequestId,
@@ -1705,6 +1801,13 @@ export function useChatSend(options: UseChatSendOptions) {
   function restoreResponseHandoffDraft(record: ResponseHandoffWalRecord): boolean {
     if (options.sessionKey.value !== record.requestSessionKey) return false
     if (record.restoreComposerOnFailure === false) return true
+    if (record.params.selectedSkills?.length && options.inputText.value
+      && options.inputText.value !== record.composerText) return false
+    if (record.params.selectedSkills?.length && options.selectedSkills) {
+      if (options.selectedSkills.value.length
+        && !sameSelectedSkills(options.selectedSkills.value, record.params.selectedSkills)) return false
+      options.selectedSkills.value = copySelectedSkills(record.params.selectedSkills)
+    }
     const restoredText = record.composerText.trim()
     if (restoredText && options.inputText.value !== restoredText) {
       options.inputText.value = [restoredText, options.inputText.value]
@@ -1719,7 +1822,7 @@ export function useChatSend(options: UseChatSendOptions) {
     ))
     if (missingAttachments.length > 0) {
       options.pendingAttachments.value = [
-        ...missingAttachments.map(attachment => ({ ...attachment })),
+        ...missingAttachments.map(snapshotAttachment),
         ...options.pendingAttachments.value,
       ]
     }
@@ -1731,6 +1834,12 @@ export function useChatSend(options: UseChatSendOptions) {
     }
     if (!options.pendingSessionIntent.value && typeof record.params.intent === 'string') {
       options.pendingSessionIntent.value = record.params.intent
+    }
+    if (record.params.intent === 'new_chat' && record.params.initialModel && record.params.initialProvider) {
+      options.restoreInitialModel?.({
+        model: record.params.initialModel,
+        provider: record.params.initialProvider,
+      })
     }
     options.autoResizeTextarea()
     return true
@@ -1816,7 +1925,7 @@ export function useChatSend(options: UseChatSendOptions) {
                   ...replayRecord,
                   params: {
                     ...replayRecord.params,
-                    attachments: sendable.map(serializeSendableAttachment),
+                    ...serializeChatFiles(sendable),
                   },
                   recoveryAttachments: refreshed,
                   updatedAt: Date.now(),
@@ -1836,7 +1945,7 @@ export function useChatSend(options: UseChatSendOptions) {
               }).catch(() => {})
               await options.failPendingQueueHandoff?.(replayRecord.ownerRequestId)
               pushToast(
-                sendFailureMessage(error, paramsHaveArtifactContext(replayRecord.params)),
+                sendFailureMessage(error),
                 { tone: 'danger' },
               )
             }
@@ -1951,13 +2060,20 @@ export function useChatSend(options: UseChatSendOptions) {
     }
     if (status !== 'succeeded') {
       const code = terminalReplayErrorCode(response, status)
-      options.messages.value.push({
+      const turnId = acceptedTaskId(response)
+      const reason = response.terminalReason || response.reason
+      const notice: ChatMessage = {
         role: 'error',
-        text: localizedChatErrorMessage(code, terminalReplayMessage(response, status)),
+        text: localizedChatErrorMessage(code, '', false, undefined, status, { reason }),
         errorCode: code,
         terminalNotice: true,
+        ...(turnId ? {
+          turnId,
+          turnOutcome: { turnId, taskId: turnId, status, statusSource: 'task', reason, errorClass: code },
+        } : {}),
         ts: new Date().toISOString(),
-      })
+      }
+      options.messages.value = dedupeTerminalErrorNotices([...options.messages.value, notice])
     }
     options.scheduleHistorySync()
     if (finalizedFreshStream) {
@@ -2015,7 +2131,11 @@ export function useChatSend(options: UseChatSendOptions) {
     const recovered = pendingItem
       ? options.steerDelivery.attemptForItem(pendingItem)
       : null
-    if (!requestSessionKey || !text.trim()) return 'not_sent'
+    if (!requestSessionKey || !text.trim()
+      || pendingItem?.selectedSkills?.length
+      || optionsForSteer.composerSnapshot?.selectedSkills.length
+      || (!pendingItem && options.selectedSkills?.value.length)
+      || pendingItem?.pageContext || optionsForSteer.composerSnapshot?.pageContext) return 'not_sent'
     if (!options.turnCommands.supports('same-turn-steer')) {
       return recovered ? 'retryable_failure' : 'not_sent'
     }
@@ -2242,21 +2362,44 @@ export function useChatSend(options: UseChatSendOptions) {
     }
   }
 
-  async function onSend(invocation: {
+  type SendInvocation = {
     bypassSlashCommand?: boolean
     composerText?: string
     textOverride?: string
     cancelIfComposerChanged?: boolean
-  } = {}) {
+  }
+
+  async function onSend(invocation: SendInvocation = {}) {
+    const key = options.sessionKey.value
+    if ([...composerSubmissions.values()].some(entry => (
+      entry.sessionKey === key && composerMatchesSnapshot(entry.snapshot)
+    ))) return
+    const token = Symbol('composer-send')
+    composerSubmissions.set(token, { sessionKey: key, snapshot: captureComposerSnapshot() })
+    composerSubmissionVersion.value += 1
+    try {
+      await sendComposerInput(invocation)
+    } finally {
+      composerSubmissions.delete(token)
+      composerSubmissionVersion.value += 1
+    }
+  }
+
+  async function sendComposerInput(invocation: SendInvocation) {
     const requestSessionKey = options.sessionKey.value
+    const requestDeliveryIdentity = options.deliveryIdentity?.value
+    const deliveryStillMatches = () => (
+      options.sessionKey.value === requestSessionKey
+      && options.deliveryIdentity?.value === requestDeliveryIdentity
+    )
     const composerSnapshot = captureComposerSnapshot()
     const bypassSlashCommand = invocation.bypassSlashCommand === true
     const composerText = invocation.composerText ?? options.inputText.value
     let text = (invocation.textOverride ?? options.inputText.value).trim()
     let durableText = text
-    let sendableAttachments = options.pendingAttachments.value.filter(isSendableAttachment)
+    let sendableAttachments = composerAttachments().filter(isSendableAttachment)
     let hasPayload = Boolean(
-      text || sendableAttachments.length > 0 || composerSnapshot.promptAnnotationIds.length > 0,
+      text || sendableAttachments.length > 0 || composerSnapshot.draftIds.length > 0,
     )
     let isLiteralSlash = false
     const handoffInFlight = responseHandoffBlocksCurrentSession()
@@ -2270,9 +2413,9 @@ export function useChatSend(options: UseChatSendOptions) {
       isLiteralSlash = true
       text = text.slice(1)
       durableText = `/${text}`
-      sendableAttachments = options.pendingAttachments.value.filter(isSendableAttachment)
+      sendableAttachments = composerAttachments().filter(isSendableAttachment)
       hasPayload = Boolean(
-        text || sendableAttachments.length > 0 || composerSnapshot.promptAnnotationIds.length > 0,
+        text || sendableAttachments.length > 0 || composerSnapshot.draftIds.length > 0,
       )
     }
 
@@ -2288,21 +2431,49 @@ export function useChatSend(options: UseChatSendOptions) {
       ? recoveredAttempt
       : null
     if (exactReplayAttempt) {
+      if (exactReplayAttempt.deliveryIdentity !== undefined
+        && exactReplayAttempt.deliveryIdentity !== requestDeliveryIdentity) return
       const replayBlockedReason = options.idempotentReplayBlockedReason
         || options.sendBlockedReason
       if (replayBlockedReason?.value) return
       if (options.validateActiveProjectBeforeSend) {
         if (await refreshedActiveProjectBlocksSend()) return
       }
-      if (options.sessionKey.value !== requestSessionKey) return
+      if (!deliveryStillMatches()) return
       if (replayBlockedReason?.value) return
       await dispatchSend(exactReplayAttempt.text, {
         composerText,
-        promptAnnotationIds: exactReplayAttempt.promptAnnotationIds,
+        draftIds: exactReplayAttempt.draftIds,
         queueMode: exactReplayAttempt.queueMode,
         retryAttempt: exactReplayAttempt,
         idempotentReplay: true,
+        preDispatchGuard: deliveryStillMatches,
       })
+      return
+    }
+
+    const offlineIdentity = options.offlineQueueIdentity?.value
+    if (offlineIdentity && hasPayload) {
+      // This branch has never called the command port. Already-submitted
+      // requests retain the exact receipt-recovery path above.
+      if (
+        recoveredAttempt
+        || handoffInFlight
+        || !requestSessionKey
+        || offlineIdentity !== options.deliveryIdentity?.value
+        || isControlInput(durableText)
+        || invocation.textOverride !== undefined
+        || composerSnapshot.intent
+        || composerSnapshot.forkBeforeMessageId
+        || composerSnapshot.workspaceId
+        || composerSnapshot.draftIds.length > 0
+        || composerSnapshot.pageContext
+        || modelImageSendBlocked(composerSnapshot.payloadAttachments)
+      ) return
+      const queued = await options.enqueuePendingInput(durableText, undefined, {
+        deliveryIdentity: offlineIdentity,
+      })
+      if (!queued) pushToast(i18n.global.t('chat.toast.offlineQueueFailed'), { tone: 'warn' })
       return
     }
 
@@ -2315,12 +2486,12 @@ export function useChatSend(options: UseChatSendOptions) {
       if (options.validateActiveProjectBeforeSend) {
         if (await refreshedActiveProjectBlocksSend()) return
       }
-      if (options.sessionKey.value !== requestSessionKey) return
+      if (!deliveryStillMatches()) return
       if (!queueOwnerMatchesSnapshot(composerSnapshot)) return
       if (options.sendBlockedReason?.value) return
       if (
-        JSON.stringify(currentPromptAnnotationIds())
-        !== JSON.stringify(composerSnapshot.promptAnnotationIds)
+        JSON.stringify(currentAnnotationDraftIds())
+        !== JSON.stringify(composerSnapshot.draftIds)
       ) return
       if (
         invocation.cancelIfComposerChanged
@@ -2328,10 +2499,6 @@ export function useChatSend(options: UseChatSendOptions) {
       ) return
     }
 
-    if (hasPayload && promptAnnotationSendIsBusy(composerSnapshot.promptAnnotationIds)) {
-      rejectBusyPromptAnnotationSend()
-      return
-    }
 
     // Retry an explicitly rejected prior send with its exact original queue
     // semantics when the visible draft is unchanged.
@@ -2340,24 +2507,28 @@ export function useChatSend(options: UseChatSendOptions) {
       recoveredAttempt &&
       matchesRecoveredDraft(recoveredAttempt, {
         requestSessionKey: options.sessionKey.value,
-        promptAnnotationIds: composerSnapshot.promptAnnotationIds,
-        documentContext: composerSnapshot.documentContext,
+        draftIds: composerSnapshot.draftIds,
+        pageContext: composerSnapshot.pageContext,
+        selectedSkills: composerSnapshot.selectedSkills,
         text,
         attachments: sendableAttachments,
         intent: composerSnapshot.intent,
         initialCollaborationMode: composerSnapshot.initialCollaborationMode,
         initialRoutingMode: composerSnapshot.initialRoutingMode,
+        initialModel: composerSnapshot.initialModel,
+        initialProvider: composerSnapshot.initialProvider,
         forkBeforeMessageId: composerSnapshot.forkBeforeMessageId,
         workspaceId: composerSnapshot.workspaceId,
       })
     ) {
       await dispatchSend(text, {
         composerText,
-        promptAnnotationIds: recoveredAttempt.promptAnnotationIds,
+        draftIds: recoveredAttempt.draftIds,
         queueMode: recoveredAttempt.queueMode,
         payload: payloadFromSnapshot(composerSnapshot),
         composerSnapshot,
         cancelIfComposerChanged: invocation.cancelIfComposerChanged,
+        preDispatchGuard: deliveryStillMatches,
       })
       return
     }
@@ -2369,7 +2540,7 @@ export function useChatSend(options: UseChatSendOptions) {
       : null
     if (slashClassification !== null) {
       if (
-        options.sessionKey.value !== requestSessionKey
+        !deliveryStillMatches()
         || !composerMatchesSnapshot(composerSnapshot)
         || !queueOwnerMatchesSnapshot(composerSnapshot)
         || Boolean(options.sendBlockedReason?.value)
@@ -2380,12 +2551,20 @@ export function useChatSend(options: UseChatSendOptions) {
         && await refreshedActiveProjectBlocksSend()
       ) return
       if (
-        options.sessionKey.value !== requestSessionKey
+        !deliveryStillMatches()
         || !composerMatchesSnapshot(composerSnapshot)
         || !queueOwnerMatchesSnapshot(composerSnapshot)
         || Boolean(options.sendBlockedReason?.value)
         || Boolean(options.taskOwnership && !options.taskOwnership.hydrationResolved.value)
       ) return
+    }
+
+    if (composerSnapshot.selectedSkills.length && (
+      slashClassification === 'registered'
+      || (!bypassSlashCommand && !isLiteralSlash && text.startsWith('!'))
+    )) {
+      pushToast(i18n.global.t('chat.skillPalette.commandWithSkills'), { tone: 'info' })
+      return
     }
 
     const compactInFlight = options.isCompactInFlightForCurrentSession()
@@ -2423,6 +2602,8 @@ export function useChatSend(options: UseChatSendOptions) {
         }
         if (
           options.busySendMode.value === 'steer'
+          && !composerSnapshot.pageContext
+          && composerSnapshot.selectedSkills.length === 0
           && !options.taskOwnership?.stopRequestedTaskId.value
           && !isLiteralSlash
           && canSteerPayload(
@@ -2439,21 +2620,28 @@ export function useChatSend(options: UseChatSendOptions) {
         // preserved (enqueue returns false before clearing the composer).
         const composerChanged = !composerMatchesSnapshot(composerSnapshot)
         if (invocation.cancelIfComposerChanged && composerChanged) return
-        const queuedPromptAnnotationIds = composerSnapshot.promptAnnotationIds
+        const queuedAnnotationDraftIds = composerSnapshot.draftIds
         const queuedEnqueueOptions = {
+          ...(composerSnapshot.selectedSkills.length ? { selectedSkills: composerSnapshot.selectedSkills } : {}),
+          ...(composerSnapshot.pageContext ? {
+            pageContext: composerSnapshot.pageContext,
+            attachments: composerSnapshot.payloadAttachments,
+          } : {}),
           ...(slashClassification === 'unknown' ? { confirmedPlainText: true } : {}),
-          ...(queuedPromptAnnotationIds.length
-            ? { promptAnnotationIds: queuedPromptAnnotationIds }
+          ...(queuedAnnotationDraftIds.length
+            ? { draftIds: queuedAnnotationDraftIds }
             : {}),
         }
         const queued = await Promise.resolve(
           composerChanged || invocation.textOverride !== undefined
             ? options.enqueuePendingPayload?.({
               text: durableText,
+              ...(composerSnapshot.selectedSkills.length ? { selectedSkills: composerSnapshot.selectedSkills } : {}),
+              ...(composerSnapshot.pageContext ? { pageContext: composerSnapshot.pageContext } : {}),
               attachments: composerSnapshot.payloadAttachments,
               intent: composerSnapshot.intent,
-              ...(queuedPromptAnnotationIds.length
-                ? { promptAnnotationIds: queuedPromptAnnotationIds }
+              ...(queuedAnnotationDraftIds.length
+                ? { draftIds: queuedAnnotationDraftIds }
                 : {}),
               ...(slashClassification === 'unknown'
                 ? { confirmedPlainText: true }
@@ -2465,7 +2653,7 @@ export function useChatSend(options: UseChatSendOptions) {
                 queueOwnerFromSnapshot(composerSnapshot),
                 queuedEnqueueOptions,
               )
-              : queuedPromptAnnotationIds.length
+              : queuedAnnotationDraftIds.length || composerSnapshot.selectedSkills.length
                 ? options.enqueuePendingInput(
                   durableText,
                   queueOwnerFromSnapshot(composerSnapshot),
@@ -2488,14 +2676,15 @@ export function useChatSend(options: UseChatSendOptions) {
       if (handled) return
     }
 
-    if (!hasPayload || !options.sessionKey.value) return
+    if (!hasPayload || !deliveryStillMatches()) return
 
     await dispatchSend(text, {
       composerText,
-      promptAnnotationIds: composerSnapshot.promptAnnotationIds,
+      draftIds: composerSnapshot.draftIds,
       payload: payloadFromSnapshot(composerSnapshot),
       composerSnapshot,
       cancelIfComposerChanged: invocation.cancelIfComposerChanged,
+      preDispatchGuard: deliveryStillMatches,
     })
   }
 
@@ -2527,6 +2716,10 @@ export function useChatSend(options: UseChatSendOptions) {
     const ownerSessionKey = expectedSessionKey
       || item.ownerSessionKey
       || options.sessionKey.value
+    const identityStillMatches = () => !item.pendingDeliveryIdentity || (
+      item.pendingDeliveryIdentity === options.deliveryIdentity?.value
+      && !options.offlineQueueIdentity?.value
+    )
     const retryAttempt = recoveredQueuedAttempts.get(item) ?? null
     const steerRetryAttempt = options.steerDelivery.attemptForItem(item)
     const preserveRetryState = (outcome: ChatSendOutcome): ChatSendOutcome => (
@@ -2541,7 +2734,7 @@ export function useChatSend(options: UseChatSendOptions) {
     if (!ownerSessionKey || options.sessionKey.value !== ownerSessionKey) {
       return preserveRetryState('not_sent')
     }
-    if (options.sendBlockedReason?.value) {
+    if (!identityStillMatches() || options.sendBlockedReason?.value) {
       return blockedOutcome()
     }
     if (options.validateActiveProjectBeforeSend) {
@@ -2549,7 +2742,7 @@ export function useChatSend(options: UseChatSendOptions) {
       if (options.sessionKey.value !== ownerSessionKey) {
         return preserveRetryState('not_sent')
       }
-      if (options.sendBlockedReason?.value) return blockedOutcome()
+      if (!identityStillMatches() || options.sendBlockedReason?.value) return blockedOutcome()
     }
     if (options.hasPendingAttachmentWork()) {
       if (delivery === 'steer') {
@@ -2628,10 +2821,6 @@ export function useChatSend(options: UseChatSendOptions) {
       }
       if (
         options.imageInputAdmission?.value === 'blocked'
-        || (
-          options.imageInputAdmission === undefined
-          && options.modelRoutingMode.value === 'llm_ensemble'
-        )
       ) {
         return preserveRetryState('not_sent')
       }
@@ -2648,20 +2837,25 @@ export function useChatSend(options: UseChatSendOptions) {
     }
 
     if (delivery === 'steer') {
+      if (item.selectedSkills?.length) return preserveRetryState('not_sent')
+      if (item.pendingDeliveryIdentity) return preserveRetryState('not_sent')
       if (text.startsWith('//')) return preserveRetryState('not_sent')
       return dispatchSteerV2(text, { queuedItem: item })
     }
     const outcome = await dispatchSend(dispatchText, {
       composerText: item.text,
-      promptAnnotationIds: item.promptAnnotationIds || [],
+      draftIds: item.draftIds || [],
       payload: {
         attachments: item.attachments,
+        pageContext: item.pageContext,
+        selectedSkills: copySelectedSkills(item.selectedSkills),
         intent: item.intent,
         // A queued follow-up has no fork target. In particular, never inherit
         // the fork target of the unrelated draft currently in the composer.
         forkBeforeMessageId: null,
       },
       preserveComposer: true,
+      preDispatchGuard: identityStillMatches,
       retryAttempt,
       rememberRetryableAttempt: attempt => {
         recoveredQueuedAttempts.set(item, attempt)
@@ -2697,6 +2891,7 @@ export function useChatSend(options: UseChatSendOptions) {
     sendOpts: DispatchSendOptions = {},
   ): Promise<ChatSendOutcome> {
     const requestSessionKey = options.sessionKey.value
+    const requestDeliveryIdentity = options.deliveryIdentity?.value
     if (!requestSessionKey) return 'not_sent'
     const blockedReason = sendOpts.idempotentReplay
       ? options.idempotentReplayBlockedReason || options.sendBlockedReason
@@ -2704,10 +2899,23 @@ export function useChatSend(options: UseChatSendOptions) {
     if (blockedReason?.value) return 'not_sent'
     const preDispatchAllowed = (
       stage: 'preflight' | 'before_rpc' = 'preflight',
-    ) => sendOpts.preDispatchGuard?.(stage) !== false
+    ) => {
+      if (options.deliveryIdentity?.value !== requestDeliveryIdentity) return false
+      const snapshot = sendOpts.composerSnapshot
+      // A project choice preserves the draft key. An older preparation must
+      // still not send that draft into its previous directory. Unknown
+      // acceptance replays retain their original, immutable request instead.
+      if (
+        !sendOpts.idempotentReplay
+        && snapshot?.intent === 'new_chat'
+        && snapshot.workspaceId !== pendingWorkspaceForIntent(options.pendingSessionIntent.value)
+      ) return false
+      return sendOpts.preDispatchGuard?.(stage) !== false
+    }
     if (!preDispatchAllowed()) return 'not_sent'
     let preserveComposer = sendOpts.preserveComposer === true
-    const sourceAttachments = sendOpts.payload?.attachments ?? options.pendingAttachments.value
+    const sourceAttachments = sendOpts.payload?.attachments
+      ?? composerAttachments()
     const intent = sendOpts.payload
       ? sendOpts.payload.intent
       : options.pendingSessionIntent.value
@@ -2732,19 +2940,35 @@ export function useChatSend(options: UseChatSendOptions) {
     )
       ? sendOpts.payload.initialRoutingMode ?? null
       : initialRoutingModeForIntent(intent)
-    const initialSendableAttachments = sourceAttachments.filter(isSendableAttachment)
-    const requestedDocumentContext = intent === null
-      ? sendOpts.payload
-        ? normalizeDocumentContext(sendOpts.payload.documentContext)
-        : normalizeDocumentContext(options.currentDocumentContext?.(requestSessionKey))
+    const initialModel = intent === 'new_chat'
+      ? sendOpts.payload && 'initialModel' in sendOpts.payload
+        ? sendOpts.payload.initialModel ?? null : initialModelForIntent(intent)
       : null
+    const initialProvider = initialModel
+      ? sendOpts.payload && 'initialProvider' in sendOpts.payload
+        ? sendOpts.payload.initialProvider ?? null : initialProviderForIntent(intent)
+      : null
+    // Exact receipt recovery must retain the original payload even if today's
+    // draft route differs. A fresh pin may never silently turn routing Off.
+    if (!sendOpts.idempotentReplay && initialModel && (
+      (initialRoutingMode !== null && initialRoutingMode !== 'direct')
+      || options.modelRoutingMode.value !== 'off'
+    )) return 'not_sent'
+    const initialSendableAttachments = sourceAttachments.filter(isSendableAttachment)
+    const requestedSelectedSkills = copySelectedSkills(
+      sendOpts.payload ? sendOpts.payload.selectedSkills : options.selectedSkills?.value,
+    )
+    const requestedPageContext = normalizePageContext(sendOpts.payload?.pageContext)
+      || pageContextForAnnotations(options.promptAnnotationSnapshots?.(
+        sendOpts.draftIds ?? currentAnnotationDraftIds(),
+      ) || [])
     // This is deliberately before optimistic rendering, composer clearing,
     // stream state, and chat.send. A blocked draft remains exactly editable.
     if (modelImageSendBlocked(sourceAttachments)) return 'not_sent'
     const retryCandidate = sendOpts.retryAttempt ?? (preserveComposer ? null : recoveredAttempt)
-    const requestedPromptAnnotationIds = sendOpts.promptAnnotationIds === undefined
-      ? currentPromptAnnotationIds()
-      : [...sendOpts.promptAnnotationIds]
+    const requestedAnnotationDraftIds = sendOpts.draftIds === undefined
+      ? currentAnnotationDraftIds()
+      : [...sendOpts.draftIds]
           .map(value => String(value || '').trim())
           .filter((value, index, values) => Boolean(value) && values.indexOf(value) === index)
           .slice(0, 16)
@@ -2759,13 +2983,16 @@ export function useChatSend(options: UseChatSendOptions) {
         retryCandidate
         && matchesRecoveredDraft(retryCandidate, {
           requestSessionKey,
-          promptAnnotationIds: requestedPromptAnnotationIds,
-          documentContext: requestedDocumentContext,
+          draftIds: requestedAnnotationDraftIds,
+          pageContext: requestedPageContext,
+          selectedSkills: requestedSelectedSkills,
           text,
           attachments: initialSendableAttachments,
           intent,
           initialCollaborationMode,
           initialRoutingMode,
+          initialModel,
+          initialProvider,
           forkBeforeMessageId,
           workspaceId,
         })
@@ -2773,47 +3000,40 @@ export function useChatSend(options: UseChatSendOptions) {
       ),
     )
     const retryAttempt = isRecoveredRetry ? retryCandidate : null
+    if (retryAttempt?.deliveryIdentity !== undefined
+      && retryAttempt.deliveryIdentity !== requestDeliveryIdentity) return 'not_sent'
     // The automatic receipt recovery and a user-triggered retry share the
     // immutable SendAttempt. Never put the same idempotency key on the wire
     // twice concurrently.
     if (retryAttempt?.acceptanceInFlight) return 'retryable_failure'
-    const attemptPromptAnnotationIds = retryAttempt?.promptAnnotationIds
-      ?? requestedPromptAnnotationIds
-    if (promptAnnotationSendIsBusy(attemptPromptAnnotationIds)) {
-      rejectBusyPromptAnnotationSend()
-      return 'not_sent'
-    }
-    // A fresh send must observe every prior autosave for this batch before it
-    // captures the optimistic transcript snapshot or constructs chat.send.
-    // Exact idempotent replay always reuses the original immutable attempt.
+    const attemptAnnotationDraftIds = retryAttempt?.draftIds
+      ?? requestedAnnotationDraftIds
+    // Finish local overlay edits before taking the immutable send snapshot.
+    // An idempotent replay reuses the original input.
     if (
       !retryAttempt
-      && attemptPromptAnnotationIds.length > 0
+      && !preserveComposer
+      && attemptAnnotationDraftIds.length > 0
       && options.preparePromptAnnotationsForSend
     ) {
       const ready = await options.preparePromptAnnotationsForSend(
-        attemptPromptAnnotationIds,
-        { isCurrent: () => options.sessionKey.value === requestSessionKey },
+        attemptAnnotationDraftIds,
+        { isCurrent: () => options.sessionKey.value === requestSessionKey && preDispatchAllowed() },
       )
       if (!ready || options.sessionKey.value !== requestSessionKey) return 'not_sent'
+      if (!preDispatchAllowed()) return 'not_sent'
       if (options.sendBlockedReason?.value) return 'not_sent'
       if (
-        JSON.stringify(currentPromptAnnotationIds())
-        !== JSON.stringify(attemptPromptAnnotationIds)
+        JSON.stringify(currentAnnotationDraftIds())
+        !== JSON.stringify(attemptAnnotationDraftIds)
       ) return 'not_sent'
-      if (promptAnnotationSendIsBusy(attemptPromptAnnotationIds)) {
-        rejectBusyPromptAnnotationSend()
-        return 'not_sent'
-      }
     }
-    let attemptDocumentContext = retryAttempt?.documentContext ?? requestedDocumentContext
-    // Prompt annotations already bind their own exact document revision, and
-    // Gateway intentionally rejects combining both context protocols. A normal
-    // fresh send instead flushes the active source editor before any optimistic
-    // message, composer mutation, or RPC and binds the exact resulting head.
-    if (attemptPromptAnnotationIds.length > 0) {
-      attemptDocumentContext = null
+    const attemptSelectedSkills = copySelectedSkills(retryAttempt?.selectedSkills ?? requestedSelectedSkills)
+    if (attemptSelectedSkills.length && !options.turnCommands.supports('explicit-skills')) {
+      pushToast(i18n.global.t('chat.skillPalette.unsupported'), { tone: 'warn' })
+      return 'not_sent'
     }
+    const attemptPageContext = retryAttempt?.pageContext ?? requestedPageContext
     const sendAttachmentIds = new Set(
       (retryAttempt?.attachments || initialSendableAttachments)
         .map(attachment => attachment.local_id),
@@ -2825,41 +3045,19 @@ export function useChatSend(options: UseChatSendOptions) {
       : undefined
     if (!retryAttempt && !serverStagedPendingItem && options.prepareAttachmentsForSend) {
       const ready = await options.prepareAttachmentsForSend({
-        isCurrent: () => options.sessionKey.value === requestSessionKey,
-        ...(sendOpts.payload ? { attachments: sourceAttachments } : {}),
+        isCurrent: () => options.sessionKey.value === requestSessionKey && preDispatchAllowed(),
+        attachments: sourceAttachments,
       })
       if (!ready) return 'not_sent'
       if (options.sessionKey.value !== requestSessionKey) return 'not_sent'
       if (!preDispatchAllowed()) return 'not_sent'
-    }
-    if (
-      !retryAttempt
-      && attemptPromptAnnotationIds.length === 0
-      && requestedDocumentContext
-      && options.prepareDocumentContextForSend
-    ) {
-      let prepared: TurnDocumentContext | null | false
-      try {
-        prepared = await options.prepareDocumentContextForSend(
-          requestSessionKey,
-          { isCurrent: () => options.sessionKey.value === requestSessionKey },
-        )
-      } catch {
-        return 'not_sent'
-      }
-      if (prepared === false || options.sessionKey.value !== requestSessionKey) return 'not_sent'
-      if (blockedReason?.value || !preDispatchAllowed()) return 'not_sent'
-      const normalized = normalizeDocumentContext(prepared)
-      if (prepared !== null && normalized === null) return 'not_sent'
-      attemptDocumentContext = normalized
     }
     const composerChanged = sendOpts.composerSnapshot
       ? !composerMatchesSnapshot(sendOpts.composerSnapshot)
       : false
     if (sendOpts.cancelIfComposerChanged && composerChanged) return 'not_sent'
     if (composerChanged) preserveComposer = true
-    const currentSourceAttachments = sendOpts.payload?.attachments
-      ?? options.pendingAttachments.value
+    const currentSourceAttachments = sourceAttachments
     if (
       preserveComposer
       && !serverStagedPendingItem
@@ -2882,7 +3080,7 @@ export function useChatSend(options: UseChatSendOptions) {
     if (
       !text
       && attachmentsToSend.length === 0
-      && attemptPromptAnnotationIds.length === 0
+      && attemptAnnotationDraftIds.length === 0
       && !serverStagedPendingItem
     ) {
       return 'not_sent'
@@ -2908,6 +3106,7 @@ export function useChatSend(options: UseChatSendOptions) {
         text: userText,
         ts: new Date().toISOString(),
         clientId: attempt.clientMessageId,
+        ...(attempt.selectedSkills.length ? { selectedSkills: copySelectedSkills(attempt.selectedSkills) } : {}),
         ...(accepted?.messageId ? { messageId: accepted.messageId } : {}),
         ...(accepted?.turnId ? { turnId: accepted.turnId } : {}),
       })
@@ -2934,21 +3133,18 @@ export function useChatSend(options: UseChatSendOptions) {
           || sendOpts.replayCoordination?.clientRequestId
           || createClientRequestId(),
         clientMessageId,
-        message: text || (attemptPromptAnnotationIds.length > 0
-          ? i18n.global.t('chat.promptAnnotations.applyPrompt')
+        message: text || (attemptPageContext?.annotations?.length
+          ? (attemptPageContext?.annotations || []).map(annotation => annotation.text).join('\n')
           : 'Describe these attachments'),
         // The Vue client never uses the legacy cancel-style steer path. Make
         // ordinary sends explicit so a persisted session queue_mode="steer"
         // from an older client cannot silently turn them into interrupts.
-        queueMode: sendOpts?.queueMode ?? 'followup',
+        queueMode: attemptSelectedSkills.length ? 'followup' : sendOpts?.queueMode ?? 'followup',
         sessionKey: requestSessionKey,
       }
-      if (attemptPromptAnnotationIds.length > 0) {
-        params.promptAnnotationIds = [...attemptPromptAnnotationIds]
-        if (!userText) params.displayText = ''
-      } else if (attemptDocumentContext) {
-        params.documentContext = { ...attemptDocumentContext }
-      }
+      if (attemptSelectedSkills.length) params.selectedSkills = copySelectedSkills(attemptSelectedSkills)
+      if (attemptPageContext) params.pageContext = attemptPageContext
+      if (attemptPageContext?.annotations?.length && !userText) params.displayText = ''
       params.source = chatSourceMetadata(options)
       if (intent) params.intent = intent
       if (intent === 'new_chat' && workspaceId) params.workspaceId = workspaceId
@@ -2956,25 +3152,39 @@ export function useChatSend(options: UseChatSendOptions) {
         params.collaborationMode = initialCollaborationMode
       }
       if (initialRoutingMode) params.initialRoutingMode = initialRoutingMode
+      if (initialModel) params.initialModel = initialModel
+      if (initialProvider) params.initialProvider = initialProvider
       if (forkBeforeMessageId) params.forkBeforeMessageId = forkBeforeMessageId
       if (attachmentsToSend.length > 0 || sendOpts.includeEmptyAttachments) {
         params.displayText = userText
-        params.attachments = attachmentsToSend.map(serializeSendableAttachment)
+        Object.assign(params, serializeChatFiles(attachmentsToSend))
       }
+      const localSnapshots = options.promptAnnotationSnapshots?.(attemptAnnotationDraftIds) || []
+      const sentSnapshots = pageAnnotationSnapshots(attemptPageContext).map((input, index) => ({
+        ...localSnapshots[index],
+        ...input,
+        annotationId: attemptAnnotationDraftIds[index] || input.annotationId,
+        documentName: localSnapshots[index]?.documentName || input.documentName,
+        tagName: localSnapshots[index]?.tagName || input.tagName,
+      }))
       attempt = {
         clientRequestId: params.clientRequestId!,
         clientMessageId,
         composerText: sendOpts?.composerText ?? text,
         requestSessionKey,
-        promptAnnotationIds: [...attemptPromptAnnotationIds],
-        promptAnnotations: options.promptAnnotationSnapshots?.(attemptPromptAnnotationIds) || [],
-        documentContext: attemptDocumentContext ? { ...attemptDocumentContext } : null,
+        deliveryIdentity: requestDeliveryIdentity,
+        draftIds: [...attemptAnnotationDraftIds],
+        promptAnnotations: sentSnapshots,
+        pageContext: attemptPageContext,
+        selectedSkills: copySelectedSkills(attemptSelectedSkills),
         queueMode: sendOpts?.queueMode,
         text,
-        attachments: attachmentsToSend.map(attachment => ({ ...attachment })),
+        attachments: attachmentsToSend.map(snapshotAttachment),
         intent,
         initialCollaborationMode,
         initialRoutingMode,
+        initialModel,
+        initialProvider,
         forkBeforeMessageId,
         workspaceId,
         ...(sendOpts.acceptedVisibleReplay
@@ -2985,7 +3195,7 @@ export function useChatSend(options: UseChatSendOptions) {
           : {}),
         params,
       }
-      if (attempt.forkBeforeMessageId) {
+      if (attempt.forkBeforeMessageId || attempt.initialModel) {
         durableHandoffRecord = await persistResponseHandoff(
           attempt,
           sendOpts.requirePreparedHandoff,
@@ -3004,6 +3214,7 @@ export function useChatSend(options: UseChatSendOptions) {
           ts: now,
           clientId: clientMessageId,
           ...(displayAttachments.length > 0 ? { attachments: displayAttachments } : {}),
+          ...(attempt.selectedSkills.length ? { selectedSkills: copySelectedSkills(attempt.selectedSkills) } : {}),
           ...(attempt.promptAnnotations.length > 0
             ? { promptAnnotations: attempt.promptAnnotations }
             : {}),
@@ -3012,7 +3223,7 @@ export function useChatSend(options: UseChatSendOptions) {
         options.scrollToBottom()
       }
     }
-    if (attempt.forkBeforeMessageId && !durableHandoffRecord) {
+    if ((attempt.forkBeforeMessageId || attempt.initialModel) && !durableHandoffRecord) {
       durableHandoffRecord = await persistResponseHandoff(
         attempt,
         sendOpts.requirePreparedHandoff,
@@ -3023,12 +3234,20 @@ export function useChatSend(options: UseChatSendOptions) {
       if (!preDispatchAllowed()) return rejectBeforeDispatch()
     }
     if (!preDispatchAllowed()) return rejectBeforeDispatch()
+    if (preserveComposer) {
+      attempt.composerSkillRefs = undefined
+      attempt.unconsumedComposer = undefined
+      attempt.consumeAttachmentDraft = undefined
+    }
     if (!preserveComposer) options.closeSlashMenu()
     recordSessionNavigationDiag('send.start', {
       requestSession: requestSessionKey,
       current: requestSessionKey,
     })
     if (!preserveComposer) {
+      if (sameSelectedSkills(options.selectedSkills?.value, attempt.selectedSkills)) {
+        attempt.composerSkillRefs = options.selectedSkills?.value
+      }
       recoveredAttempt = null
       const composerTextBeforeSend = options.inputText.value
       const preserveEditedComposer = Boolean(
@@ -3036,13 +3255,23 @@ export function useChatSend(options: UseChatSendOptions) {
         && composerTextBeforeSend
         && composerTextBeforeSend !== retryAttempt.composerText
       )
-      options.inputText.value = preserveEditedComposer ? composerTextBeforeSend : ''
-      options.autoResizeTextarea()
-      options.pendingAttachments.value = attachmentsToKeep
-      if (options.pendingForkBeforeMessageId.value === forkBeforeMessageId) {
-        options.pendingForkBeforeMessageId.value = null
+      if (attempt.selectedSkills.length) {
+        // Keep the complete explicit request in its draft until admission is
+        // known. Navigating away or losing an ACK cannot strand only its tags.
+        attempt.unconsumedComposer = composerTextBeforeSend === attempt.composerText
+          && sameSelectedSkills(options.selectedSkills?.value, attempt.selectedSkills)
+          ? captureComposerSnapshot() : undefined
+        attempt.consumeAttachmentDraft = attempt.unconsumedComposer
+          ? options.captureAttachmentDraftConsumption?.(attempt.attachments) : undefined
+      } else {
+        options.inputText.value = preserveEditedComposer ? composerTextBeforeSend : ''
+        options.autoResizeTextarea()
+        options.pendingAttachments.value = attachmentsToKeep
+        if (options.pendingForkBeforeMessageId.value === forkBeforeMessageId) {
+          options.pendingForkBeforeMessageId.value = null
+        }
       }
-    } else if (sendOpts.composerSnapshot) {
+    } else if (sendOpts.composerSnapshot && !attempt.selectedSkills.length) {
       const originalAttachmentRefs = new Set(sendOpts.composerSnapshot.attachmentRefs)
       options.pendingAttachments.value = options.pendingAttachments.value.filter(
         attachment => !originalAttachmentRefs.has(attachment),
@@ -3089,7 +3318,7 @@ export function useChatSend(options: UseChatSendOptions) {
     }
     options.aborted.value = false
     let responseHandoff = (
-      attempt.forkBeforeMessageId
+      (attempt.forkBeforeMessageId || attempt.initialModel)
         ? beginResponseHandoff(
             requestSessionKey,
             attempt.clientRequestId,
@@ -3130,7 +3359,9 @@ export function useChatSend(options: UseChatSendOptions) {
       attempt.acceptanceRequest = { request: acceptanceRequest }
       attempt.acceptanceInFlight = true
       const res = await options.turnCommands.send(acceptanceRequest)
+      consumeAcceptedComposer(attempt)
       acknowledgeAttemptPromptAnnotations(attempt, res)
+
       attempt.acceptanceResolved = true
       attempt.acceptedTaskId = acceptedTaskId(res)
       attempt.acceptedSessionKey = res?.sessionKey || requestSessionKey
@@ -3159,6 +3390,14 @@ export function useChatSend(options: UseChatSendOptions) {
       const lostFreshStream = !wasStreaming
         && !freshSendStillOwnsStream(freshSendToken, requestSessionKey)
       if (stoppedByUser || lostFreshStream) {
+        if (options.sessionKey.value !== requestSessionKey) {
+          recordSessionNavigationDiag('send.response.stale', {
+            requestSession: requestSessionKey,
+            responseSession: res?.sessionKey,
+            current: options.sessionKey.value,
+            reason: 'current_session_changed',
+          })
+        }
         const acceptedSessionKey = res?.sessionKey || requestSessionKey
         const stoppedTerminalIsCurrent = Boolean(
           stoppedByUser
@@ -3285,6 +3524,14 @@ export function useChatSend(options: UseChatSendOptions) {
     } catch (err: unknown) {
       const commandError = turnCommandFailure(err)
       const acceptedError = acceptedErrorInfo(err)
+      if (attempt.initialModel && !attempt.forkBeforeMessageId && commandError?.accepted === false) {
+        // A known rejection is editable again. Do not leave a submitting WAL
+        // record that could later replay an abandoned model choice on reopen.
+        if (durableHandoffRecord && await deleteResponseHandoff(durableHandoffRecord)) {
+          durableHandoffRecord = null
+          if (responseHandoff) responseHandoff.durableRecord = null
+        }
+      }
       if (!acceptedError) setAttemptPromptAnnotations(attempt, [])
       if (acceptedError && !commitAcceptedVisibleReplay({
         messageId: acceptedError.messageId,
@@ -3375,7 +3622,7 @@ export function useChatSend(options: UseChatSendOptions) {
         }
         options.messages.value.push({
           role: 'error',
-          text: sendFailureMessage(err, paramsHaveArtifactContext(attempt.params)),
+          text: sendFailureMessage(err),
           errorCode: errorCode(err),
           ts: new Date().toISOString(),
         })
@@ -3417,10 +3664,72 @@ export function useChatSend(options: UseChatSendOptions) {
         }
       }
       rememberRetryableAttempt(true)
+      if (!preserveComposer && !acceptedError && !sendOpts.suppressRejectedFailureMessage) {
+        const restoredSnapshot = captureComposerSnapshot()
+        const separateSkillDraft = explicitComposerChanged(attempt)
+          || (options.selectedSkills?.value.length
+          && !sameSelectedSkills(options.selectedSkills.value, attempt.selectedSkills))
+          || (attempt.selectedSkills.length && restoredSnapshot.inputText !== attempt.composerText)
+        const originalDraftRestored = restoredSnapshot.inputText === attempt.composerText
+          && matchesRecoveredDraft(attempt, {
+            requestSessionKey,
+            draftIds: restoredSnapshot.draftIds,
+            pageContext: restoredSnapshot.pageContext,
+            selectedSkills: restoredSnapshot.selectedSkills,
+            text: attempt.text,
+            attachments: restoredSnapshot.payloadAttachments.filter(isSendableAttachment),
+            intent: restoredSnapshot.intent,
+            initialCollaborationMode: restoredSnapshot.initialCollaborationMode,
+            initialRoutingMode: restoredSnapshot.initialRoutingMode,
+            initialModel: restoredSnapshot.initialModel,
+            initialProvider: restoredSnapshot.initialProvider,
+            forkBeforeMessageId: restoredSnapshot.forkBeforeMessageId,
+            workspaceId: restoredSnapshot.workspaceId,
+          })
+        const canRetry = commandError?.accepted === false
+          && commandError.retryable !== false
+          && Boolean(attempt.deliveryIdentity)
+          && attempt.deliveryIdentity === options.deliveryIdentity?.value
+          && (separateSkillDraft || originalDraftRestored)
+        pushToast(sendFailureMessage(err), {
+          tone: 'danger',
+          duration: 8000,
+          ...(canRetry ? { action: {
+            label: i18n.global.t('chat.retry'),
+            onClick: () => {
+              if (
+                recoveredAttempt !== attempt
+                || options.sessionKey.value !== requestSessionKey
+                || attempt.deliveryIdentity !== options.deliveryIdentity?.value
+                || !composerMatchesSnapshot(restoredSnapshot)
+                || options.sendBlockedReason?.value
+                || options.offlineQueueIdentity?.value
+                || options.stream.isStreaming.value
+                || hasAuthoritativeWork()
+              ) return
+              if (separateSkillDraft) {
+                void dispatchSend(attempt.text, {
+                  retryAttempt: attempt, preserveComposer: true, draftIds: attempt.draftIds,
+                  payload: {
+                    selectedSkills: copySelectedSkills(attempt.selectedSkills),
+                    attachments: attempt.attachments, pageContext: attempt.pageContext,
+                    intent: attempt.intent, forkBeforeMessageId: attempt.forkBeforeMessageId,
+                    workspaceId: attempt.workspaceId,
+                    initialCollaborationMode: attempt.initialCollaborationMode,
+                    initialRoutingMode: attempt.initialRoutingMode,
+                  },
+                })
+              } else {
+                void onSend()
+              }
+            },
+          } } : {}),
+        })
+      }
       if (acceptedError || !sendOpts.suppressRejectedFailureMessage) {
         options.messages.value.push({
           role: 'error',
-          text: sendFailureMessage(err, paramsHaveArtifactContext(attempt.params)),
+          text: sendFailureMessage(err),
           errorCode: errorCode(err),
           ts: new Date().toISOString(),
         })
@@ -3470,6 +3779,7 @@ export function useChatSend(options: UseChatSendOptions) {
       return Boolean(
         anchor
         && anchor.text === text
+        && sameSelectedSkills(anchor.selectedSkills, payload.selectedSkills)
         && (anchor.attachments?.length ?? 0) === 0,
       )
     }
@@ -3497,13 +3807,16 @@ export function useChatSend(options: UseChatSendOptions) {
       usageBarrierReplayAttempt,
       {
         requestSessionKey,
-        promptAnnotationIds: [],
-        documentContext: null,
+        draftIds: [],
+        pageContext: null,
+        selectedSkills: copySelectedSkills(payload.selectedSkills),
         text,
         attachments: [],
         intent: null,
         initialCollaborationMode: null,
         initialRoutingMode: null,
+        initialModel: null,
+        initialProvider: null,
         forkBeforeMessageId,
         workspaceId: null,
       },
@@ -3513,6 +3826,7 @@ export function useChatSend(options: UseChatSendOptions) {
     try {
       const outcome = await dispatchSend(text, {
         payload: {
+          selectedSkills: copySelectedSkills(payload.selectedSkills),
           attachments: [],
           intent: null,
           forkBeforeMessageId,
@@ -3548,6 +3862,18 @@ export function useChatSend(options: UseChatSendOptions) {
     recovery: { requiresIdempotentReplay: boolean },
   ) {
     const currentText = options.inputText.value
+    if (explicitComposerChanged(attempt) || (options.selectedSkills?.value.length
+      && !sameSelectedSkills(options.selectedSkills.value, attempt.selectedSkills))
+      || (attempt.selectedSkills.length && currentText && currentText !== attempt.composerText)) {
+      // A rejected request still owns its bound identities. Do not merge its
+      // text into a newer draft that explicitly selected different instructions.
+      attempt.requiresIdempotentReplay = recovery.requiresIdempotentReplay
+      recoveredAttempt = attempt
+      return
+    }
+    if (attempt.selectedSkills.length && options.selectedSkills?.value.length === 0) {
+      options.selectedSkills.value = copySelectedSkills(attempt.selectedSkills)
+    }
     if (!currentText) {
       options.inputText.value = attempt.composerText
     } else if (
@@ -3729,6 +4055,29 @@ export function useChatSend(options: UseChatSendOptions) {
     const existing = hiddenDispatchInFlight.get(hiddenDispatchKey)
     if (existing) return existing
 
+    const existingRecord = listHiddenControls(requestSessionKey, options.hiddenControlStorage)
+      .find(item => item.clientRequestId === stableClientRequestId)
+    const hiddenIntent = requestSessionKey === options.sessionKey.value
+      && !options.stream.isStreaming.value && !hasAuthoritativeWork()
+      ? options.pendingSessionIntent.value : null
+    const routingMode = initialRoutingModeForIntent(hiddenIntent)
+    const model = initialModelForIntent(hiddenIntent)
+    const provider = model ? initialProviderForIntent(hiddenIntent) : null
+    if (!existingRecord && model && (options.modelRoutingMode.value !== 'off'
+      || (routingMode && routingMode !== 'direct'))) {
+      return Promise.resolve(hiddenDispatchResult('rejected', 'invalid_request', stableClientRequestId, requestSessionKey))
+    }
+    // Reopening or retrying a stable control uses its persisted creation input,
+    // even when the currently visible draft has changed in the meantime.
+    const initialSettings: HiddenControlInitialSettings | null | undefined = existingRecord
+      ? existingRecord.initialSettings
+      : hiddenIntent === 'new_chat' ? {
+          intent: 'new_chat',
+          ...(routingMode ? { initialRoutingMode: routingMode } : {}),
+          ...(model ? { initialModel: model } : {}),
+          ...(provider ? { initialProvider: provider } : {}),
+        } : null
+
     // Persist before either local queueing or RPC. The payload contains only
     // the already-visible control turn (never provider credentials), while its
     // stable request id lets Gateway ingress collapse response-loss retries.
@@ -3737,6 +4086,7 @@ export function useChatSend(options: UseChatSendOptions) {
       clientRequestId: stableClientRequestId,
       providerText,
       displayText,
+      ...(initialSettings !== undefined ? { initialSettings } : {}),
     }, options.hiddenControlStorage)
     if (persistResult === 'conflict' || persistResult === 'failed' || persistResult === 'invalid') {
       return Promise.resolve(hiddenDispatchResult(
@@ -3772,6 +4122,7 @@ export function useChatSend(options: UseChatSendOptions) {
       displayText,
       stableClientRequestId,
       requestSessionKey,
+      initialSettings,
     )
     hiddenDispatchInFlight.set(hiddenDispatchKey, operation)
     void operation.then(() => {
@@ -3791,6 +4142,7 @@ export function useChatSend(options: UseChatSendOptions) {
     displayText: string,
     stableClientRequestId: string,
     requestSessionKey: string,
+    initialSettings: HiddenControlInitialSettings | null | undefined,
   ): Promise<HiddenControlDispatchResult> {
     const compactInFlight = options.isCompactInFlightForCurrentSession()
     const handoffInFlight = responseHandoffBlocksCurrentSession()
@@ -3850,12 +4202,17 @@ export function useChatSend(options: UseChatSendOptions) {
       message: providerText,
       sessionKey: requestSessionKey,
     }
-    const hiddenSessionIntent = requestSessionKey === options.sessionKey.value
-      ? options.pendingSessionIntent.value
-      : null
-    const hiddenInitialRoutingMode = initialRoutingModeForIntent(hiddenSessionIntent)
+    const hiddenSessionIntent = initialSettings !== undefined
+      ? initialSettings?.intent ?? null
+      : requestSessionKey === options.sessionKey.value ? options.pendingSessionIntent.value : null
+    const hiddenInitialRoutingMode = initialSettings !== undefined
+      ? initialSettings?.initialRoutingMode ?? null : initialRoutingModeForIntent(hiddenSessionIntent)
+    const hiddenInitialModel = initialSettings?.initialModel ?? null
+    const hiddenInitialProvider = initialSettings?.initialProvider ?? null
     if (hiddenSessionIntent) params.intent = hiddenSessionIntent
     if (hiddenInitialRoutingMode) params.initialRoutingMode = hiddenInitialRoutingMode
+    if (hiddenInitialModel) params.initialModel = hiddenInitialModel
+    if (hiddenInitialProvider) params.initialProvider = hiddenInitialProvider
     if (displayText && displayText !== providerText) params.displayText = displayText
     params.source = chatSourceMetadata(options)
 
@@ -3868,14 +4225,17 @@ export function useChatSend(options: UseChatSendOptions) {
       clientMessageId,
       composerText: displayText,
       requestSessionKey,
-      promptAnnotationIds: [],
+      draftIds: [],
       promptAnnotations: [],
-      documentContext: null,
+      pageContext: null,
+      selectedSkills: [],
       text: providerText,
       attachments: [],
       intent: hiddenSessionIntent,
       initialCollaborationMode: null,
       initialRoutingMode: hiddenInitialRoutingMode,
+      initialModel: hiddenInitialModel,
+      initialProvider: hiddenInitialProvider,
       forkBeforeMessageId: null,
       workspaceId: null,
       params,
@@ -3908,13 +4268,7 @@ export function useChatSend(options: UseChatSendOptions) {
       attempt.acceptanceResolved = true
       attempt.acceptedTaskId = acceptedTaskId(res)
       attempt.acceptedSessionKey = res?.sessionKey || requestSessionKey
-      if (
-        hiddenSessionIntent
-        && requestSessionKey === options.sessionKey.value
-        && options.pendingSessionIntent.value === hiddenSessionIntent
-      ) {
-        options.pendingSessionIntent.value = null
-      }
+      consumeAcceptedSessionIntent(attempt)
       // A resolved chat.send response proves durable ingress acceptance. Clear
       // the browser outbox before any local session handoff work, which can
       // fail independently without making an exact-id resend necessary.
@@ -4048,13 +4402,7 @@ export function useChatSend(options: UseChatSendOptions) {
       const acceptedError = acceptedErrorInfo(err)
       const accepted = commandError?.accepted
       if (accepted === true) {
-        if (
-          hiddenSessionIntent
-          && requestSessionKey === options.sessionKey.value
-          && options.pendingSessionIntent.value === hiddenSessionIntent
-        ) {
-          options.pendingSessionIntent.value = null
-        }
+        consumeAcceptedSessionIntent(attempt)
         removeHiddenControl(
           requestSessionKey,
           stableClientRequestId,
@@ -4115,7 +4463,7 @@ export function useChatSend(options: UseChatSendOptions) {
         }
         options.messages.value.push({
           role: 'error',
-          text: sendFailureMessage(err, paramsHaveArtifactContext(params)),
+          text: sendFailureMessage(err),
           errorCode: errorCode(err),
           ts: new Date().toISOString(),
         })
@@ -4182,7 +4530,7 @@ export function useChatSend(options: UseChatSendOptions) {
       }
       options.messages.value.push({
         role: 'error',
-        text: sendFailureMessage(err, paramsHaveArtifactContext(params)),
+        text: sendFailureMessage(err),
         errorCode: errorCode(err),
         ts: new Date().toISOString(),
       })
@@ -4322,6 +4670,7 @@ export function useChatSend(options: UseChatSendOptions) {
 
   return {
     onSend,
+    sendPending,
     onStop,
     sendQueuedSteer,
     sendQueuedFollowup,

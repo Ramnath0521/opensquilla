@@ -5,6 +5,7 @@ import type {
   ProposalsSettings,
   RegistryResult,
   Skill,
+  SkillCandidate,
   SkillDiagnostic,
   SkillLifecycle,
   SkillSourceResolution,
@@ -13,6 +14,7 @@ import type {
 export interface SkillInstallResult {
   readonly success: boolean
   readonly cancelled?: boolean
+  readonly recoveryRequired?: boolean
   readonly unchanged?: boolean
   readonly name?: string
   readonly message?: string
@@ -80,9 +82,40 @@ export interface ProposalSettingsUpdate {
   readonly auto_enable_max_risk?: 'low' | 'medium' | 'high'
 }
 
+export interface SkillInstallStatus {
+  readonly operationId: string
+  readonly scope: string
+  readonly state: 'unknown' | 'running' | 'succeeded' | 'failed' | 'cancelled' | 'recovery_required'
+  readonly phase: string
+  readonly terminal: boolean
+  readonly progress?: Readonly<Record<string, unknown>>
+  readonly result?: SkillInstallResult
+}
+
 export interface SkillCatalog {
+  subscribeInvalidation?(listener: () => void): () => void
+  supportsCandidates(): boolean
+  listCandidates(options?: {
+    readonly sessionKey?: string
+    readonly signal?: AbortSignal
+  }): Promise<{ readonly generation: number; readonly candidates: readonly SkillCandidate[] }>
+  supportsSetEnabled(): boolean
+  setEnabled(request: {
+    readonly name: string
+    readonly enabled: boolean
+    readonly signal?: AbortSignal
+  }): Promise<{
+    readonly name: string
+    readonly enabled: boolean
+    readonly persisted: boolean
+    readonly refreshed: boolean
+    readonly generation?: number
+    readonly message?: string
+  }>
+  supportsInstallStatus?(): boolean
+  installStatus?(operationId: string, options?: { readonly signal?: AbortSignal }): Promise<SkillInstallStatus>
   list(options?: { readonly signal?: AbortSignal }): Promise<readonly Skill[]>
-  detail(skill: Pick<Skill, 'name' | 'instance_id' | 'install_id'>, options?: {
+  detail(skill: Pick<Skill, 'name' | 'kind' | 'instance_id' | 'install_id' | 'active' | 'lifecycle'>, options?: {
     readonly signal?: AbortSignal
   }): Promise<Skill>
   search(query: string, options?: {

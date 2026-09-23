@@ -117,7 +117,11 @@ export function createV4GoalCenter(transport: GoalCenterTransport): GoalCenter {
       } catch (error) { throw mapGoalError(error) }
     },
     async set(input, options): Promise<GoalSetResult> {
-      const params: GoalSetParams = { sessionKey: input.sessionKey, objective: input.objective, clientRequestId: input.clientRequestId, clientMessageId: input.clientMessageId, ...(input.sourceKind ? { sourceKind: input.sourceKind } : {}) }
+      const params: GoalSetParams = {
+        sessionKey: input.sessionKey, objective: input.objective,
+        clientRequestId: input.clientRequestId, clientMessageId: input.clientMessageId,
+        ...(input.sourceKind ? { sourceKind: input.sourceKind } : {}),
+      }
       if (!validateGoalSetParams(params)) throw new GoalCenterError('invalid', 'goals.set params violated Contract')
       try {
         const raw = await transport.request<GoalSetWireResult>(GOALS_SET_METHOD, params, optionsFor(options?.signal))

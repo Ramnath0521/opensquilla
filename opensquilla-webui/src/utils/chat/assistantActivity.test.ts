@@ -758,6 +758,25 @@ describe('projectAssistantActivity', () => {
 })
 
 describe('projectAssistantActivityTimeline', () => {
+  it('distinguishes buffered tool preparation from answering and actual execution', () => {
+    const projection = projectAssistantActivityTimeline([], {
+      lifecycle: 'answering',
+      statusHistory: [
+        { action: 'write:1', label: 'Writing reply', at: 1000 },
+        { action: 'Preparing tool call', label: 'untrusted detail', at: 5000 },
+      ],
+      endedAt: 12000,
+    })
+    expect(projection.activityClusters).toEqual([])
+    expect(projection.statusSteps[projection.statusSteps.length - 1]).toMatchObject({
+      isCurrent: true,
+      durationSeconds: 7,
+      label: { code: 'chat.activity.lifecycle.preparingToolCall', params: {} },
+    })
+    expect(projection.statusSteps[0]?.isCurrent).toBe(false)
+    expect(JSON.stringify(projection.statusSteps)).not.toContain('untrusted detail')
+  })
+
   it('projects explicit lifecycle codes and marks only live calls as current', () => {
     const running = toolGroup([
       call('running', {
@@ -1154,6 +1173,23 @@ describe('projectAssistantActivityTimeline', () => {
     expect(JSON.stringify(projection.statusSteps)).not.toContain('raw reasoning body')
   })
 
+  it.each(['working', 'settled'] as const)('localizes retries without a fixed limit when %s', (lifecycle) => {
+    const projection = projectAssistantActivityTimeline([], {
+      lifecycle,
+      statusHistory: [
+        { action: 'provider:retrying:7:0', label: 'Retrying 7/0', at: 1_000 },
+      ],
+    })
+
+    expect(projection.statusSteps[0]?.label).toEqual({
+      code: 'chat.activity.provider.retryingWithoutLimit', params: { attempt: 7 },
+    })
+    for (const locale of [en, zhHans, ja, de, fr, es]) {
+      expect(locale.chat.activity.provider.retryingWithoutLimit).toContain('{attempt}')
+      expect(locale.chat.activity.provider.retryingWithoutLimit).not.toContain('{limit}')
+    }
+  })
+
   it('derives each phase duration from the next transition and terminal boundary', () => {
     const projection = projectAssistantActivityTimeline([], {
       lifecycle: 'settled',
@@ -1269,7 +1305,16 @@ describe('projectAssistantActivityTimeline', () => {
     ])
   })
 
-  it('does not describe a non-benign compaction veto as within budget', () => {
+  it.each([
+    ['no_entries', 'chat.compact.noSafeHistory'],
+    ['no_compression_benefit', 'chat.compact.alreadyConcise'],
+    ['quality_gate_failed', 'chat.compact.skipped'],
+    ['no_safe_turn_boundary', 'chat.compact.noSafeHistory'],
+    ['protected_tail_exhausts_compaction_window', 'chat.compact.noSafeHistory'],
+    ['non_history_envelope_exhausts_budget', 'chat.compact.skipped'],
+    ['summary_does_not_fit', 'chat.compact.skipped'],
+    ['unknown_reason', 'chat.compact.skipped'],
+  ])('distinguishes a safe no-op from a veto for %s', (reason, expectedLabel) => {
     const projection = projectAssistantActivityTimeline([], {
       lifecycle: 'settled',
       statusHistory: [{
@@ -1280,14 +1325,14 @@ describe('projectAssistantActivityTimeline', () => {
         category: 'maintenance',
         state: 'skipped',
         source: 'automatic',
-        reason: 'no_safe_turn_boundary',
+        reason,
       }],
     })
 
-    expect(projection.statusSteps[0]?.label.code).toBe('chat.compact.skipped')
+    expect(projection.statusSteps[0]?.label.code).toBe(expectedLabel)
   })
 
-  it('merges adjacent automatic completions and keeps durable metadata', () => {
+  it('keeps request-scoped reductions distinct from adjacent saved summaries', () => {
     const projection = projectAssistantActivityTimeline([], {
       lifecycle: 'settled',
       statusHistory: [
@@ -1314,8 +1359,15 @@ describe('projectAssistantActivityTimeline', () => {
       ],
     })
 
-    expect(projection.statusSteps).toHaveLength(1)
+    expect(projection.statusSteps).toHaveLength(2)
     expect(projection.statusSteps[0]).toMatchObject({
+      id: 'cmp-request-scoped',
+      state: 'completed',
+      isCurrent: false,
+      durability: 'request_scoped',
+      label: { code: 'chat.compact.temporarilyReduced' },
+    })
+    expect(projection.statusSteps[1]).toMatchObject({
       id: 'cmp-durable',
       state: 'completed',
       source: 'automatic',

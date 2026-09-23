@@ -36,7 +36,10 @@ log = structlog.get_logger(__name__)
 
 _CODE_TASK_PREFLIGHT_TIMEOUT = 15.0
 _PACKAGED_GATEWAY_EXECUTABLES = {"opensquilla-gateway", "opensquilla-gateway.exe"}
-_CODE_TASK_REQUIRED_TOOLS = frozenset({"background_process", "exec_command", "process"})
+# Long code-task runs use the unified execution surface: ``exec_command``
+# starts the run and ``process`` observes it. ``background_process`` is a
+# compatibility wrapper and is not required by Coding Mode.
+_CODE_TASK_REQUIRED_TOOLS = frozenset({"exec_command", "process"})
 
 
 def _runs_code_task(argv: list[str]) -> bool:
@@ -175,27 +178,28 @@ _CODING_MODE_DIRECTIVE_TEMPLATE = (
     "--verification-mode build; code-task edits the existing app in place and "
     "applies the verified change back to the repo so the next edit builds on it.\n"
     "code-task runs for MANY minutes (often 20-40, up to ~90 on a heavy repo "
-    "that must install dependencies), so it is a long-running task: ALWAYS "
-    "launch it with background_process(timeout=5400) and then await it with "
-    'process(action="wait", session_id=..., timeout=5400). Do NOT run '
-    "code-task with a blocking exec_command — exec_command is hard-capped at "
-    "600s (10 min) no matter what timeout you pass, so it would kill "
-    "code-task mid-run and waste the attempt. Do not poll "
-    "process(action=\"poll\") in a loop either — just wait for the result.\n"
+    "that must install dependencies), so it is a long-running task: launch it "
+    "with exec_command(yield_time_ms=0, timeout=5400), keep the returned "
+    "execution_id. While it runs, choose independent work, inspect progress, "
+    "or use process(action=\"wait\", execution_id=..., timeout=5400) when "
+    "your next step needs the result. You may finish the turn with an accurate "
+    "pending status; completion will not resume this task automatically. "
+    "Reuse the returned handle rather than launching the same command again "
+    "because it is still running. Avoid busy polling.\n"
     "code-task works in an ISOLATED run directory, NOT in the --repo source you "
     "pass it: that source stays EMPTY until a run finishes and VERIFIES, then "
     "the change is committed back. So do NOT judge progress by the source "
     "repo's files and do NOT conclude it is 'stuck' because the source looks "
-    "empty. Let process(action=\"wait\") return the result — do NOT kill the "
-    "run, do NOT 'clean and retry', and do NOT launch the same task again while "
-    "one is still running. Decide success ONLY from the returned result (its "
+    "empty. An empty source repo alone is not a reason to cancel or restart "
+    "the run. Respect user cancellation. Decide success ONLY from the "
+    "completed result (its "
     "state and build.installer_path, which point into the run directory); the "
     "run prints its run directory on startup and writes live progress to "
     "<run_dir>/status.json. That status file includes phase, pid, current_command, "
     "log_paths, last_output_at, and terminal error/final_failure_reason fields; "
     "for build mode it also reports scaffold_running/scaffold_complete, "
     "agent_running, verifying, completed, or stalled.\n"
-    "If process(action=\"wait\") returns a non-zero exit, an environment_blocked "
+    "If the completed result reports a non-zero exit, an environment_blocked "
     "state, or a build result with no installer_path for build mode, STOP and "
     "report the code-task result. Do NOT manually rebuild the app, copy files, "
     "or publish a workaround artifact from this session.\n"
@@ -224,26 +228,26 @@ _CODING_MODE_DIRECTIVE_TEMPLATE = (
     "spaces / & / non-ASCII in ordinary %TEMP% paths; cmd.exe DOES "
     "still expand %VAR% inside double quotes, but %TEMP% itself is "
     "normally free of '%' so this is robust in practice -- argv "
-    "support in background_process is the long-term airtight fix) or "
+    "support in the unified exec_command surface is the long-term airtight fix) or "
     "shlex.quote(path) on POSIX (defends against $, backticks, and "
     "backslash quirks in $TMPDIR). exec_command's return is formatted "
     "as `exit_code=0\\n<stdout>`; confirm exit_code=0, then take the "
     "final stdout line — the already-shell-quoted path — and paste it "
     "verbatim as the --task-file argument.\n"
-    "    2a. (Case 1, real repo) background_process(\n"
+    "    2a. (Case 1, real repo) exec_command(\n"
     "          command=\"__CODE_TASK_CMD__ solve --repo <url-or-path> "
     "--task-file <quoted-path-from-step-1> --shallow --yes\",\n"
-    "          timeout=5400,\n"
+    "          timeout=5400, yield_time_ms=0,\n"
     "        )\n"
-    "    2b. (Case 2, scratch) background_process(\n"
+    "    2b. (Case 2, scratch) exec_command(\n"
     "          command=\"__CODE_TASK_CMD__ solve --task-file <quoted-"
     "path-from-step-1> --verification-mode scratch --yes\",\n"
-    "          timeout=5400,\n"
+    "          timeout=5400, yield_time_ms=0,\n"
     "        )\n"
-    "    2c. (Case 3, app build from scratch) background_process(\n"
+    "    2c. (Case 3, app build from scratch) exec_command(\n"
     "          command=\"__CODE_TASK_CMD__ solve --task-file <quoted-"
     "path-from-step-1> --verification-mode build --yes\",\n"
-    "          timeout=5400,\n"
+    "          timeout=5400, yield_time_ms=0,\n"
     "        )\n"
     "Why this works: stdin rides through a real OS pipe — neither cmd.exe "
     "nor bash touches its contents. The already-shell-quoted path the "
@@ -252,8 +256,8 @@ _CODING_MODE_DIRECTIVE_TEMPLATE = (
     "uses the staging recipe so a future longer task in the same session "
     "cannot regress.\n"
     "Cleanup: the staged task file persists under %TEMP% / $TMPDIR (task "
-    "prose can contain private issue text). After "
-    "process(action='wait', ...) returns the task result, drop the "
+    "prose can contain private issue text). After collecting the completed "
+    "task result, drop the "
     "file with a separate exec_command (`del <quoted-path>` on Windows, "
     "`rm <quoted-path>` on POSIX). If you forget, the OS sweeps temp on "
     "reboot."
@@ -314,7 +318,7 @@ async def enforce_coding_mode(ctx: TurnContext) -> TurnContext:
 
     missing_tools = _missing_code_task_tools(ctx)
     if missing_tools:
-        # `filter_skills` independently gates the manifest on the same three
+        # `resolve_skill_catalog` independently gates the manifest on the same three
         # tools. Do not leave a conflicting, mandatory code-task instruction
         # on restricted callers such as ordinary channel users.
         ctx.metadata["enforce_coding_mode__applied"] = False
@@ -335,8 +339,8 @@ async def enforce_coding_mode(ctx: TurnContext) -> TurnContext:
         new_suffix = f"{suffix}{directive}" if suffix else directive
         ctx.system_prompt = (base, new_suffix)
 
-    # Pin code-task so a relevance filter (when filter_enabled) cannot drop its
-    # description from <available_skills>; filter_skills honors this metadata.
+    # Pin code-task so a tight metadata budget keeps its description in
+    # <available_skills>; resolve_skill_catalog honors this metadata.
     ctx.metadata["pinned_skills"] = list({*ctx.metadata.get("pinned_skills", []), "code-task"})
     ctx.metadata["coding_mode"] = True
     log.info("coding_mode.enforced")
