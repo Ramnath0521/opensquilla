@@ -16,9 +16,11 @@ from opensquilla.gateway.adapters.contract_method import (
 )
 
 SKILL_MANAGEMENT_CONTRACT_METHODS: Final = (
+    "skills.setEnabled",
     "skills.reload",
     "skills.install",
     "skills.install.cancel",
+    "skills.install.status",
     "skills.deps.install",
     "skills.uninstall",
 )

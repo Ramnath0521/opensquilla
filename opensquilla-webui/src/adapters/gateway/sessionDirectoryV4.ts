@@ -6,6 +6,7 @@ import {
   type SessionsListParams,
   type SessionsListResult,
 } from '@/contracts/generated/v4/sessionsList'
+import { validateSessionsListResult } from '@/contracts/generated/v4/sessionsListValidators.mjs'
 import {
   SESSIONS_RESOLVE_METHOD,
   type SessionsResolveParams,
@@ -280,13 +281,17 @@ export function createV4SessionDirectory(
   }
 
   async function call(params: SessionsListParams, signal?: AbortSignal) {
-    const result = await requestWithPolicy<Partial<SessionsListResult>>(
+    const result = await requestWithPolicy<unknown>(
       SESSIONS_LIST_METHOD,
       params,
       signal,
       'Session directory request aborted',
     )
-    return objectValue(result) as Partial<SessionsListResult> || {}
+    if (!validateSessionsListResult(result)) throw new SessionDirectoryError(
+      'unavailable',
+      'sessions.list returned an invalid response',
+    )
+    return result as SessionsListResult
   }
 
   return {
@@ -354,6 +359,10 @@ export function createV4SessionDirectory(
         return {
           key: result.session_key,
           id: result.session_id,
+          ...(result.model !== undefined ? { model: result.model } : {}),
+          ...(typeof result.title === 'string' ? { title: result.title } : {}),
+          ...(typeof result.runStatus === 'string'
+            ? { runStatus: normalizeSessionRunStatus(result.runStatus) } : {}),
         }
       } catch (error) {
         if (isAbort(error, request.signal)) throw error

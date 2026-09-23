@@ -1,11 +1,12 @@
 // @vitest-environment happy-dom
 
-import { afterEach, describe, expect, it } from 'vitest'
+import { afterEach, describe, expect, it, vi } from 'vitest'
 import { effectScope, nextTick, ref } from 'vue'
 
 import {
   RECENT_DRAFT_SESSION_KEY,
   recentDraftSessionKey,
+  recoverableDraftSessionKey,
   useChatDraftPersistence,
 } from './useChatDraftPersistence'
 
@@ -21,6 +22,7 @@ function mount(sessionKey: ReturnType<typeof ref<string>>, inputText: ReturnType
 }
 
 afterEach(() => {
+  vi.unstubAllGlobals()
   localStorage.clear()
 })
 
@@ -42,6 +44,34 @@ describe('useChatDraftPersistence', () => {
 
     expect(inputText2.value).toBe('half-written instruction')
     expect(localStorage.getItem(RECENT_DRAFT_SESSION_KEY)).toBe('agent:main:webchat:a')
+  })
+
+  it('preserves a fresh draft during namespace binding even when storage is unavailable', async () => {
+    const sessionKey = ref('agent:main:webchat:provisional')
+    const inputText = ref('Typing while Hello is delayed')
+    const { api, scope } = mount(sessionKey, inputText)
+    const denied = () => { throw new Error('storage denied') }
+    vi.stubGlobal('localStorage', { getItem: denied, setItem: denied, removeItem: denied })
+    try {
+      api.rebindCurrentDraft(`agent:main:webchat:guest:${'a'.repeat(64)}:provisional`)
+      inputText.value += ', then continuing'
+      await nextTick()
+      expect(inputText.value).toBe('Typing while Hello is delayed, then continuing')
+    } finally { scope.stop() }
+  })
+
+  it('does not carry a namespace rebind into an intervening history navigation', async () => {
+    const sessionKey = ref('agent:main:webchat:provisional')
+    const inputText = ref('Fresh draft')
+    const { api, scope } = mount(sessionKey, inputText)
+    const historyKey = 'agent:main:webchat:history'
+    api.saveDraft(historyKey, 'Existing history reply')
+    try {
+      api.rebindCurrentDraft(`agent:main:webchat:guest:${'a'.repeat(64)}:provisional`)
+      sessionKey.value = historyKey
+      await nextTick()
+      expect(inputText.value).toBe('Existing history reply')
+    } finally { scope.stop() }
   })
 
   it('keeps drafts isolated per session and does not clobber typed text', async () => {
@@ -99,6 +129,19 @@ describe('useChatDraftPersistence', () => {
 
     expect(recentDraftSessionKey()).toBe('agent:main:webchat:b')
     expect(localStorage.getItem('opensquilla.chat.draft:agent:main:webchat:a')).toBe('draft A')
+  })
+
+  it('validates a scoped draft without changing the recent pointer', () => {
+    const scopedKey = 'agent:main:webchat:scoped'
+    const recentKey = 'agent:main:webchat:recent'
+    localStorage.setItem(`opensquilla.chat.draft:${scopedKey}`, 'scoped draft')
+    localStorage.setItem(`opensquilla.chat.draft:${recentKey}`, 'recent draft')
+    localStorage.setItem(RECENT_DRAFT_SESSION_KEY, recentKey)
+
+    expect(recoverableDraftSessionKey(scopedKey)).toBe(scopedKey)
+    expect(recoverableDraftSessionKey('agent:main:webchat:missing')).toBe('')
+    expect(recoverableDraftSessionKey('not-a-session')).toBe('')
+    expect(localStorage.getItem(RECENT_DRAFT_SESSION_KEY)).toBe(recentKey)
   })
 
   it('explicitly discards the recoverable draft without scanning other drafts', async () => {
@@ -177,4 +220,54 @@ describe('useChatDraftPersistence', () => {
     await nextTick()
     expect(inputText2.value).toBe('user is already typing')
   })
+})
+
+describe('skill draft persistence', () => {
+  it('restores skill identity with its own session and preserves it through namespace binding', async () => {
+    const selectedSkills = ref([{ name: 'tables', instanceId: 'skill:tables', digest: 'a'.repeat(64) }])
+    const sessionKey = ref('agent:main:webchat:one')
+    const inputText = ref('Analyze this')
+    const scope = effectScope()
+    const api = scope.run(() => useChatDraftPersistence({ sessionKey, inputText, selectedSkills }))!
+    inputText.value += ' report'
+    await nextTick()
+    sessionKey.value = 'agent:main:webchat:two'
+    await nextTick()
+    expect(selectedSkills.value).toEqual([])
+    sessionKey.value = 'agent:main:webchat:one'
+    await nextTick()
+    expect(inputText.value).toBe('Analyze this report')
+    expect(selectedSkills.value[0]?.instanceId).toBe('skill:tables')
+    api.rebindCurrentDraft('agent:main:webchat:bound')
+    await nextTick()
+    expect(selectedSkills.value[0]?.instanceId).toBe('skill:tables')
+    expect(localStorage.getItem('opensquilla.chat.draft:agent:main:webchat:one')).toBeNull()
+    scope.stop()
+    const restoredSkills = ref<typeof selectedSkills.value>([])
+    const restoredText = ref('')
+    const restoredScope = effectScope()
+    restoredScope.run(() => useChatDraftPersistence({ sessionKey, inputText: restoredText, selectedSkills: restoredSkills }))
+    expect(restoredSkills.value).toEqual(selectedSkills.value)
+    expect(restoredText.value).toBe(inputText.value)
+    restoredScope.stop()
+  })
+})
+
+it('consumes only the exact accepted offscreen skill draft after the session watcher saves it', async () => {
+  const skills = [{ name: 'tables', instanceId: 'skill:tables', digest: 'a'.repeat(64) }]
+  const sessionKey = ref('agent:main:webchat:source')
+  const inputText = ref('Pending request')
+  const selectedSkills = ref(skills)
+  const scope = effectScope()
+  const api = scope.run(() => useChatDraftPersistence({ sessionKey, inputText, selectedSkills }))!
+  sessionKey.value = 'agent:main:webchat:other'
+  await api.consumeAcceptedDraft('agent:main:webchat:source', { text: 'Pending request', selectedSkills: skills })
+  expect(api.loadDraft('agent:main:webchat:source')).toBe('')
+  api.saveDraft('agent:main:webchat:source', 'Newer draft', skills)
+  await api.consumeAcceptedDraft('agent:main:webchat:source', { text: 'Pending request', selectedSkills: skills })
+  expect(api.loadDraft('agent:main:webchat:source')).toBe('Newer draft')
+  api.saveDraft('agent:main:webchat:source', 'Pending request', [{ ...skills[0]!, digest: 'b'.repeat(64) }])
+  await api.consumeAcceptedDraft('agent:main:webchat:source', { text: 'Pending request', selectedSkills: skills })
+  expect(api.loadDraft('agent:main:webchat:source')).toBe('Pending request')
+  scope.stop()
 })

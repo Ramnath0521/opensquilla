@@ -4,7 +4,10 @@ import type {
   ChatToolCallRenderItem,
 } from '@/types/chat'
 import type { ChatPart, StatusPart } from '@/types/parts'
-import { compactionSkippedLabelCode } from '@/utils/chat/compactionStatus'
+import {
+  compactionCompletedLabelCode,
+  compactionSkippedLabelCode,
+} from '@/utils/chat/compactionStatus'
 
 type TextPart = Extract<ChatPart, { type: 'text' }>
 
@@ -24,6 +27,7 @@ export type AssistantActivityClusterState =
 export type AssistantActivityLifecycleCode =
   | 'chat.activity.lifecycle.working'
   | 'chat.activity.lifecycle.answering'
+  | 'chat.activity.lifecycle.preparingToolCall'
   | 'chat.activity.lifecycle.answerPrepared'
   | 'chat.activity.lifecycle.settled'
   | 'chat.activity.lifecycle.interrupted'
@@ -116,10 +120,14 @@ export type AssistantActivityStatusCode =
   | 'chat.activity.provider.rateLimited'
   | 'chat.activity.provider.retryWait'
   | 'chat.activity.provider.retrying'
+  | 'chat.activity.provider.retryingWithoutLimit'
   | 'chat.activity.provider.fallback'
   | 'chat.compact.compacting'
   | 'chat.compact.compacted'
+  | 'chat.compact.temporarilyReduced'
   | 'chat.compact.withinBudget'
+  | 'chat.compact.noSafeHistory'
+  | 'chat.compact.alreadyConcise'
   | 'chat.compact.skipped'
   | 'chat.compact.cancelled'
   | 'chat.compact.failed'
@@ -247,12 +255,6 @@ const FILE_INSPECT_TOOLS = new Set([
   'list_directory',
   'glob_search',
   'grep_search',
-  'document_inspect',
-  'document_read',
-  'document_locate',
-  'document_browser_inspect',
-  'document_browser_screenshot',
-  'document_browser_reload',
 ])
 const FILE_CHANGE_TOOLS = new Set([
   'write_file',
@@ -262,10 +264,6 @@ const FILE_CHANGE_TOOLS = new Set([
   'edit_file',
   'edit_source',
   'apply_patch',
-  'document_apply',
-  'document_patch',
-  'document_browser_act',
-  'document_finish',
 ])
 const COMMAND_TOOLS = new Set([
   'exec',
@@ -863,10 +861,13 @@ function statusLabelFor(
       return codeDescriptor('chat.compact.cancelled')
     }
     if (entry.state === 'running') return codeDescriptor('chat.compact.compacting')
-    return codeDescriptor('chat.compact.compacted')
+    return codeDescriptor(compactionCompletedLabelCode(entry.durability))
   }
   const action = String(entry.action || '').trim()
   const normalized = action.toLowerCase()
+  if (normalized === 'preparing tool call') {
+    return codeDescriptor('chat.activity.lifecycle.preparingToolCall')
+  }
   if (normalized.startsWith('provider:')) {
     const [, phase = '', first = '0', second = '0'] = normalized.split(':')
     if (phase === 'requesting') {
@@ -888,10 +889,11 @@ function statusLabelFor(
       })
     }
     if (phase === 'retrying') {
-      return codeDescriptor('chat.activity.provider.retrying', {
-        attempt: Math.max(0, Number.parseInt(first, 10) || 0),
-        limit: Math.max(0, Number.parseInt(second, 10) || 0),
-      })
+      const attempt = Math.max(0, Number.parseInt(first, 10) || 0)
+      const limit = Math.max(0, Number.parseInt(second, 10) || 0)
+      return limit > 0
+        ? codeDescriptor('chat.activity.provider.retrying', { attempt, limit })
+        : codeDescriptor('chat.activity.provider.retryingWithoutLimit', { attempt })
     }
     if (phase === 'fallback') return codeDescriptor('chat.activity.provider.fallback')
     return codeDescriptor('chat.activity.lifecycle.working')
@@ -1007,10 +1009,9 @@ function isAutomaticCompletedMaintenance(step: AssistantActivityStatusStep): boo
 }
 
 /**
- * One automatic compaction may be observed through both a transient request
- * lifecycle and the durable history rewrite. When the backend uses different
- * ids for those adjacent terminal observations, present them as one maintenance
- * result. A failure or any intervening phase is a hard boundary.
+ * Adjacent automatic completions with the same durability can share one row.
+ * Temporary request reductions and saved summaries remain distinct outcomes.
+ * A failure or any intervening phase is a hard boundary.
  */
 function mergeAdjacentAutomaticCompletedMaintenance(
   steps: AssistantActivityStatusStep[],
@@ -1023,17 +1024,8 @@ function mergeAdjacentAutomaticCompletedMaintenance(
       && isAutomaticCompletedMaintenance(previous)
       && isAutomaticCompletedMaintenance(step)
       && previous.id !== step.id
+      && previous.label.code === step.label.code
     ) {
-      const preferred = step.durability === 'durable' && previous.durability !== 'durable'
-        ? step
-        : previous
-      merged[merged.length - 1] = {
-        ...preferred,
-        // Preserve the first visual position and keyed DOM row while allowing
-        // durable metadata (including its id) to become authoritative.
-        key: previous.key,
-        at: previous.at,
-      }
       continue
     }
     merged.push(step)

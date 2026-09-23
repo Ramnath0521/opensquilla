@@ -35,6 +35,25 @@ trimmed and must contain 1-4000 Unicode characters. The objective is also stored
 as the real first user message for the first Goal turn. Running `/goal` with no
 argument shows the current status when a Goal exists and command help otherwise.
 
+You can also explicitly ask the agent to create a Goal during an ordinary
+Default-mode conversation. `create_goal` attaches it to the task already running;
+it does not add a synthetic user message or start another task. `get_goal` reads
+the current objective and accounting. `update_goal` can edit the objective,
+resume with `active`, pause, or record complete/blocked.
+Creation, objective changes, pause and resume require the user's request.
+Natural-language resume and edits keep using the current authenticated task.
+These controls do not grant extra tool or filesystem permissions.
+
+An `update_goal` objective edit preserves an unfinished Goal's current
+state when no status is supplied. An edit can include `status: "paused"` to change
+the objective and pause in one operation; an already paused Goal stays paused. It
+can instead include `status: "active"` for an explicitly requested resume.
+Neither operation creates a second task or cancels the current one. Submit
+`complete` or `blocked` separately from edits; only `blocked` accepts a `reason`.
+An ordinary follow-up can repeat a pause on an already paused Goal. An admitted
+Goal task can also commit a plain pause after its owner disconnects;
+editing the objective still requires the live authenticated owner.
+
 Only one unfinished Goal can exist in a session. Starting another one returns a
 conflict instead of silently replacing it. After a completed Goal, a new Goal can
 start once the old owning task has fully settled and the session is idle.
@@ -92,7 +111,10 @@ guardrail state. `executionState` distinguishes idle, queued, and working tasks.
 A deferred reason can explain that automatic work is waiting for user ingress,
 other session work, or Plan mode.
 
-During complex work, the main agent may replace the Goal progress checklist with
+During complex work, the main agent uses the ordinary `update_plan` progress
+tool. `update_goal_progress` remains a compatibility adapter to the same task
+progress record; the Goal checklist is a projection, not a second authority.
+The agent may replace that checklist with
 up to 20 structured steps when a concise status view is useful. A step is at
 most 200 characters; the optional explanation is at most 1000 characters; at
 most one step may be `in_progress`. The checklist is a dynamic projection of the
@@ -109,6 +131,12 @@ Goal active and continues useful work until every requirement is proven and no
 required work remains, then submits the explicit complete decision. Assistant
 text, artifact delivery, and a completed-looking checklist never complete a Goal
 on their own.
+
+The evidence and repeated-blocker requirements are instructions to the agent;
+storage validates identity, generation and ownership, not a hidden proof judge.
+Committing complete/blocked does not hide ordinary tools or force a separate
+summary request. Subsequent provider failures remain ordinary task failures;
+they do not erase the already committed Goal result.
 
 An agent-authored blocked decision is similarly deliberate. The same blocking
 condition must prevent meaningful progress for at least three consecutive Goal
@@ -131,11 +159,14 @@ following are still true:
 - the session generation, Goal identity, objective revision, and continuation
   sequence match;
 - the Goal is active and has no owning task;
-- the session is in Default mode and has no active manual Plan run;
-- the execution lease is still valid and its owner is still subscribed and
-  authorized;
+- the session is in Default mode;
+- the execution grant is still authorized, and the owner has a live
+  authenticated connection and session subscription;
 - there is no explicit user ingress or other queued/running session work; and
 - the current guardrail window still permits another turn.
+
+Historical PlanRun records are associations and progress projections. They do
+not lock a session; only actual queued or running tasks participate in admission.
 
 Explicit user input wins every race with automatic work. A normal Default-mode
 follow-up can claim the active Goal; if it was queued, the claim is revalidated
@@ -145,9 +176,27 @@ compaction, and system turns do not claim it.
 Automatic continuations are system events. They do not invent a user transcript
 row, create a Goal command receipt, or capture a fake user message into memory.
 They still render assistant output, tools, approvals, and usage on connected
-Web UI and CLI surfaces. If terminal input arrives while an external Goal turn
+Web UI and CLI surfaces. A blocking `request_user_input` on Web UI or the
+interactive Gateway CLI keeps the current task waiting for its answer. Goal
+does not start another turn during that wait. In the CLI, reply in the composer
+with text or an option number; answers return to the same task, including after
+reconnecting to a pending question. Stop cancels the question with its task.
+An explicit CLI exit command or end of input also cancels a waiting question,
+so leaving the terminal does not drain work that needs another answer.
+This waiting state does not itself mark the Goal paused or blocked. CLI clients
+opt into this reply transport through the existing connection handshake;
+clients without it retain the terminating question protocol.
+
+If ordinary terminal input arrives while an external Goal turn
 is active, the CLI first tries the normal steering path and falls back to a new
 user turn only if the terminal race rejects the steer.
+
+Each automatic continuation uses the session's current model-routing mode at
+task acceptance, even without a new user message. Direct mode
+keeps the session's selected model; router and ensemble modes keep their
+respective behavior. A routing-mode change applies to the next accepted turn;
+an already accepted turn retains its routing snapshot. In router mode, each
+continuation is a new turn and can show its own routing decision.
 
 Goal mode does not retry a failed or timed-out whole turn. A tool may already
 have performed an irreversible action, so replaying the turn could duplicate
@@ -184,7 +233,9 @@ Starting or resuming a Goal gives the calling, subscribed Web UI or CLI
 connection an in-memory execution lease. A read-only spectator does not acquire,
 refresh, or inherit that lease. Authority, credentials, and route envelopes are
 not stored in the Goal row; every automatic turn rebuilds and revalidates them
-from the live connection.
+through the ordinary permission and route preparation path. Automatic
+continuation requires both the owner's live authenticated connection and its
+session subscription. There is no per-Goal background execution policy.
 
 If the owner disconnects or unsubscribes, the process-local lease detaches but
 the durable Goal remains `active`. A running task may finish or report a
@@ -201,7 +252,12 @@ inherit the lease. If the tab-local token is no longer available, an authorized
 operator may explicitly take over a detached lease from the Goal controls or
 `/goal resume`; takeover is refused while a live owner is still attached.
 
-Gateway shutdown or restart still pauses unfinished active Goals with
+A pending approval or question keeps waiting on its existing
+task and releases its compute slot. If an approval cannot continue without a
+human decision, the Goal pauses with `approval_required`; a new Goal turn does
+not approve or retry that action automatically.
+
+Gateway shutdown or restart pauses active Goals with
 `process_restart`; restart never calls a provider to resume them. Reconnect and
 explicitly resume after the Gateway itself has restarted.
 
@@ -217,10 +273,10 @@ from the old session generation from controlling a new or copied conversation.
 
 ## Artifact delivery
 
-Successful `publish_artifact` delivery remains terminal for ordinary turns. In
-a Goal-owned turn, however, delivery is an ordinary tool result: the artifact
-is immediately available while the agent continues through the normal tool
-loop with the same route, safety policy, approvals, and provider fallback.
+Successful `publish_artifact` delivery is an ordinary tool result in both
+ordinary and Goal-owned turns. The artifact is immediately available, and the
+agent decides whether more work or a final response is needed through the normal
+tool loop with the same route, safety policy, approvals, and provider fallback.
 The agent may update structured progress and calls `update_goal` only when the
 whole objective is complete or truly blocked. Structured progress remains
 optional; an artifact or a completed-looking checklist alone never implies Goal
@@ -253,11 +309,38 @@ pauses it with `turn_limit` or `runtime_limit`. A successful resume resets the
 window turn and active-time counters; lifetime turn, active-time, and token totals
 remain available for status and auditing.
 
-Usage is settled once from the authoritative terminal task and usage ledger.
-The Goal snapshot reports input, output, reasoning, cache-read, cache-write, and
-total tokens. A provider usage-limit classification moves an otherwise active
-Goal to `usage_limited`; an ordinary failure or timeout blocks it rather than
-replaying the turn.
+Each physical provider request freezes its root task and Goal attribution before
+dispatch. Its first trusted finalization updates Goal totals atomically with the
+existing usage ledger. Child and grandchild calls keep the root attribution;
+late receipts count even after the owning task or Goal completes. A repeated
+receipt never counts twice, and clearing/replacing a Goal never charges old
+receipts to its replacement. Natural Goal creation starts accounting with
+requests admitted after creation; earlier ordinary conversation calls are not
+retroactively moved into it.
+The snapshot's `usageAccountingStartedAtMs` records this coverage boundary.
+For a new Goal it is the creation time. For an upgraded Goal it remains `null`
+until the first newly attributed request starts, then retains that timestamp;
+earlier usage is still incomplete and is not backfilled.
+
+`usageCoverage` is `complete`, `partial_history` for Goals upgraded from older
+settlement accounting, or `partial_usage` when a request has no trustworthy
+receipt. Historical totals are preserved without inventing descendant usage.
+Late receipts repair coverage when unknown calls are resolved. These accounting
+fields describe observed usage; they do not impose a per-Goal Token limit or
+pause execution when receipts are incomplete. Provider account credit exhaustion
+remains the distinct `usage_limited` state.
+
+Per-Goal Token budgets and foreground/background settings have been removed.
+Historical settings are inert, and Goals previously paused by a budget or an
+unknown usage receipt remain paused until explicitly resumed. Upgrading never
+resumes work automatically. Use the current client for Goal mutations; requests
+that still send the removed options are rejected before any task is accepted.
+
+Three consecutive automatic turns with complete activity evidence but no body,
+tools, reasoning, or useful waits pause with `empty_continuations`. User turns,
+steering and meaningful activity reset the count; missing activity evidence is
+not treated as proof of an empty turn. Existing turn/runtime guardrails still
+apply. An ordinary failure or timeout blocks the Goal instead of replaying work.
 
 ## Emergency stop and rollback
 
@@ -280,7 +363,7 @@ session database and follow the target release's migration guidance before
 downgrading software.
 
 Older experimental Goal settings such as idle nudges, blocked/failure retries,
-retry backoff or polling, unattended continuation, and watcher TTL no longer
+retry backoff or polling, and watcher TTL no longer
 control behavior. Remove those keys from local configuration so the file does
 not imply protections that are no longer part of the runtime contract.
 
@@ -328,10 +411,10 @@ GOAL_BUSY
 STALE_GOAL
 SESSION_GENERATION_CHANGED
 PLAN_MODE_ACTIVE
-PLAN_RUN_ACTIVE
 EXECUTION_LEASE_REQUIRED
 GOAL_NOT_RESUMABLE
 GOAL_EXECUTION_DISABLED
+UNSUPPORTED_GOAL_OPTIONS
 IDEMPOTENCY_CONFLICT
 ```
 

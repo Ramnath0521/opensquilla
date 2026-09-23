@@ -16,6 +16,18 @@ export interface GatewayStatus {
 export type DesktopGatewayConnectionStatus = 'starting' | 'ready' | 'stopped' | 'error'
 
 /**
+ * A native resume notification is an observation only. Keep its source
+ * explicit so the renderer can distinguish the OS power event from its own
+ * browser lifecycle signals without inferring suspend state.
+ */
+/** `power-monitor` remains accepted for older preload shells and is normalized. */
+export type DesktopResumeSource = 'desktop-resume' | 'power-monitor'
+
+export interface DesktopResumeEvent {
+  source: DesktopResumeSource
+}
+
+/**
  * Connection facts published only to the trusted Desktop main frame. The
  * instance-scoped auth token is derived from the owned Gateway launch and
  * expires with that process; it is never the operator's configured token.
@@ -30,6 +42,12 @@ export interface DesktopGatewayConnection {
   wsUrl: string | null
   authToken?: string | null
   error: string | null
+  sandboxUpgrade?: SandboxUpgradeReport | null
+}
+
+export interface SandboxUpgradeReport {
+  status?: string
+  error?: string | null
 }
 
 export interface DesktopRetryStartupResult {
@@ -54,6 +72,8 @@ export type DesktopUpdateErrorCode =
   | 'manifest_invalid'
   | 'checksum_unavailable'
   | 'integrity_failed'
+  | 'signature_invalid'
+  | 'signature_unavailable'
   | 'download_failed'
   | 'install_failed'
 
@@ -68,6 +88,8 @@ export interface DesktopUpdateState {
   snoozedUntil: string | null
   canCheck: boolean
   canNativeInstall: boolean
+  /** Explicit shell permission to launch installation; older manual shells omit it. */
+  canInstall?: boolean
   installMode: DesktopUpdateInstallMode
   releaseUrl: string | null
   source: DesktopUpdateSource | null
@@ -137,7 +159,6 @@ export interface PlatformCapabilities {
   canManageLocalApiKeys: boolean
   canRevealGatewayLog: boolean
   canRestartGateway: boolean
-  hasDesktopOnboarding: boolean
   hasWebConfig: boolean
   /**
    * The operator likely has a terminal where `opensquilla` resolves (web
@@ -175,7 +196,51 @@ export interface ProjectDirectoryPickerRequest {
   initialPath?: string
 }
 
+export interface NativeAttachmentContext {
+  gatewayInstanceId: string
+  sessionKey: string
+  sessionId: string
+  sessionEpoch: number
+}
+export interface NativeAttachmentSelection {
+  previewDataUrl?: string
+  token: string
+  name: string
+  mime: string
+  size: number
+}
+export interface NativeAttachmentReceipt {
+  previewDataUrl?: string
+  name: string
+  mime: string
+  size: number
+  file_uuid?: string
+  expires_at?: number
+  ttl_seconds?: number
+  workspaceFile?: import('@/types/chat').WorkspaceFileReference
+}
+
 export interface PlatformFilesApi {
+  chooseAttachments?: (request: NativeAttachmentContext) => Promise<NativeAttachmentSelection[]>
+  selectAttachmentFile?: (request: NativeAttachmentContext, file: File) => Promise<NativeAttachmentSelection | null>
+  importAttachmentSelection?: (request: NativeAttachmentContext, token: string) => Promise<NativeAttachmentReceipt>
+  cancelAttachmentSelections?: () => Promise<void>
+  saveArtifact?: (payload: ArtifactOpenRequest) => Promise<{ status: 'saved' | 'cancelled' }>
+  sourceFileAction?: (payload: {
+    gatewayInstanceId: string
+    sessionKey: string
+    documentId: string
+    pagePath?: string
+    action: 'open' | 'reveal'
+  }) => Promise<void>
+  /** Open or reveal a validated file in the current local workspace. */
+  workspaceFileAction?: (payload: {
+    gatewayInstanceId: string
+    sessionKey: string
+    path: string
+    workspaceBinding: string
+    action: 'open' | 'reveal'
+  }) => Promise<{ ok: boolean; message?: string }>
   /** Write the bytes to a temp file and open it with the OS default app. */
   openArtifact?: (payload: ArtifactOpenRequest) => Promise<ArtifactNativeOpenResult>
   /** Open the trusted host's native folder picker. Undefined on the web. */
@@ -274,35 +339,31 @@ export interface NativeArtifactAnnotationOverlayCloseRequest {
   rearm?: true
 }
 
-export interface NativeArtifactScreenshotRequest {
-  version: 3 | 4
+export interface NativeWorkbenchBrowserTarget {
+  targetRef: string
+  surfaceId: string
+  url: string
+  title: string
+  resourceId?: string
+  sessionKey: string
 }
 
-export interface NativeArtifactScreenshotValue {
-  mime: 'image/png'
-  data: Uint8Array
+export interface NativeWorkbenchScreenshot {
+  targetRef: string
+  mimeType: 'image/png'
+  dataBase64: string
   width: number
   height: number
 }
 
-export type NativeArtifactScreenshotResult = {
-  ok: true
-  method: 'screenshot'
-  value: NativeArtifactScreenshotValue
-} | {
-  ok: false
-  method: 'screenshot'
-  code: string
-  message: string
-}
-
 export interface NativeArtifactAnnotationSelection {
   selectionId: string
+  targetRef: string
+  resourceId?: string
   tagName: string
   elementPath: string
-  elementProofSha256: string
-  /** Compatibility diagnostic emitted by current Desktop shells. */
-  domSha256?: string
+  selectionText?: string
+  locatorHint?: string
   rect: { x: number; y: number; width: number; height: number }
 }
 
@@ -336,12 +397,12 @@ export type NativeWorkbenchSurfaceEventType =
   | 'error'
   | 'crashed'
   | 'escape'
+  | 'browser-opened'
   | 'annotation-selected'
   | 'annotation-draft-change'
   | 'annotation-submit'
   | 'annotation-cancel'
   | 'annotation-overlay-fallback'
-  | 'agent-edit-released'
 
 export interface NativeWorkbenchSurfaceEvent {
   version: NativeWorkbenchProtocolVersion
@@ -363,6 +424,8 @@ export interface NativeWorkbenchSurfaceEvent {
     path?: string
     reason?: string
     annotationId?: string
+    sessionKey?: string
+    targetRef?: string
     selection?: NativeArtifactAnnotationSelection
     body?: string
   }
@@ -388,6 +451,7 @@ export interface NativeArtifactPreviewLeaseCreateRequest {
   scopeId: string
   mode: WorkbenchPreviewMode
   authToken?: string
+  pagePath?: string
 }
 
 export interface NativeArtifactPreviewLeaseControlRequest {
@@ -420,9 +484,13 @@ export interface NativeWorkbenchApi {
   closeArtifactAnnotationOverlay?(
     request: NativeArtifactAnnotationOverlayCloseRequest,
   ): Promise<NativeWorkbenchSurfaceResult>
-  screenshot?(
-    request: NativeArtifactScreenshotRequest,
-  ): Promise<NativeArtifactScreenshotResult>
+  getWorkbenchBrowserTarget?(request: { surfaceId: string }): Promise<NativeWorkbenchBrowserTarget>
+  focusWorkbenchAnnotation?(request: {
+    surfaceId: string; targetRef: string; locatorHint: string; pagePath?: string
+  }): Promise<NativeWorkbenchSurfaceResult>
+  captureWorkbenchScreenshot?(request: {
+    surfaceId: string; targetRef: string
+  }): Promise<NativeWorkbenchScreenshot>
   createArtifactPreviewLease?(
     request: NativeArtifactPreviewLeaseCreateRequest,
   ): Promise<NativeArtifactPreviewLeaseBrokerResult>
@@ -464,6 +532,10 @@ export interface CliInvocation {
 }
 
 export interface PlatformGatewayApi {
+  /** Non-secret binding for local attachment intake and profile-scoped drafts. */
+  getAttachmentBinding?: () => Promise<{ instanceId: string; profileFingerprint: string } | null>
+  /** Observation only: never restart the Gateway or reload the renderer. */
+  onResume?: (callback: (event: DesktopResumeEvent) => void) => () => void
   getStatus(): Promise<GatewayStatus>
   getConnection?: () => Promise<DesktopGatewayConnection>
   onConnection?: (
@@ -519,6 +591,8 @@ export interface PlatformMigrationApi {
 
 export interface PlatformWindowApi {
   onHidden?: (callback: () => void) => void | (() => void)
+  onSessionDeepLink?: (callback: (sessionKey: string) => void) => () => void
+  getPendingSessionDeepLink?: () => Promise<string | null>
 }
 
 export interface PlatformUpdatesApi {
@@ -553,13 +627,13 @@ export interface Platform {
    * returns false; desktop returns the shell's live native-update capability,
    * including runtime guards such as macOS requiring /Applications.
    * Presentation ownership is intentionally reported separately by
-   * desktopUpdateManaged(), since unsigned Windows can discover an update and
+   * desktopUpdateManaged(), since Windows can discover an update and
    * open a manual installer without applying it natively.
    */
   nativeAutoUpdateEnabled: () => Promise<boolean>
   /**
    * Whether the desktop shell owns update discovery and presentation, including
-   * manual versioned installers on unsigned Windows builds. This is deliberately
+   * manual versioned installers on Windows builds. This is deliberately
    * separate from nativeAutoUpdateEnabled so the passive gateway banner does not
    * duplicate the shell-managed Windows notice.
    */

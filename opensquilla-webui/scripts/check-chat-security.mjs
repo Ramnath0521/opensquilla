@@ -1,4 +1,4 @@
-import { readFileSync } from 'node:fs'
+import { existsSync, readFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
@@ -9,6 +9,17 @@ function read(rel) {
 }
 
 const failures = []
+
+for (const rel of [
+  'src/workbench/artifactPromptAnnotationProvider.ts',
+  'src/adapters/gateway/artifactPromptAnnotationsV4.ts',
+  'src/stores/workbenchDocumentContext.ts',
+  'src/components/workbench/ArtifactHtmlStudio.vue',
+]) {
+  if (existsSync(join(root, rel))) {
+    failures.push(`${rel}: retired document editing entry points must remain absent.`)
+  }
+}
 
 function assertAbsent(rel, pattern, message) {
   const body = read(rel)
@@ -56,7 +67,6 @@ for (const rel of [
 for (const rel of [
   'src/workbench/workbenchResourceProvider.ts',
   'src/workbench/artifactDocumentProvider.ts',
-  'src/workbench/artifactPromptAnnotationProvider.ts',
 ]) {
   assertAbsent(
     rel,
@@ -85,8 +95,14 @@ assertPresent(
 
 assertPresent(
   'src/adapters/gateway/privateArtifactHttpTransport.ts',
-  /url\.protocol !== 'http:'[\s\S]+url\.protocol !== 'https:'[\s\S]+url\.origin !== base\.origin/,
-  'attachment downloads must reject non-HTTP(S) and cross-origin staged URLs.',
+  /function artifactHttpAttachmentUrl\([\s\S]+if \(!trustedOrigin\(url\.href, baseOrigin\)\)\s*\{\s*return ''/,
+  'attachment downloads must use the shared trusted-origin check for Web and Desktop URLs.',
+)
+
+assertPresent(
+  'src/adapters/gateway/privateArtifactHttpTransport.ts',
+  /function trustedOrigin\([\s\S]+if \(!urlsShareArtifactOrigin\(resolved, base\)\) return false[\s\S]+resolved\.protocol === 'http:'[\s\S]+resolved\.protocol === 'https:'[\s\S]+resolved\.protocol === DESKTOP_RENDERER_PROTOCOL[\s\S]+resolved\.hostname === DESKTOP_RENDERER_HOST/,
+  'trusted downloads must reject cross-origin URLs and allow only HTTP(S) or the exact Desktop proxy.',
 )
 
 assertPresent(

@@ -1,4 +1,5 @@
-import { computed, ref, type ComputedRef, type Ref } from 'vue'
+import { computed, ref, watch, getCurrentScope, onScopeDispose, type ComputedRef, type Ref } from 'vue'
+import { createSkillInstallReceipts } from './skillInstallReceipts'
 import i18n from '@/i18n'
 import type { SkillCatalog, SkillInstallResult } from '@/modules/skillCatalog'
 import { useToasts } from '@/composables/useToasts'
@@ -17,6 +18,7 @@ export type InstallResult = SkillInstallResult
 export type SkillInstallQueueStatus =
   | 'queued'
   | 'installing'
+  | 'waiting'
   | 'cancelling'
   | 'cancelled'
   | 'installed'
@@ -24,6 +26,7 @@ export type SkillInstallQueueStatus =
   | 'deferred'
   | 'unknown'
   | 'failed'
+  | 'selection_required'
 
 export interface SkillInstallQueueItem {
   id: string
@@ -33,6 +36,7 @@ export interface SkillInstallQueueItem {
   status: SkillInstallQueueStatus
   result?: InstallResult
   error?: string
+  progress?: string
 }
 
 export function skillInstallRequiresRiskAcknowledgement(
@@ -50,7 +54,35 @@ export function skillInstallRiskConfirmation(
   return typeof token === 'string' ? token.trim() : ''
 }
 
-export type SkillInstallSource = 'clawhub' | 'github'
+export interface SkillDirectoryCandidate {
+  name: string
+  path: string
+  identifier: string
+}
+
+export function skillInstallCandidates(result: InstallResult | undefined): SkillDirectoryCandidate[] {
+  const details = result?.diagnostics?.find(item =>
+    item.code === 'SOURCE_TREE_AMBIGUOUS' && item.details?.selectionRequired === true)?.details
+  if (!details || typeof details.repository !== 'string'
+    || !/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(details.repository)
+    || typeof details.immutableRevision !== 'string'
+    || !/^[0-9a-f]{40}$/.test(details.immutableRevision)
+    || !Array.isArray(details.candidates) || details.candidates.length > 100) return []
+  const candidates: SkillDirectoryCandidate[] = []
+  for (const candidate of details.candidates) {
+    if (!candidate || typeof candidate !== 'object') return []
+    const { name, path, identifier } = candidate as Record<string, unknown>
+    if (typeof name !== 'string' || !name || name.length > 256
+      || typeof path !== 'string' || path.length > 1024
+      || (path && path.split('/').some(part => !part || part === '.' || part === '..'))
+      || /[\\\x00-\x1f]/.test(path)
+      || identifier !== `${details.repository}@${details.immutableRevision}:${path ? `${path}/` : ''}SKILL.md`) return []
+    candidates.push({ name, path, identifier: identifier as string })
+  }
+  return candidates
+}
+
+export type SkillInstallSource = 'clawhub' | 'skillhub' | 'github'
 
 export const GITHUB_BATCH_MAX_REFERENCES = 10
 
@@ -195,10 +227,11 @@ export interface SkillRegistry {
   mutationBusy: ComputedRef<boolean>
   installingDepsId: Ref<string | null>
   uninstallingName: Ref<string | null>
-  searchRegistry: () => Promise<void>
+  searchRegistry: (source?: SkillInstallSource) => Promise<void>
+  resetRegistrySearch: () => void
   installGithub: () => Promise<void>
   installSkill: (identifier: string, source: string, displayName?: string) => Promise<void>
-  retryQueueItem: (id: string, acknowledgeRisk?: boolean) => Promise<void>
+  retryQueueItem: (id: string, acknowledgeRisk?: boolean, candidateIdentifier?: string) => Promise<void>
   cancelInstall: (source: SkillInstallSource) => Promise<void>
   clearInstallActivity: (source: SkillInstallSource) => void
   installDeps: (
@@ -217,6 +250,9 @@ export function useSkillRegistry(
 ): SkillRegistry {
   const { pushToast } = useToasts()
   const t = i18n.global.t
+  const receiptAbort = new AbortController()
+  if (getCurrentScope()) onScopeDispose(() => receiptAbort.abort())
+  const receipts = createSkillInstallReceipts(catalog, receiptAbort.signal)
   const registryQuery = ref('')
   const githubUrl = ref('')
   const registryResults = ref<RegistryResult[]>([])
@@ -226,6 +262,7 @@ export function useSkillRegistry(
   const installingId = ref<string | null>(null)
   const installActivities = ref<SkillInstallActivities>({
     clawhub: { items: [], refreshWarning: '', phase: 'terminal' },
+    skillhub: { items: [], refreshWarning: '', phase: 'terminal' },
     github: { items: [], refreshWarning: '', phase: 'terminal' },
   })
   const runningSource = ref<SkillInstallSource | null>(null)
@@ -245,7 +282,65 @@ export function useSkillRegistry(
   let searchRequestId = 0
   let cancelRequestedOperationId = ''
 
-  async function searchRegistry() {
+  function showInstallProgress(item: SkillInstallQueueItem, phase: string) {
+    item.status = 'waiting'
+    if (['resolving', 'downloading', 'scanning', 'committing'].includes(phase)) {
+      item.progress = t(`cronSkills.registry.installPhase.${phase}`)
+    }
+  }
+
+  async function restoreInstallReceipts() {
+    if (!receipts.supported() || runningSource.value) return
+    let pending
+    try { pending = await receipts.pending() } catch { return }
+    if (!pending.length || !mutationGate.acquire('install_queue')) return
+    try {
+      for (const row of pending) {
+        const source = activitySource(row.source)
+        const item = requestToQueueItem(row)
+        item.status = 'waiting'
+        const activity = installActivities.value[source]
+        activity.items.push(item)
+        activity.phase = 'installing'
+        const active = activity.items[activity.items.length - 1]!
+        runningSource.value = source
+        activeInstallOperation.value = { id: row.operationId, itemId: active.id, source }
+        try {
+          const result = await receipts.wait(row.operationId, status => showInstallProgress(active, status.phase))
+          active.result = result
+          active.status = result.recoveryRequired ? 'unknown' : result.cancelled ? 'cancelled' : result.success
+            ? (result.unchanged ? 'unchanged' : 'installed')
+            : skillInstallCandidates(result).length ? 'selection_required' : 'failed'
+          active.error = result.success || result.cancelled ? '' : result.message || ''
+          await refreshCatalogAfterBatch(source, [active])
+        } catch (error) {
+          active.status = 'unknown'
+          active.error = (error as Error).message
+        }
+        installActivities.value[source].phase = 'terminal'
+      }
+    } finally {
+      runningSource.value = null
+      activeInstallOperation.value = null
+      cancellingSource.value = null
+      mutationGate.release('install_queue')
+    }
+  }
+
+  watch(() => receipts.supported(), supported => {
+    if (supported) void restoreInstallReceipts()
+  }, { immediate: true })
+
+  function resetRegistrySearch() {
+    // A source switch discards pending responses without clearing the user's query.
+    searchRequestId += 1
+    registryResults.value = []
+    registryDiagnostics.value = []
+    registrySearchError.value = ''
+    registryLoading.value = false
+  }
+
+  async function searchRegistry(source: SkillInstallSource = 'clawhub') {
     const query = registryQuery.value.trim()
     const requestId = ++searchRequestId
     if (!query) {
@@ -259,7 +354,7 @@ export function useSkillRegistry(
     try {
       const data = await catalog.search(query, {
         limit: 20,
-        source: 'clawhub',
+        source,
       })
       if (requestId !== searchRequestId) return
       registryResults.value = [...data.results]
@@ -301,7 +396,9 @@ export function useSkillRegistry(
   }
 
   function activitySource(source: string): SkillInstallSource {
-    return source === 'github' ? 'github' : 'clawhub'
+    if (source === 'github') return 'github'
+    if (source === 'skillhub') return 'skillhub'
+    return 'clawhub'
   }
 
   function removeSuccessfulGithubLines(items: SkillInstallQueueItem[]) {
@@ -350,7 +447,7 @@ export function useSkillRegistry(
       item.result = undefined
       installingId.value = item.id
       let rateLimited = false
-      const operationId = installCancellationSupported.value
+      const operationId = installCancellationSupported.value || receipts.supported()
         ? createInstallOperationId()
         : ''
       if (operationId) {
@@ -361,6 +458,10 @@ export function useSkillRegistry(
         }
       }
       try {
+        if (operationId && receipts.supported()) {
+          await receipts.remember({ operationId, identifier: item.identifier,
+            source: item.source, displayName: item.displayName })
+        }
         const res = await catalog.install({
           identifier: item.identifier,
           source: item.source,
@@ -368,14 +469,19 @@ export function useSkillRegistry(
           ...(riskConfirmation
             ? { riskConfirmation }
             : {}),
+        }).catch(async error => {
+          if (!operationId || !receipts.supported()) throw error
+          item.status = 'waiting'
+          return receipts.wait(operationId, status => showInstallProgress(item, status.phase))
         })
+        if (operationId && !res.recoveryRequired) receipts.forget(operationId)
         item.result = res
         item.displayName = res.name || item.displayName
-        item.status = res.cancelled
+        item.status = res.recoveryRequired ? 'unknown' : res.cancelled
           ? 'cancelled'
           : res.success
             ? (res.unchanged ? 'unchanged' : 'installed')
-            : 'failed'
+            : skillInstallCandidates(res).length ? 'selection_required' : 'failed'
         item.error = res.success || res.cancelled
           ? ''
           : (res.message || t('cronSkills.registry.installFailed'))
@@ -408,7 +514,7 @@ export function useSkillRegistry(
     for (const item of installActivities.value[source].items) {
       if (item.status !== 'queued'
         && item.status !== 'installing'
-        && item.status !== 'cancelling') continue
+        && item.status !== 'cancelling' && item.status !== 'waiting') continue
       item.status = 'unknown'
       item.error ||= t('cronSkills.registry.installResultUnknown')
     }
@@ -468,6 +574,7 @@ export function useSkillRegistry(
       return {
         ...registryResult,
         installed: installResult.installed ?? installResult.success,
+        ...(installResult.installId ? { installId: installResult.installId } : {}),
         lifecycle: installResult.lifecycle,
         instruction_usable: installResult.instruction_usable,
         diagnostics: installResult.diagnostics ? [...installResult.diagnostics] : undefined,
@@ -479,17 +586,30 @@ export function useSkillRegistry(
     await runNewBatch([{ identifier, source, displayName }])
   }
 
-  async function retryQueueItem(id: string, acknowledgeRisk = false) {
-    const source = (['clawhub', 'github'] as const).find(candidate =>
+  async function retryQueueItem(id: string, acknowledgeRisk = false, candidateIdentifier = '') {
+    const source = (['clawhub', 'skillhub', 'github'] as const).find(candidate =>
       installActivities.value[candidate].items.some(item => item.id === id))
     if (!source) return
     const item = installActivities.value[source].items.find(candidate => candidate.id === id)
-    if (!item || (item.status !== 'failed' && item.status !== 'cancelled')) return
-    const riskConfirmation = acknowledgeRisk
+    if (!item) return
+    const candidate = candidateIdentifier && item.source === 'github'
+      ? skillInstallCandidates(item.result).find(row => row.identifier === candidateIdentifier)
+      : undefined
+    if (candidateIdentifier && (!candidate || item.status !== 'selection_required')) return
+    if (!candidate && item.status !== 'failed' && item.status !== 'cancelled') return
+    const riskConfirmation = acknowledgeRisk && !candidate
       ? skillInstallRiskConfirmation(item.result)
       : ''
-    if (acknowledgeRisk && !riskConfirmation) return
+    if (acknowledgeRisk && !candidate && !riskConfirmation) return
     if (!mutationGate.acquire('install_queue')) return
+    if (candidate) {
+      githubUrl.value = githubUrl.value.split(/\r?\n/).map(line =>
+        line.trim() === item.identifier ? candidate.identifier : line).join('\n')
+      item.identifier = candidate.identifier
+      item.displayName = candidate.name
+      item.result = undefined
+      item.error = ''
+    }
     installActivities.value[source].refreshWarning = ''
     installActivities.value[source].phase = 'installing'
     runningSource.value = source
@@ -637,6 +757,7 @@ export function useSkillRegistry(
     installingDepsId,
     uninstallingName,
     searchRegistry,
+    resetRegistrySearch,
     installGithub,
     installSkill,
     retryQueueItem,

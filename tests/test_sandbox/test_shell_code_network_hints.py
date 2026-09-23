@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import os
@@ -103,8 +104,12 @@ async def test_code_exec_exact_elevation_runs_host_once(
         pid = 6201
         returncode = 0
 
-        async def communicate(self) -> tuple[bytes, bytes]:
-            return b"approved\n", b""
+        def __init__(self) -> None:
+            self.stdout = asyncio.StreamReader()
+            self.stdout.feed_data(b"approved\n")
+            self.stdout.feed_eof()
+            self.stderr = asyncio.StreamReader()
+            self.stderr.feed_eof()
 
         def kill(self) -> None:
             raise AssertionError("approved code should not time out")
@@ -749,7 +754,8 @@ async def test_trusted_windows_shell_receives_managed_proxy_without_network_hint
     try:
         result = await shell.exec_command(
             "powershell -NoProfile -Command \"Write-Output $env:HTTP_PROXY\"",
-            workdir=str(tmp_path),
+            # The POSIX pytest directory is not a simulated Windows /tmp alias.
+            workdir=".",
         )
     finally:
         current_tool_context.reset(token)
@@ -758,6 +764,7 @@ async def test_trusted_windows_shell_receives_managed_proxy_without_network_hint
 
     assert result.startswith("exit_code=0")
     assert backend_calls
+    assert backend_calls[0].cwd == tmp_path.resolve()
     assert backend_calls[0].policy.network is NetworkMode.PROXY_ALLOWLIST
     assert backend_calls[0].env["HTTP_PROXY"].startswith("http://127.0.0.1:")
 
@@ -1035,6 +1042,7 @@ def test_windows_shell_host_handles_invoke_webrequest_status_via_managed_proxy(
             text=True,
             capture_output=True,
             check=False,
+            timeout=60,
         )
 
     assert result.returncode == 0, result.stderr
@@ -1074,6 +1082,7 @@ def test_windows_shell_host_handles_try_wrapped_invoke_webrequest_status_via_man
             text=True,
             capture_output=True,
             check=False,
+            timeout=60,
         )
 
     assert result.returncode == 0, result.stderr
@@ -1113,6 +1122,7 @@ def test_windows_shell_host_handles_assigned_invoke_webrequest_status_via_manage
             text=True,
             capture_output=True,
             check=False,
+            timeout=60,
         )
 
     assert result.returncode == 0, result.stderr
@@ -1151,6 +1161,7 @@ def test_windows_shell_host_handles_assigned_curl_head_status_via_managed_proxy(
             text=True,
             capture_output=True,
             check=False,
+            timeout=60,
         )
 
     assert result.returncode == 0, result.stderr
@@ -1185,6 +1196,7 @@ def test_windows_shell_host_handles_curl_head_via_managed_proxy(
             text=True,
             capture_output=True,
             check=False,
+            timeout=60,
         )
 
     assert result.returncode == 0, result.stderr
@@ -1255,8 +1267,9 @@ class _SingleResponseHttpProxy:
         self._socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self._socket.bind(("127.0.0.1", 0))
         self._socket.listen(1)
-        self._socket.settimeout(5)
+        self._socket.settimeout(0.1)
         self.port = int(self._socket.getsockname()[1])
+        self._stop = threading.Event()
         self._thread = threading.Thread(target=self._serve_once, daemon=True)
 
     def __enter__(self) -> int:
@@ -1264,13 +1277,23 @@ class _SingleResponseHttpProxy:
         return self.port
 
     def __exit__(self, *args: object) -> None:
-        self._thread.join(timeout=5)
+        self._stop.set()
         self._socket.close()
+        self._thread.join(timeout=6)
+        assert not self._thread.is_alive(), "test proxy did not stop"
 
     def _serve_once(self) -> None:
-        try:
-            conn, _addr = self._socket.accept()
-        except OSError:
+        while not self._stop.is_set():
+            try:
+                conn, _addr = self._socket.accept()
+                break
+            except TimeoutError:
+                continue
+            except OSError:
+                if self._stop.is_set():
+                    return
+                raise
+        else:
             return
         with conn:
             conn.settimeout(5)
@@ -1281,6 +1304,36 @@ class _SingleResponseHttpProxy:
                     break
                 data += chunk
             conn.sendall(self._response)
+
+
+def test_proxy_keeps_serving_after_idle_accept_timeouts(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    original_accept = socket.socket.accept
+    ready = threading.Event()
+    attempts = 0
+    response = b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nOK"
+    proxy = _SingleResponseHttpProxy(response)
+
+    def accept_after_idle(listener: socket.socket) -> tuple[socket.socket, object]:
+        nonlocal attempts
+        if listener is not proxy._socket:
+            return original_accept(listener)
+        attempts += 1
+        if attempts <= 2:
+            raise TimeoutError("synthetic idle accept timeout")
+        ready.set()
+        return original_accept(listener)
+
+    monkeypatch.setattr(socket.socket, "accept", accept_after_idle)
+    with proxy as port:
+        assert ready.wait(timeout=5), "test proxy stopped before the client connected"
+        with socket.create_connection(("127.0.0.1", port), timeout=5) as client:
+            client.sendall(b"GET / HTTP/1.1\r\nHost: example.test\r\n\r\n")
+            received = b""
+            while chunk := client.recv(4096):
+                received += chunk
+    assert received == response
 
 
 def test_windows_direct_powershell_argv_does_not_install_socket_fallbacks() -> None:

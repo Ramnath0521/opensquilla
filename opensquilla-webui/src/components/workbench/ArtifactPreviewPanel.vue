@@ -13,6 +13,7 @@
         <span class="artifact-preview__meta">{{ artifactFileSubtitle(artifact) }}</span>
       </span>
       <span class="artifact-preview__actions">
+        <ResourceActionsMenu :artifact="artifact" :session-key="sessionKey" :previewable="false" trigger />
         <button
           v-if="preview.kind.value !== 'unsupported'"
           type="button"
@@ -65,17 +66,7 @@
 
     <div class="artifact-preview__viewport">
       <div
-        v-if="agentEditInProgress"
-        class="artifact-preview__status"
-        data-testid="artifact-preview-agent-edit-in-progress"
-        role="status"
-      >
-        <Icon name="info" :size="18" />
-        <strong>{{ t('workbench.artifactPreview.agentEditInProgress') }}</strong>
-      </div>
-
-      <div
-        v-else-if="preview.state.value === 'loading'"
+        v-if="preview.state.value === 'loading'"
         class="artifact-preview__status"
         role="status"
         :aria-label="t('chat.loadingPreview')"
@@ -105,7 +96,10 @@
         <span class="artifact-preview__status-detail">{{ failureDetail }}</span>
         <span class="artifact-preview__status-actions">
           <button
-            v-if="preview.state.value !== 'unsupported' || preview.errorCode.value !== 'unsupported'"
+            v-if="
+              !pdfViewerUnavailable
+                && (preview.state.value !== 'unsupported' || preview.errorCode.value !== 'unsupported')
+            "
             type="button"
             class="btn btn--ghost"
             @click="reloadPreview"
@@ -177,6 +171,7 @@
           :sandbox="htmlSandbox"
           :allow="htmlPermissions"
           referrerpolicy="no-referrer"
+          @load="onHtmlFrameLoad"
         />
         <div
           v-else-if="preview.kind.value === 'html'"
@@ -197,6 +192,7 @@
 import { computed, inject, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { useI18n } from 'vue-i18n'
 import Icon from '@/components/Icon.vue'
+import ResourceActionsMenu from '@/components/ResourceActionsMenu.vue'
 import {
   ARTIFACT_WORKBENCH_KEY,
   type ArtifactPreviewResourceState,
@@ -212,7 +208,6 @@ import {
 import { ARTIFACT_PREVIEW_ESCAPE_MESSAGE } from '@/utils/workbench/artifactPreview'
 
 const props = withDefaults(defineProps<{
-  agentEditInProgress?: boolean
   artifact: ArtifactPayload
   baseOrigin?: string
   nativeHtml?: boolean
@@ -228,7 +223,6 @@ const props = withDefaults(defineProps<{
   showHeader?: boolean
   suspended?: boolean
 }>(), {
-  agentEditInProgress: false,
   baseOrigin: '',
   nativeHtml: false,
   nativeSurfaceState: 'loading',
@@ -257,6 +251,15 @@ const artifactWorkbench = inject(ARTIFACT_WORKBENCH_KEY)
 if (!artifactWorkbench) throw new Error('ArtifactWorkbench was not provided')
 const previewFrameRef = ref<HTMLIFrameElement | null>(null)
 const htmlFrameGeneration = ref(0)
+let loadedFrame: HTMLIFrameElement | null = null
+
+function onHtmlFrameLoad(event: Event) {
+  const frame = event.currentTarget as HTMLIFrameElement
+  // A cross-origin/opaque iframe cannot attest its new URL after navigation.
+  // Keep previewing it, but do not offer file operations for a guessed page.
+  if (loadedFrame === frame) emit('workbench-event', { type: 'preview-page-unknown' })
+  loadedFrame = frame
+}
 
 const preview = artifactWorkbench.previews.createResource({
   artifact: () => props.artifact,
@@ -368,10 +371,21 @@ function emitArtifactEvent(
   emit('workbench-event', { type, payload: props.artifact })
 }
 
+// `pdfViewerEnabled` only describes the browser's inline PDF capability. It
+// is still useful as an early guard for WebViews/Electron builds that have the
+// PDF plugin disabled, where an iframe otherwise renders as an unexplained
+// empty dark surface.
+const pdfViewerUnavailable = computed(() => {
+  if (preview.kind.value !== 'pdf') return false
+  if (typeof navigator === 'undefined' || !('pdfViewerEnabled' in navigator)) return false
+  return (navigator as Navigator & { pdfViewerEnabled?: boolean }).pdfViewerEnabled === false
+})
+
 const isRenderable = computed(() =>
-  preview.state.value === 'ready'
+  !pdfViewerUnavailable.value
+  && (preview.state.value === 'ready'
   || preview.state.value === 'ready-with-warnings'
-  || preview.state.value === 'missing-resource')
+  || preview.state.value === 'missing-resource'))
 
 const opaqueOfflinePreview = computed(() =>
   props.previewSandboxProfile === 'opaque-offline'
@@ -429,12 +443,14 @@ onBeforeUnmount(() => {
 })
 
 const isFailureState = computed(() =>
-  preview.state.value === 'crashed'
+  pdfViewerUnavailable.value
+  || preview.state.value === 'crashed'
   || preview.state.value === 'error'
   || preview.state.value === 'offline'
   || preview.state.value === 'unsupported')
 
 const failureTitle = computed(() => {
+  if (pdfViewerUnavailable.value) return t('workbench.artifactPreview.unsupported')
   if (preview.state.value === 'offline') return t('workbench.artifactPreview.offline')
   if (preview.state.value === 'crashed') return t('workbench.artifactPreview.crashed')
   if (preview.errorCode.value === 'too-large') return t('workbench.artifactPreview.tooLarge')
@@ -446,6 +462,7 @@ const failureTitle = computed(() => {
 })
 
 const failureDetail = computed(() => {
+  if (pdfViewerUnavailable.value) return t('workbench.artifactPreview.pdfViewerUnavailable')
   if (preview.errorCode.value === 'preview-blocked' && props.previewErrorMessage) {
     return props.previewErrorMessage
   }

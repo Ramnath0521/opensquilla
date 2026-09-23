@@ -13,6 +13,7 @@ from types import SimpleNamespace
 from typing import Any
 from urllib.error import URLError
 
+import httpx
 import pytest
 import typer
 from typer.testing import CliRunner
@@ -211,6 +212,288 @@ def test_gateway_run_reports_invalid_config_without_traceback(
     assert "Traceback" not in output
 
 
+@pytest.fixture
+def gateway_start_timeouts(monkeypatch: pytest.MonkeyPatch) -> list[asyncio.Timeout]:
+    from opensquilla.telemetry import runtime as telemetry_runtime
+
+    timeouts: list[asyncio.Timeout] = []
+
+    def timeout_at_checkpoint(delay: float | None) -> asyncio.Timeout:
+        assert delay == telemetry_runtime.SHUTDOWN_UPLOAD_TIMEOUT_SECONDS
+        timeout = asyncio.timeout(None)
+        timeouts.append(timeout)
+        return timeout
+
+    # Functional delivery tests must not race cold SQLite initialization.
+    # Expire the real helper timeout at an observed request boundary instead;
+    # the runtime's separate cleanup budget is only a deadlock backstop here.
+    monkeypatch.setattr(telemetry_runtime, "SHUTDOWN_UPLOAD_TIMEOUT_SECONDS", 30.0)
+    monkeypatch.setattr(
+        gateway_cmd,
+        "asyncio",
+        SimpleNamespace(**(vars(asyncio) | {"timeout": timeout_at_checkpoint})),
+    )
+    return timeouts
+
+
+@pytest.mark.parametrize(
+    ("failure_kind", "disabled", "desktop", "expected_outcome", "expected_code"),
+    [
+        ("bind", False, False, "fail", "spawn_failed"),
+        ("startup", False, False, "fail", "internal_error"),
+        ("timeout", False, False, "timeout", "health_timeout"),
+        ("late_tls", False, False, "fail", "spawn_failed"),
+        ("late_bind", False, False, "fail", "spawn_failed"),
+        ("after_ready", False, False, None, None),
+        ("startup", True, False, None, None),
+        ("startup", False, True, None, None),
+    ],
+)
+def test_gateway_start_failure_reaches_collector_without_exception_content(
+    tmp_path, monkeypatch, gateway_start_timeouts,
+    failure_kind, disabled, desktop, expected_outcome, expected_code,
+) -> None:
+    from opensquilla.gateway.config import GatewayConfig
+    from opensquilla.telemetry import runtime as telemetry_runtime
+    from opensquilla.telemetry.consent import resolve_scope_consent
+    from opensquilla.telemetry.contracts.wire import TelemetryWireTarget, parse_telemetry_wire
+    from opensquilla.telemetry.coordination import scope_consent_coordinator_for
+    from opensquilla.telemetry.uploader import TelemetryUploader
+
+    config = GatewayConfig(state_dir=str(tmp_path / "state"))
+    config.privacy.disable_network_observability = disabled
+    real_runtime = telemetry_runtime.ScopedTelemetryRuntime
+
+    def runtime_with_test_consent(*, config):
+        scope_consent_coordinator_for(
+            config,
+            state_provider=lambda scope: resolve_scope_consent(scope, config=config, env={}),
+        )
+        return real_runtime(config=config)
+
+    monkeypatch.setattr(telemetry_runtime, "ScopedTelemetryRuntime", runtime_with_test_consent)
+    monkeypatch.setenv("OPENSQUILLA_STATE_DIR", str(tmp_path))
+    monkeypatch.setattr(gateway_cmd, "_load_gateway_config", lambda *_args, **_kwargs: config)
+    monkeypatch.setattr(gateway_cmd, "desktop_config_path_is_profile_local", lambda *_args: True)
+    monkeypatch.setattr(gateway_cmd, "desktop_profile_lifecycle_active", lambda: desktop)
+    monkeypatch.setattr(gateway_cmd, "_install_shutdown_handlers", lambda *_args: [])
+    monkeypatch.setattr(
+        gateway_cmd, "_gateway_bind_available", lambda *_args: failure_kind != "bind"
+    )
+    received = []
+
+    def collect(request):
+        assert b"synthetic-secret-content" not in request.content
+        batch = parse_telemetry_wire(
+            request.content, target=TelemetryWireTarget.RELIABILITY_BATCH
+        )
+        received.extend(batch.events)
+        return httpx.Response(
+            202,
+            json={
+                "ok": True,
+                "batch_id": str(batch.batch_id),
+                "accepted": len(batch.events),
+                "duplicates": 0,
+            },
+        )
+
+    def uploader(*args, **kwargs):
+        client = httpx.AsyncClient(transport=httpx.MockTransport(collect))
+        result = TelemetryUploader(*args, **kwargs, http_client=client)
+        result._owns_client = True
+        return result
+
+    monkeypatch.setattr(telemetry_runtime, "TelemetryUploader", uploader)
+
+    async def fail_start(**_kwargs):
+        if failure_kind in {"late_tls", "late_bind", "after_ready"}:
+            from opensquilla.telemetry.reliability_sink import ReliabilityEventSink
+
+            existing_runtime = runtime_with_test_consent(config=_kwargs["config"])
+            existing_sink = ReliabilityEventSink(existing_runtime)
+
+            async def serve():
+                await asyncio.sleep(0)
+                if failure_kind == "late_bind":
+                    raise SystemExit(1)
+                raise FileNotFoundError("synthetic-secret-content")
+
+            task = asyncio.create_task(serve())
+
+            async def close(_reason):
+                with contextlib.suppress(BaseException):
+                    await task
+                await existing_runtime.close()
+
+            return SimpleNamespace(
+                app=SimpleNamespace(
+                    state=SimpleNamespace(gateway_start_ready=failure_kind == "after_ready")
+                ),
+                _task=task,
+                _services=SimpleNamespace(reliability_event_sink=existing_sink),
+                close=close,
+            )
+        if failure_kind == "timeout":
+            raise TimeoutError("synthetic-secret-content")
+        raise RuntimeError("synthetic-secret-content")
+
+    monkeypatch.setattr(gateway_cmd, "start_gateway_server", fail_start)
+    result = runner.invoke(app, ["gateway", "run"])
+
+    assert result.exit_code == 1
+    if expected_outcome is None:
+        assert received == []
+    else:
+        assert len(received) == 1
+        event = received[0]
+        assert event.event_name == "gateway_start_result"
+        assert event.source == "gateway"
+        assert event.outcome == expected_outcome
+        assert event.error_code == expected_code
+
+
+@pytest.mark.parametrize("reuse_existing_sink", [False, True])
+async def test_gateway_start_failure_does_not_wait_on_another_runtime_send_lock(
+    tmp_path, monkeypatch, reuse_existing_sink
+) -> None:
+    from opensquilla.gateway.config import GatewayConfig
+    from opensquilla.telemetry import runtime as telemetry_runtime
+    from opensquilla.telemetry.consent import TelemetryScope, resolve_scope_consent
+    from opensquilla.telemetry.contracts.common import ResultOutcome
+    from opensquilla.telemetry.coordination import scope_consent_coordinator_for
+    from opensquilla.telemetry.outbox import TelemetryOutbox
+    from opensquilla.telemetry.reliability_sink import ReliabilityEventSink
+    from opensquilla.telemetry.uploader import TelemetryUploader
+
+    config = GatewayConfig(state_dir=str(tmp_path / "state"))
+    scope_consent_coordinator_for(
+        config, state_provider=lambda scope: resolve_scope_consent(scope, config=config, env={})
+    )
+    entered = asyncio.Event()
+    cancelled = asyncio.Event()
+
+    async def held_send(_request):
+        entered.set()
+        try:
+            await asyncio.Event().wait()
+        finally:
+            cancelled.set()
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(held_send)) as client:
+        monkeypatch.setattr(
+            telemetry_runtime,
+            "TelemetryUploader",
+            lambda *args, **kwargs: TelemetryUploader(*args, **kwargs, http_client=client),
+        )
+        real_runtime = telemetry_runtime.ScopedTelemetryRuntime
+        original = real_runtime(config=config)
+        sink = ReliabilityEventSink(original)
+        await sink.record_gateway_start(
+            outcome=ResultOutcome.SUCCESS, error_code=None, failure_stage=None, duration_ms=1
+        )
+        await original.start()
+        await asyncio.wait_for(entered.wait(), timeout=1)
+        created = []
+
+        def new_runtime(**kwargs):
+            runtime = real_runtime(**kwargs)
+            created.append(runtime)
+            return runtime
+
+        monkeypatch.setattr(telemetry_runtime, "ScopedTelemetryRuntime", new_runtime)
+        monkeypatch.setattr(telemetry_runtime, "SHUTDOWN_UPLOAD_TIMEOUT_SECONDS", 0.05)
+        monkeypatch.setattr(gateway_cmd, "desktop_profile_lifecycle_active", lambda: False)
+        try:
+            await asyncio.wait_for(
+                gateway_cmd._record_gateway_start_failure(
+                    config,
+                    started_at=gateway_cmd.time.monotonic(),
+                    failure=FileNotFoundError("synthetic-private-path"),
+                    existing_sink=sink if reuse_existing_sink else None,
+                ),
+                timeout=0.5,
+            )
+            assert not cancelled.is_set()
+        finally:
+            await asyncio.wait_for(original.close(), timeout=1)
+
+    assert cancelled.is_set()
+    assert len(created) == (0 if reuse_existing_sink else 1)
+    assert all(runtime._closed and not runtime.opened_scopes for runtime in created)
+    outbox = await TelemetryOutbox.open(config.state_dir, TelemetryScope.RELIABILITY)
+    try:
+        assert (await outbox.stats()).pending_events == (2 if reuse_existing_sink else 1)
+    finally:
+        await outbox.close()
+
+
+async def test_gateway_early_failure_timeout_closes_owned_upload_without_retry(
+    tmp_path, monkeypatch, gateway_start_timeouts
+) -> None:
+    from opensquilla.gateway.config import GatewayConfig
+    from opensquilla.telemetry import runtime as telemetry_runtime
+    from opensquilla.telemetry.consent import TelemetryScope, resolve_scope_consent
+    from opensquilla.telemetry.coordination import scope_consent_coordinator_for
+    from opensquilla.telemetry.outbox import TelemetryOutbox
+    from opensquilla.telemetry.uploader import TelemetryUploader
+
+    config = GatewayConfig(state_dir=str(tmp_path / "state"))
+    scope_consent_coordinator_for(
+        config, state_provider=lambda scope: resolve_scope_consent(scope, config=config, env={})
+    )
+    requests = []
+    cancelled = asyncio.Event()
+
+    async def stalled(request):
+        requests.append(request)
+        assert len(gateway_start_timeouts) == 1
+        gateway_start_timeouts[0].reschedule(asyncio.get_running_loop().time())
+        try:
+            await asyncio.Event().wait()
+        finally:
+            cancelled.set()
+
+    runtimes = []
+    uploaders = []
+    real_runtime = telemetry_runtime.ScopedTelemetryRuntime
+
+    def runtime_factory(**kwargs):
+        runtime = real_runtime(**kwargs)
+        runtimes.append(runtime)
+        return runtime
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(stalled)) as client:
+        def uploader_factory(*args, **kwargs):
+            uploader = TelemetryUploader(*args, **kwargs, http_client=client)
+            uploaders.append(uploader)
+            return uploader
+
+        monkeypatch.setattr(telemetry_runtime, "ScopedTelemetryRuntime", runtime_factory)
+        monkeypatch.setattr(telemetry_runtime, "TelemetryUploader", uploader_factory)
+        monkeypatch.setattr(gateway_cmd, "desktop_profile_lifecycle_active", lambda: False)
+        await asyncio.wait_for(
+            gateway_cmd._record_gateway_start_failure(
+                config,
+                started_at=gateway_cmd.time.monotonic(),
+                failure=OSError("synthetic-private-path"),
+            ),
+            timeout=10,
+        )
+
+    assert len(requests) == 1
+    assert gateway_start_timeouts[0].expired()
+    assert cancelled.is_set()
+    assert len(runtimes) == len(uploaders) == 1
+    assert runtimes[0]._closed and not runtimes[0].opened_scopes
+    assert uploaders[0]._closed
+    outbox = await TelemetryOutbox.open(config.state_dir, TelemetryScope.RELIABILITY)
+    try:
+        assert (await outbox.stats()).pending_events == 1
+    finally:
+        await outbox.close()
+
+
 def test_gateway_run_memory_recovery_command_is_bare_on_windows(
     tmp_path,
     monkeypatch,
@@ -261,6 +544,52 @@ def test_gateway_lifecycle_paths_use_state_root(tmp_path, monkeypatch) -> None:
         tmp_path / "home" / "state" / "gateway" / "gateway.json"
     )
     assert gateway_lifecycle.gateway_log_path() == tmp_path / "home" / "logs" / "gateway.log"
+
+
+def test_gateway_spawn_passes_stable_runtime_cwd(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    runtime_root = tmp_path / "runtime"
+    runtime_root.mkdir()
+    calls: list[tuple[list[str], dict[str, Any]]] = []
+
+    def fake_popen(argv, **kwargs):
+        calls.append((argv, kwargs))
+        return SimpleNamespace(pid=4242)
+
+    monkeypatch.setattr(gateway_lifecycle, "_gateway_runtime_cwd", lambda: runtime_root)
+    monkeypatch.setattr(gateway_lifecycle.subprocess, "Popen", fake_popen)
+    manager = Manager(port=0, health_timeout=0)
+    manager.log_path = tmp_path / "gateway.log"
+
+    manager._spawn_gateway([sys.executable, "-m", "opensquilla.cli.main", "gateway", "run"])
+
+    assert calls
+    assert calls[0][1]["cwd"] == str(runtime_root)
+
+
+def test_gateway_spawn_does_not_spawn_when_runtime_root_is_unavailable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    spawned = False
+
+    def fail_popen(*_args, **_kwargs):
+        nonlocal spawned
+        spawned = True
+        raise AssertionError("invalid runtime root must fail before Popen")
+
+    monkeypatch.setattr(
+        gateway_lifecycle,
+        "_gateway_runtime_cwd",
+        lambda: (_ for _ in ()).throw(RuntimeError("runtime_root_missing: deleted")),
+    )
+    monkeypatch.setattr(gateway_lifecycle.subprocess, "Popen", fail_popen)
+    manager = Manager(port=0, health_timeout=0)
+    manager.log_path = tmp_path / "gateway.log"
+
+    with pytest.raises(RuntimeError, match=r"^runtime_root_missing:"):
+        manager._spawn_gateway([sys.executable, "-m", "opensquilla.cli.main", "gateway", "run"])
+    assert spawned is False
 
 
 def test_safe_desktop_gateway_start_uses_external_lifecycle_state(
@@ -665,6 +994,142 @@ def test_gateway_start_uses_config_host_port_when_flags_are_omitted(
     assert argv[argv.index("--port") + 1] == "19999"
     payload = _payload(result)
     assert payload["url"] == "http://127.0.0.2:19999"
+
+
+_INVALID_PORT_MESSAGE = (
+    "Gateway port must be an integer between 0 and 65535. "
+    "Fix port in the config file or OPENSQUILLA_GATEWAY_PORT."
+)
+_INVALID_PORT_CASES = [
+    ("flag", "-1"),
+    ("flag", "65536"),
+    ("config", "-1"),
+    ("config", "65536"),
+    ("mixed-config", "65536"),
+    ("environment", "-1"),
+    ("environment", "65536"),
+    ("environment", "synthetic-sensitive-token"),
+]
+
+
+def _invalid_port_options(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    source: str,
+    value: str,
+) -> list[str]:
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setenv("OPENSQUILLA_STATE_DIR", str(home))
+    monkeypatch.setenv("OPENSQUILLA_PROFILE_KIND", "cli")
+    monkeypatch.setenv("OPENSQUILLA_USER_STATE_DIR", str(tmp_path / "user-state"))
+    monkeypatch.delenv("OPENSQUILLA_GATEWAY_CONFIG_PATH", raising=False)
+    monkeypatch.delenv("OPENSQUILLA_GATEWAY_PORT", raising=False)
+    target = home / "config.toml"
+    # A legacy document makes unexpected migration writes visible as well.
+    configured_port = value if source in {"config", "mixed-config"} else "18791"
+    document = "" if source == "environment" else f"port = {configured_port}\n"
+    if source == "mixed-config":
+        document += 'debug = "synthetic-sensitive-token"\n'
+    target.write_text(document, encoding="utf-8")
+    _write_pidfile(_record(pid=12345))
+    log = gateway_lifecycle.gateway_log_path()
+    log.parent.mkdir(parents=True, exist_ok=True)
+    log.write_bytes(b"preserve existing gateway log\n")
+
+    def forbidden_operation(*_args, **_kwargs):
+        raise AssertionError("invalid port must be rejected before lifecycle operations")
+
+    monkeypatch.setattr(gateway_lifecycle.subprocess, "Popen", forbidden_operation)
+    monkeypatch.setattr(gateway_cmd, "_gateway_bind_available", forbidden_operation)
+    monkeypatch.setattr(gateway_cmd, "start_gateway_server", forbidden_operation)
+    for method in ("_spawn_gateway", "_probe_health", "_pid_running", "_terminate_pid"):
+        monkeypatch.setattr(Manager, method, forbidden_operation)
+
+    options = ["--config", str(target)]
+    if source == "flag":
+        options.extend(["--port", value])
+    elif source == "environment":
+        monkeypatch.setenv("OPENSQUILLA_GATEWAY_PORT", value)
+    return options
+
+
+@pytest.mark.parametrize("action", ["start", "status", "stop", "restart"])
+@pytest.mark.parametrize(("source", "value"), _INVALID_PORT_CASES)
+def test_gateway_lifecycle_rejects_invalid_port_as_safe_json_before_side_effects(
+    action: str,
+    source: str,
+    value: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    options = _invalid_port_options(tmp_path, monkeypatch, source, value)
+    before = _profile_tree_snapshot(tmp_path)
+
+    result = runner.invoke(app, ["gateway", action, *options, "--json"])
+
+    assert result.exit_code == 2, result.output
+    payload = _payload(result)
+    assert payload["ok"] is False
+    assert payload["action"] == action
+    assert payload["state"] == f"{action}_failed"
+    assert payload["code"] == "INVALID_PORT"
+    assert payload["message"] == _INVALID_PORT_MESSAGE
+    assert "synthetic-sensitive-token" not in result.output
+    assert "Traceback" not in result.output
+    assert "HEALTH_TIMEOUT" not in result.output
+    assert _profile_tree_snapshot(tmp_path) == before
+
+
+@pytest.mark.parametrize(("source", "value"), _INVALID_PORT_CASES)
+def test_gateway_run_rejects_invalid_port_before_bind_without_traceback(
+    source: str,
+    value: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    options = _invalid_port_options(tmp_path, monkeypatch, source, value)
+    before = _profile_tree_snapshot(tmp_path)
+
+    result = runner.invoke(app, ["gateway", "run", *options])
+
+    assert result.exit_code == 2, result.output
+    if source == "flag":
+        assert "0<=x<=65535" in result.output
+    else:
+        assert " ".join(_INVALID_PORT_MESSAGE.split()) in " ".join(result.output.split())
+    assert "synthetic-sensitive-token" not in result.output
+    assert "Traceback" not in result.output
+    # The foreground command acquires process/profile locks before config load;
+    # none of the operator's existing config, pidfile, or log may be changed.
+    after = _profile_tree_snapshot(tmp_path)
+    assert {name: after.get(name) for name in before} == before
+
+
+@pytest.mark.parametrize("port", [0, 1, 65535])
+def test_gateway_start_keeps_valid_port_boundaries(
+    port: int,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("OPENSQUILLA_STATE_DIR", str(tmp_path / "home"))
+    monkeypatch.delenv("OPENSQUILLA_GATEWAY_PORT", raising=False)
+    calls = []
+
+    def fake_popen(argv, **kwargs):
+        calls.append(argv)
+        return SimpleNamespace(pid=4246)
+
+    monkeypatch.setattr(gateway_lifecycle.subprocess, "Popen", fake_popen)
+    _patch_health(monkeypatch, False)
+    _patch_wait_for_health(monkeypatch, True)
+
+    result = runner.invoke(app, ["gateway", "start", "--port", str(port), "--json"])
+
+    assert result.exit_code == 0, result.output
+    assert len(calls) == 1
+    assert calls[0][calls[0].index("--port") + 1] == str(port)
+    assert _payload(result)["port"] == port
 
 
 def test_gateway_status_uses_config_host_port_when_flags_are_omitted(
@@ -1223,6 +1688,60 @@ def _install_fake_start(server, holder, monkeypatch) -> None:
     monkeypatch.setattr(gateway_cmd, "start_gateway_server", fake_start)
 
 
+@pytest.mark.parametrize(
+    ("profile_kind", "desktop_env", "expected_surface"),
+    [
+        (None, None, "cli"),
+        ("desktop-primary", "1", "desktop"),
+        ("desktop-recovery", "1", "desktop"),
+        (None, "1", "desktop"),
+        (None, "0", "cli"),
+        ("cli", "1", "cli"),
+    ],
+)
+def test_gateway_run_records_launch_for_owning_surface(
+    tmp_path, monkeypatch, profile_kind, desktop_env, expected_surface
+) -> None:
+    config = tmp_path / "config.toml"
+    config.write_text('host = "127.0.0.1"\nport = 18791\n', encoding="utf-8")
+    monkeypatch.setenv("OPENSQUILLA_STATE_DIR", str(tmp_path))
+    for key, value in (
+        ("OPENSQUILLA_PROFILE_KIND", profile_kind),
+        ("OPENSQUILLA_DESKTOP", desktop_env),
+    ):
+        if value is None:
+            monkeypatch.delenv(key, raising=False)
+        else:
+            monkeypatch.setenv(key, value)
+
+    calls: list[dict[str, object]] = []
+
+    async def record_launch(**kwargs: object) -> bool:
+        calls.append(kwargs)
+        return True
+
+    server = _ShutdownProbeServer(fire="api_shutdown", via="http")
+    server._services = SimpleNamespace(
+        growth_event_sink=SimpleNamespace(record_client_launch=record_launch)
+    )
+    _install_fake_start(server, {}, monkeypatch)
+    monkeypatch.setattr(gateway_cmd, "_gateway_bind_available", lambda *_args: True)
+    monkeypatch.setattr(gateway_cmd, "_install_shutdown_handlers", lambda *_args: [])
+
+    gateway_cmd.run_gateway(
+        port=None, bind=None, listen="", debug=False, config_path=str(config)
+    )
+
+    assert calls == [
+        {
+            "surface": expected_surface,
+            "entrypoint": "gateway_run",
+            "execution_mode": "gateway",
+        }
+    ]
+    assert server.closed == ["api_shutdown"]
+
+
 def test_gateway_run_drains_via_close_on_shutdown_signal(tmp_path, monkeypatch) -> None:
     """A delivered SIGTERM must trigger server.close() (the graceful drain)."""
     config = tmp_path / "gw.toml"
@@ -1339,11 +1858,21 @@ def test_gateway_run_drains_via_http_shutdown_trigger(tmp_path, monkeypatch) -> 
     _install_fake_start(server, holder, monkeypatch)
     monkeypatch.setattr(gateway_cmd, "_gateway_bind_available", lambda *_args: True)
 
-    gateway_cmd.run_gateway(
-        port=None, bind=None, listen="", debug=False, config_path=str(config)
-    )
+    import structlog
+
+    with structlog.testing.capture_logs() as logs:
+        gateway_cmd.run_gateway(
+            port=None, bind=None, listen="", debug=False, config_path=str(config)
+        )
 
     assert holder["server"].closed == ["api_shutdown"]
+    assert {
+        "event": "gateway.shutdown_requested",
+        "reason": "api_shutdown",
+    } in [
+        {key: event[key] for key in ("event", "reason") if key in event}
+        for event in logs
+    ]
 
 
 def test_gateway_run_force_exits_after_incomplete_shutdown(tmp_path, monkeypatch) -> None:

@@ -6,6 +6,7 @@ import asyncio
 import base64
 import contextlib
 import json
+import logging
 import ntpath
 import os
 import secrets
@@ -63,12 +64,19 @@ from opensquilla.sandbox.permissions import (
 )
 from opensquilla.sandbox.run_mode import normalize_run_mode
 from opensquilla.sandbox.runtime_launcher import ChildRole, internal_child_argv
-from opensquilla.sandbox.types import SandboxBackendError, SandboxRequest, SandboxResult
+from opensquilla.sandbox.types import (
+    SandboxBackendError,
+    SandboxRequest,
+    SandboxResult,
+)
 from opensquilla.subprocess_encoding import decode_subprocess_output
+
+log = logging.getLogger(__name__)
 
 _OUTPUT_BYTE_CAP = 1_048_576
 _HELPER_PAYLOAD_ENV = "OPENSQUILLA_WINDOWS_DEFAULT_PAYLOAD"
 _HELPER_ERROR_PREFIX = "OPENSQUILLA_WINDOWS_DEFAULT_HELPER_ERROR "
+_HELPER_TIMEOUT_PREFIX = b"\nOPENSQUILLA_WINDOWS_DEFAULT_HELPER_TIMEOUT "
 _HELPER_TIMEOUT_GRACE_S = 30.0
 _WINDOWS_PROCESS_BASE_ENV_KEYS = (
     "SystemRoot",
@@ -104,6 +112,7 @@ class WindowsDefaultBackend(Backend):
     def available(self) -> bool:
         return _support_ready()
 
+
     def operation_domains_supported(self) -> frozenset[SandboxOperationDomain]:
         return frozenset({"filesystem"})
 
@@ -118,7 +127,8 @@ class WindowsDefaultBackend(Backend):
         _filesystem_request(operation)
         if not _support_ready():
             raise SandboxBackendError(
-                "windows_default backend unavailable: administrator setup or Windows "
+                "sandbox_setup_required: Windows Safe helper setup is not ready; "
+                "administrator setup or Windows "
                 "support checks are not ready"
             )
         if operation.workspace is None:
@@ -153,7 +163,8 @@ class WindowsDefaultBackend(Backend):
     ) -> SandboxResult:
         if not _support_ready():
             raise SandboxBackendError(
-                "windows_default backend unavailable: administrator setup or Windows "
+                "sandbox_setup_required: Windows Safe helper setup is not ready; "
+                "administrator setup or Windows "
                 "support checks are not ready"
             )
 
@@ -185,7 +196,7 @@ class WindowsDefaultBackend(Backend):
                 env=helper_env,
             )
         except (FileNotFoundError, OSError) as exc:
-            raise SandboxBackendError(f"windows_default helper launch failed: {exc}") from exc
+            raise SandboxBackendError(f"helper_launch_failed: {exc}") from exc
 
         try:
             stdout_bytes, stderr_bytes = await asyncio.wait_for(
@@ -212,6 +223,10 @@ class WindowsDefaultBackend(Backend):
         if owner is not None:
             await owner.terminate(graceful_timeout=0.0, kill_timeout=1.0)
         elapsed = time.monotonic() - started
+        stderr_bytes, helper_timed_out = _extract_authenticated_helper_timeout(
+            stderr_bytes,
+            expected_nonce=str(payload["helperNonce"]),
+        )
         stdout, trunc_out = _decode_capped(stdout_bytes)
         stderr, trunc_err = _decode_capped(stderr_bytes)
         helper_error = _authenticated_helper_error(
@@ -219,8 +234,11 @@ class WindowsDefaultBackend(Backend):
             expected_nonce=str(payload["helperNonce"]),
         )
         if proc.returncode not in {None, 0} and helper_error is not None:
+            if "helper_root_unavailable:" in helper_error:
+                detail = helper_error.split("helper_root_unavailable:", 1)[1].strip()
+                raise SandboxBackendError(f"helper_root_unavailable: {detail}")
             raise SandboxBackendError(
-                f"windows_default helper infrastructure failed: {helper_error}"
+                f"helper_launch_failed: {helper_error}"
             )
         return SandboxResult(
             returncode=proc.returncode if proc.returncode is not None else -1,
@@ -231,7 +249,7 @@ class WindowsDefaultBackend(Backend):
             policy_used=request.policy.summary(),
             truncated_stdout=trunc_out,
             truncated_stderr=trunc_err,
-            timed_out=False,
+            timed_out=proc.returncode == 124 and helper_timed_out,
         )
 
 
@@ -310,6 +328,47 @@ def _is_capability_probe_request(request: SandboxRequest) -> bool:
     return request.action_kind == "capability.probe" or request.action_kind.startswith(
         "capability.probe.fs.worker."
     )
+
+
+def _extract_authenticated_helper_timeout(
+    stderr: bytes,
+    *,
+    expected_nonce: str,
+) -> tuple[bytes, bool]:
+    """Remove trusted timeout frames before output truncation or decoding."""
+    if not expected_nonce:
+        return stderr, False
+    chunks: list[bytes] = []
+    cursor = 0
+    search_from = 0
+    timed_out = False
+    while (start := stderr.find(_HELPER_TIMEOUT_PREFIX, search_from)) >= 0:
+        content_start = start + len(_HELPER_TIMEOUT_PREFIX)
+        end = stderr.find(b"\n", content_start)
+        if end < 0:
+            break
+        search_from = content_start
+        try:
+            payload = json.loads(stderr[content_start:end])
+        except (ValueError, RecursionError):
+            continue
+        if not isinstance(payload, dict):
+            continue
+        nonce = payload.get("nonce")
+        if (
+            isinstance(nonce, str)
+            and nonce.isascii()
+            and secrets.compare_digest(nonce, expected_nonce)
+            and payload.get("timed_out") is True
+        ):
+            # The leading and trailing LF belong to the control frame, so a
+            # user's unterminated stderr line and arbitrary bytes stay intact.
+            chunks.append(stderr[cursor:start])
+            cursor = end + 1
+            search_from = cursor
+            timed_out = True
+    chunks.append(stderr[cursor:])
+    return b"".join(chunks), timed_out
 
 
 def _authenticated_helper_error(
@@ -490,7 +549,7 @@ def _validate_filesystem_operation_targets(
     runtime_roots: tuple[Path, ...],
 ) -> None:
     target = targets[0] if targets else None
-    if operation.kind == "read_file" and target is not None:
+    if operation.kind in {"read_file", "probe_file"} and target is not None:
         display = request.display_path or str(target)
         if not target.exists():
             raise FileNotFoundError(f"File not found: {display}")
@@ -534,8 +593,11 @@ def _filesystem_operation_targets(
     logical_targets: tuple[Path, ...]
     if operation.kind in {
         "read_file",
+        "probe_file",
         "list_dir",
         "write_text",
+        "copy_attachment",
+        "fork_attachment",
         "edit_text",
         "create_source",
         "edit_source",
@@ -815,10 +877,10 @@ def _acl_plan_payload(
             if _acl_sensitive_marker(root) is None
         )
     )
-    tool_traversal_roots = _windows_tool_traversal_roots(
-        tool_rx_roots,
-        host_env=_host_tool_env(request),
-    )
+    # Grant discovered tool directories, not their ancestors. The restricted
+    # token enables SeChangeNotifyPrivilege to traverse those ancestors. RX on
+    # a directory inherits to its children, so granting AppData or .cache here
+    # would rewrite unrelated trees before the requested process can start.
     runtime_acl_roots = tuple(
         root
         for root in runtime_rx_roots(_python_executable())
@@ -832,7 +894,6 @@ def _acl_plan_payload(
             AclGrant(root, AclAccess.RX, AclGrantKind.REQUIRED)
             for root in _workspace_traversal_roots(request.cwd)
         ),
-        *(AclGrant(root, AclAccess.RX, AclGrantKind.REQUIRED) for root in tool_traversal_roots),
         *(AclGrant(root, AclAccess.RX, AclGrantKind.REQUIRED) for root in runtime_acl_roots),
         *(AclGrant(root, AclAccess.RX, AclGrantKind.REQUIRED) for root in tool_rx_roots),
         *(AclGrant(root, AclAccess.RX, AclGrantKind.REQUIRED) for root in process_acl_roots),
@@ -1177,9 +1238,7 @@ def _process_base_env(request: SandboxRequest) -> dict[str, str]:
 
 
 def _is_filesystem_worker_request(request: SandboxRequest) -> bool:
-    return request.action_kind.startswith(
-        ("fs.worker.", "capability.probe.fs.worker.")
-    )
+    return request.action_kind.startswith(("fs.worker.", "capability.probe.fs.worker."))
 
 
 def _request_needs_host_tool_paths(request: SandboxRequest) -> bool:
@@ -1305,52 +1364,6 @@ def _common_windows_tool_dirs(env: Mapping[str, str]) -> tuple[Path, ...]:
                 )
             )
     return tuple(candidates)
-
-
-def _windows_tool_traversal_roots(
-    tool_roots: tuple[Path, ...],
-    *,
-    host_env: Mapping[str, str],
-) -> tuple[Path, ...]:
-    anchors: list[Path] = []
-    for key in ("LOCALAPPDATA", "APPDATA"):
-        value = _env_path(host_env, key)
-        if value is not None and value.parent != value:
-            anchors.append(value.parent)
-    userprofile = _env_path(host_env, "USERPROFILE")
-    if userprofile is not None:
-        anchors.append(userprofile / ".local")
-        anchors.append(userprofile / ".cache")
-
-    roots: list[Path] = []
-    for tool_root in tool_roots:
-        resolved_tool = tool_root.resolve(strict=False)
-        for anchor in anchors:
-            resolved_anchor = anchor.resolve(strict=False)
-            if not _is_relative_to_casefold(resolved_tool, resolved_anchor):
-                continue
-            roots.extend(_path_chain(resolved_anchor, resolved_tool.parent))
-            break
-    return tuple(_dedupe_paths(path for path in roots if _acl_sensitive_marker(path) is None))
-
-
-def _path_chain(start: Path, stop: Path) -> tuple[Path, ...]:
-    start = start.resolve(strict=False)
-    stop = stop.resolve(strict=False)
-    if not _is_relative_to_casefold(stop, start):
-        return ()
-    roots: list[Path] = []
-    current = stop
-    while True:
-        roots.append(current)
-        if current == start:
-            break
-        parent = current.parent
-        if parent == current:
-            return ()
-        current = parent
-    roots.reverse()
-    return tuple(roots)
 
 
 def _program_files_roots(env: Mapping[str, str]) -> tuple[Path, ...]:

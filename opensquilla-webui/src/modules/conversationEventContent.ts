@@ -1,3 +1,4 @@
+import type { TaskProgressSnapshot } from '@/types/taskProgress'
 import type {
   ChatModelCallSegment,
   ChatRunTask,
@@ -29,6 +30,10 @@ export type ConversationEventIdentity = {
 }
 
 export type ConversationEventData = ConversationEventIdentity & {
+  skillLoad?: import('@/types/skillLoads').SkillLoadReceipt
+  progress?: TaskProgressSnapshot
+  modelCapacity?: import('./providerConfiguration').ModelCapacityFailure
+  execution_log_handle?: string
   reason?: string
   status?: string
   run_status?: string
@@ -194,14 +199,15 @@ export type ConversationEventContext = {
 
 type WithIdentity<K extends keyof ConversationEventData> = Pick<ConversationEventData, keyof ConversationEventIdentity | K>
 export type ConversationTextContent = WithIdentity<'text' | 'presentation' | 'model_call_id' | 'iteration'>
-export type ConversationToolContent = WithIdentity<'id' | 'watchdogToolId' | 'name' | 'input' | 'input_delta' | 'arguments' | 'synthetic_from_text' | 'result' | 'approvalResult' | 'error' | 'is_error' | 'tool_presentation' | 'model_call_id' | 'iteration'>
+export type ConversationToolContent = WithIdentity<'id' | 'watchdogToolId' | 'name' | 'input' | 'input_delta' | 'arguments' | 'synthetic_from_text' | 'result' | 'approvalResult' | 'error' | 'is_error' | 'tool_presentation' | 'model_call_id' | 'iteration' | 'execution_log_handle'>
 export type ConversationThinkingContent = WithIdentity<'text' | 'model_call_id' | 'iteration' | 'block_id' | 'block_index' | 'content_kind' | 'ended_at' | 'status'>
 export type ConversationCompactionContent = WithIdentity<'status' | 'compacted' | 'detail' | 'reason' | 'skip_reason' | 'source' | 'phase' | 'compaction_id' | 'sequence' | 'heartbeat' | 'heartbeat_at' | 'elapsed_ms' | 'stage' | 'refused' | 'safe_to_send' | 'applied' | 'durability' | 'user_visible' | 'intent'>
-export type ConversationProviderActivity = WithIdentity<'activity_id' | 'phase' | 'reason' | 'retry_attempt' | 'retry_limit' | 'retry_after_ms' | 'heartbeat'>
+/** The physical request model is optional for older Gateway producers. */
+export type ConversationProviderActivity = WithIdentity<'activity_id' | 'phase' | 'reason' | 'retry_attempt' | 'retry_limit' | 'retry_after_ms' | 'heartbeat' | 'model'>
 export type ConversationEnsembleProgress = WithIdentity<'event_type' | 'proposer_index' | 'proposer_label' | 'proposer_model' | 'proposer_provider' | 'watchdogMemberId' | 'sample_index' | 'elapsed_ms' | 'input_tokens' | 'output_tokens' | 'cost_usd' | 'error' | 'error_code'>
 export type ConversationAnswerReset = WithIdentity<'old_generation_epoch' | 'new_generation_epoch' | 'preserve_completed_tools' | 'authoritative_text_snapshot' | 'authoritative_reasoning_snapshot' | 'sequence' | 'terminal' | 'terminal_text_snapshot'>
 export type ConversationSubagentCompletion = WithIdentity<'type' | 'parent_session_key' | 'child_session_key' | 'status' | 'terminal_reason' | 'message_id'> & { result?: { text?: string; [key: string]: unknown } }
-export type ConversationLifecycle = WithIdentity<'reason' | 'status' | 'run_status' | 'terminal_message' | 'terminal_reason' | 'message' | 'code' | 'error_class' | 'group_id' | 'to_state' | 'active_task' | 'last_task' | 'changed_task' | 'terminalOutcome'>
+export type ConversationLifecycle = WithIdentity<'reason' | 'phase' | 'status' | 'run_status' | 'terminal_message' | 'terminal_reason' | 'message' | 'code' | 'error_class' | 'group_id' | 'to_state' | 'active_task' | 'last_task' | 'changed_task' | 'terminalOutcome' | 'modelCapacity'>
 export type ConversationTurnCompletion = ConversationLifecycle & WithIdentity<'finalText' | 'completedTurnId' | 'usage' | 'text' | 'reasoning_content' | 'delivery' | 'suppression_reason' | 'input_mode' | 'run_kind' | 'model_call_segments'>
 export type ConversationCommittedTurn = WithIdentity<'status' | 'terminal_reason' | 'finished_at' | 'session_id' | 'client_message_id' | 'user_message_id' | 'surface_id'>
 export type ConversationInputDisposition = WithIdentity<'target_turn_id' | 'client_request_id' | 'client_message_id' | 'user_message_id' | 'disposition' | 'promoted_from_turn_id' | 'promoted_turn_id' | 'applied_iteration' | 'model_call_id' | 'failure_code' | 'retryable' | 'recovery' | 'fallback_safe' | 'revision' | 'intent'>
@@ -212,7 +218,7 @@ export type ConversationArtifact = WithIdentity<'id' | 'kind' | 'name' | 'sha256
 export type ConversationUsage = Pick<ChatUsagePayload,
   'model' | 'routed_model' | 'input_tokens' | 'output_tokens' | 'cached_tokens' | 'reasoning_tokens'
   | 'cost_usd' | 'routed_tier' | 'routing_source' | 'total_savings_pct' | 'total_savings_usd'
-  | 'savings_usd' | 'savings_pct' | 'model_usage_breakdown' | 'ensemble_trace' | 'route_plan'
+  | 'savings_usd' | 'savings_pct' | 'model_usage_breakdown' | 'ensemble_trace' | 'route_plan' | 'execution_legs'
   | 'model_call_segments' | 'router_model_call_id' | 'router_iteration' | 'coverage_status'
   | 'usage_unknown' | 'unknown_usage_events' | 'decision_id' | '__savings_ui_suppressed'
 > & { cache_write?: number; cache_write_tokens?: number; billed_cost?: number; total_tokens?: number; estimated_cost_component_usd?: number }

@@ -27,6 +27,7 @@ No ``TurnHook`` is fired from inside the stream loop today.
 from __future__ import annotations
 
 import asyncio
+import copy
 import json
 from collections.abc import AsyncIterator, Callable
 from dataclasses import dataclass, field, replace
@@ -198,8 +199,11 @@ class CompactionPersistPort(Protocol):
         removed_count: int = 0,
         source_entries: tuple[Any, ...] | None = None,
         source_preimage: tuple[tuple[Any, ...], ...] | None = None,
+        source_context_fingerprint: str | None = None,
         source_boundary_message_id: str | None = None,
         source_boundary_entry_id: int | None = None,
+        expected_session_id: str | None = None,
+        expected_session_epoch: int | None = None,
     ) -> bool | None: ...
 
 @runtime_checkable
@@ -372,15 +376,15 @@ class StreamConsumerStageInput:
     input_provenance: dict[str, Any] | None = None
     # In-process pending submitted-line provider for mid-turn injection.
     pending_input_provider: PendingInputProvider | None = None
-    # Live delivery-ready authorization resolved on the event loop before the
-    # blocking omitted-artifact publish enters its worker thread.
-    attached_plan_run_ready: bool | None = None
     # Frozen durable prefix used by in-turn compaction persistence. The storage
     # adapter compares it atomically and preserves later append-only queue rows.
     compaction_source_entries: tuple[Any, ...] | None = None
     compaction_source_preimage: tuple[tuple[Any, ...], ...] | None = None
+    compaction_source_context_fingerprint: str | None = None
     compaction_source_boundary_message_id: str | None = None
     compaction_source_boundary_entry_id: int | None = None
+    expected_session_id: str | None = None
+    expected_session_epoch: int | None = None
     # Original ingress mode.  Internal Goal continuations and heartbeats use
     # ``system_event``; their text is held until the terminal snapshot can be
     # canonicalized so silent-reply protocol markers never flash on a client.
@@ -412,26 +416,6 @@ def _supports_generation_reset(inp: StreamConsumerStageInput) -> bool:
         return True
     return bool(context.surface.supports_generation_reset)
 
-
-def _control_reason_for_error_code(code: Any) -> Any | None:
-    """Map only typed control/error codes; provider failures stay recoverable."""
-
-    from opensquilla.engine.types import ControlTerminalReason
-
-    normalized = str(code or "").strip().lower().replace("-", "_")
-    return {
-        "agent_runtime_timeout": ControlTerminalReason.HARD_DEADLINE,
-        "hard_deadline": ControlTerminalReason.HARD_DEADLINE,
-        "hard_deadline_exceeded": ControlTerminalReason.HARD_DEADLINE,
-        "shutdown": ControlTerminalReason.SHUTDOWN,
-        "gateway_shutdown": ControlTerminalReason.SHUTDOWN,
-        "cancel": ControlTerminalReason.CANCEL,
-        "cancelled": ControlTerminalReason.CANCEL,
-        "canceled": ControlTerminalReason.CANCEL,
-        "platform_validation": ControlTerminalReason.PLATFORM_VALIDATION,
-        "platform_safety": ControlTerminalReason.PLATFORM_SAFETY,
-        "safety_control": ControlTerminalReason.PLATFORM_SAFETY,
-    }.get(normalized)
 
 # ---------------------------------------------------------------------------
 # Per-event handler classes
@@ -696,6 +680,83 @@ class _ToolResultHandler:
             state.turn_segments.append(result_segment)
         return event
 
+def _cancel_pending_user_input_results(
+    state: _StreamState,
+    *,
+    task_id: str,
+    assistant_replay: dict[str, Any] | None,
+) -> dict[str, Any] | None:
+    """Close this cancelled turn's questions in both durable history views.
+
+    This synchronous projection runs before cancellation persistence. It never
+    yields from a closing Agent generator, and preserves the original question
+    through the ordinary terminal tool-result handler.
+    """
+    from opensquilla.engine.types import ToolResultEvent
+
+    if not task_id:
+        return assistant_replay
+    question_ids = {
+        segment.get("tool_use_id") for segment in state.turn_segments
+        if segment.get("type") == "tool_use" and segment.get("name") == "request_user_input"
+    }
+    cancelled: dict[str, str] = {}
+    handler = _ToolResultHandler()
+    for segment in tuple(state.turn_segments):
+        tool_use_id = segment.get("tool_use_id")
+        if (
+            segment.get("type") != "tool_result"
+            or segment.get("name") != "request_user_input"
+            or not isinstance(tool_use_id, str) or not tool_use_id
+            or tool_use_id not in question_ids
+        ):
+            continue
+        pending = _pending_user_input_request(segment.get("result"))
+        if pending is None or pending.get("run_id") != task_id:
+            continue
+        request_id = pending.get("request_id")
+        if not isinstance(request_id, str) or not request_id:
+            continue
+        content = json.dumps(
+            {
+                "status": "cancelled", "kind": "user_input", "paused": False,
+                "request_id": request_id, "reason": "turn_cancelled",
+            },
+            ensure_ascii=False,
+        )
+        handler.handle(
+            ToolResultEvent(
+                tool_use_id=tool_use_id, tool_name="request_user_input", result=content,
+            ),
+            state,
+        )
+        cancelled[tool_use_id] = content
+    if not cancelled or assistant_replay is None:
+        return assistant_replay
+    replay = copy.deepcopy(assistant_replay)
+    messages = replay.get("messages")
+    if not isinstance(messages, list):
+        return replay
+    for message in messages:
+        if not isinstance(message, dict):
+            continue
+        replay_content = message.get("content")
+        if not isinstance(replay_content, list):
+            continue
+        for block in replay_content:
+            if not isinstance(block, dict) or block.get("type") != "tool_result":
+                continue
+            tool_use_id = block.get("tool_use_id")
+            if not isinstance(tool_use_id, str):
+                continue
+            replacement = cancelled.get(tool_use_id)
+            pending = _pending_user_input_request(block.get("content"))
+            if replacement is not None and pending is not None and pending.get("run_id") == task_id:
+                block["content"] = replacement
+                block["is_error"] = False
+    return replay
+
+
 class _ArtifactHandler:
     """Append an artifact payload to the per-turn artifact list."""
 
@@ -726,10 +787,9 @@ class _ErrorHandler:
             _LLM_TIMEOUT_ENVELOPE,
             _drop_unpaired_tool_use_segments,
         )
-        from opensquilla.engine.types import ErrorEvent as _ErrorEvent
-
         if event.code == "timeout":
-            event = _ErrorEvent(
+            event = replace(
+                event,
                 message=_LLM_TIMEOUT_ENVELOPE["user_message"],
                 code=_LLM_TIMEOUT_ENVELOPE["error_class"],
             )
@@ -1078,7 +1138,6 @@ class _DoneHandler:
         return auto_publish_omitted_workspace_artifacts(
             inp.tool_context,
             final_text=accumulated_text,
-            attached_plan_run_ready=inp.attached_plan_run_ready,
         )
 
     def record_publish_result(
@@ -1526,6 +1585,7 @@ class _CompactionHandler:
                     "removed_count": event.removed_count,
                     "source_entries": inp.compaction_source_entries,
                     "source_preimage": inp.compaction_source_preimage,
+                    "source_context_fingerprint": inp.compaction_source_context_fingerprint,
                     "source_boundary_message_id": (
                         inp.compaction_source_boundary_message_id
                     ),
@@ -1540,6 +1600,14 @@ class _CompactionHandler:
                 if event.compaction_timeout_seconds is not None:
                     persist_kwargs["compaction_timeout_seconds"] = (
                         event.compaction_timeout_seconds
+                    )
+                if (
+                    inp.expected_session_id is not None
+                    or inp.expected_session_epoch is not None
+                ):
+                    persist_kwargs["expected_session_id"] = inp.expected_session_id
+                    persist_kwargs["expected_session_epoch"] = (
+                        inp.expected_session_epoch
                     )
                 installed = await self._persist.persist_and_notify(**persist_kwargs)
                 if installed is False:
@@ -2148,20 +2216,10 @@ class StreamConsumerStage:
                 # the ArtifactStore -- yielding a torn transcript or an
                 # artifact persisted without a transcript record.
                 pre = self._done_handler.pre_publish(event, inp, state)
-                from opensquilla.engine.artifact_delivery import (
-                    attached_plan_run_ready_for_auto_publish,
-                )
-
-                publish_inp = replace(
-                    inp,
-                    attached_plan_run_ready=(
-                        await attached_plan_run_ready_for_auto_publish(inp.tool_context)
-                    ),
-                )
                 publish_task = asyncio.ensure_future(
                     asyncio.to_thread(
                         self._done_handler.run_publish,
-                        publish_inp,
+                        inp,
                         pre.accumulated_text,
                     )
                 )

@@ -80,7 +80,6 @@ def create_gateway_app(
     cron_scheduler: Any = None,
     turn_runner: Any = None,
     task_runtime: Any = None,
-    flush_service: Any = None,
     heartbeat_service: Any = None,
     heartbeat_loop: Any = None,
     agent_registry: Any = None,
@@ -92,6 +91,7 @@ def create_gateway_app(
     extra_routes: list[Route] | None = None,
     prompt_cache_keepalive_service: Any = None,
     skill_management_service: Any = None,
+    sandbox_upgrade_report: dict[str, object] | None = None,
 ) -> Starlette:
     """Build and return the Starlette ASGI application."""
     if diagnostics_state is None:
@@ -265,6 +265,7 @@ def create_gateway_app(
                 "status": "running",
                 "provider": provider_name,
                 "auth_mode": config.auth.mode,
+                "sandboxUpgrade": sandbox_upgrade_report,
             }
         )
 
@@ -498,7 +499,6 @@ def create_gateway_app(
             cron_scheduler=cron_scheduler,
             turn_runner=turn_runner,
             task_runtime=task_runtime,
-            flush_service=flush_service,
             heartbeat_service=heartbeat_service,
             heartbeat_loop=heartbeat_loop,
             prompt_cache_keepalive_service=prompt_cache_keepalive_service,
@@ -769,7 +769,6 @@ def create_gateway_app(
             cron_scheduler=cron_scheduler,
             turn_runner=turn_runner,
             task_runtime=task_runtime,
-            flush_service=flush_service,
             heartbeat_service=heartbeat_service,
             heartbeat_loop=heartbeat_loop,
             agent_registry=agent_registry,
@@ -893,10 +892,9 @@ def create_gateway_app(
         set_upload_store,
     )
 
-    # Back the store with a persistent marker directory so a staged upload lost
-    # across a gateway restart resolves to the specific "lost in restart, please
-    # re-upload" error instead of a generic "unknown uuid" (issue #468). Only
-    # replace the default in-memory-only singleton; respect a test-injected store.
+    # Persist temporary uploads so unexpired file UUIDs remain usable after a
+    # gateway restart. Only replace the default in-memory-only singleton;
+    # respect a test-injected store.
     _upload_store = get_upload_store()
     if getattr(_upload_store, "marker_dir", None) is None:
         from opensquilla.gateway.uploads import (  # noqa: PLC0415
@@ -909,7 +907,7 @@ def create_gateway_app(
             if _store_total_cap is not None:
                 log.warning(
                     "attachments.upload_store_max_total_bytes=%r is not a "
-                    "positive integer; using the %d byte default (this RAM "
+                    "positive integer; using the %d byte default (this storage "
                     "cap can be raised but not disabled)",
                     _store_total_cap,
                     _UPLOAD_STORE_DEFAULT_TOTAL,
@@ -922,6 +920,11 @@ def create_gateway_app(
         )
         set_upload_store(_upload_store)
     register_upload_routes(app, config=config, store=_upload_store)
+    from opensquilla.gateway.native_attachments import register_native_attachment_routes
+
+    register_native_attachment_routes(
+        app, config=config, store=_upload_store, session_manager=session_manager,
+    )
     from opensquilla.gateway.artifacts import register_artifact_routes  # noqa: PLC0415
     from opensquilla.gateway.attachments import register_attachment_routes  # noqa: PLC0415
     from opensquilla.gateway.audio_transcription import (  # noqa: PLC0415

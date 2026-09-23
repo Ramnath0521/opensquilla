@@ -24,6 +24,8 @@ import type { MetaRunCenter } from '@/modules/metaRunCenter'
 import { createV4MetaRunCenter } from './metaRunCenterV4'
 import type { AppSettings } from '@/modules/appSettings'
 import { createV4AppSettings } from './appSettingsV4'
+import type { ProductActivity } from '@/modules/productActivity'
+import { createV4ProductActivity } from './productActivityV4'
 import type { ProviderConfiguration } from '@/modules/providerConfiguration'
 import { createV4ProviderConfiguration } from './providerConfigurationV4'
 import type { SetupWorkflow } from '@/modules/setupWorkflow'
@@ -32,6 +34,10 @@ import type { MigrationOperations } from '@/modules/migrationOperations'
 import { createV4MigrationOperations } from './migrationOperationsV4'
 import type { WorkspaceCatalog } from '@/modules/workspaceCatalog'
 import { createV4WorkspaceCatalog } from './workspaceCatalogV4'
+import type { WorkspaceReferences } from '@/modules/workspaceReferences'
+import { createV4WorkspaceReferences } from './workspaceReferencesV4'
+import type { WorkspaceFiles } from '@/modules/workspaceFiles'
+import { createV4WorkspaceFiles } from './workspaceFilesV4'
 import type { SandboxRuntime } from '@/modules/sandboxRuntime'
 import { createV4SandboxRuntime } from './sandboxRuntimeV4'
 import type { UsageReporting } from '@/modules/usageReporting'
@@ -46,6 +52,8 @@ import type { ClarificationSubmission } from '@/modules/clarificationSubmission'
 import { createV4ClarificationSubmission } from './clarificationSubmissionV4'
 import type { SessionMaintenance } from '@/modules/sessionMaintenance'
 import { createV4SessionMaintenance } from './sessionMaintenanceV4'
+import type { SessionProcesses } from '@/modules/sessionProcesses'
+import { createV4SessionProcesses } from './sessionProcessesV4'
 import type { Observability } from '@/modules/observability'
 import { createV4Observability } from './observabilityV4'
 import type { SkillCatalog } from '@/modules/skillCatalog'
@@ -94,10 +102,13 @@ export interface GatewayAdapters {
   readonly planCenter: PlanCenter
   readonly metaRunCenter: MetaRunCenter
   readonly appSettings: AppSettings
+  readonly productActivity: ProductActivity
   readonly providerConfiguration: ProviderConfiguration
   readonly setupWorkflow: SetupWorkflow
   readonly migrationOperations: MigrationOperations
   readonly workspaceCatalog: WorkspaceCatalog
+  readonly workspaceReferences: WorkspaceReferences
+  readonly workspaceFiles: WorkspaceFiles
   readonly sandboxRuntime: SandboxRuntime
   readonly usageReporting: UsageReporting
   readonly commandCatalog: CommandCatalog
@@ -105,6 +116,7 @@ export interface GatewayAdapters {
   readonly promptCacheLease: PromptCacheLease
   readonly clarificationSubmission: ClarificationSubmission
   readonly sessionMaintenance: SessionMaintenance
+  readonly sessionProcesses: SessionProcesses
   readonly observability: Observability
   readonly skillCatalog: SkillCatalog
   readonly agentCatalog: AgentCatalog
@@ -173,10 +185,13 @@ export function createGatewayAdapters(
     planCenter: createV4PlanCenter(transports.rpc, transports.events),
     metaRunCenter: createV4MetaRunCenter(transports.rpc, transports.events),
     appSettings: createV4AppSettings(transports.rpc),
+    productActivity: createV4ProductActivity(transports.rpc),
     providerConfiguration: createV4ProviderConfiguration(transports.rpc, transports.events),
     setupWorkflow: createV4SetupWorkflow(transports.rpc),
     migrationOperations: createV4MigrationOperations(transports.rpc),
     workspaceCatalog: createV4WorkspaceCatalog(transports.rpc),
+    workspaceReferences: createV4WorkspaceReferences(transports.rpc),
+    workspaceFiles: createV4WorkspaceFiles(http),
     sandboxRuntime: createV4SandboxRuntime(transports.rpc, transports.events),
     usageReporting: createV4UsageReporting(transports.rpc),
     commandCatalog: createV4CommandCatalog(transports.rpc),
@@ -184,6 +199,7 @@ export function createGatewayAdapters(
     promptCacheLease: createV4PromptCacheLease(transports.rpc),
     clarificationSubmission: createV4ClarificationSubmission(transports.rpc),
     sessionMaintenance: createV4SessionMaintenance(transports.rpc),
+    sessionProcesses: createV4SessionProcesses(transports.rpc, { getAuth: () => source.auth }),
     observability: createV4Observability(transports.rpc, http),
     skillCatalog: createV4SkillCatalog(transports.rpc),
     agentCatalog: createV4AgentCatalog(transports.rpc),

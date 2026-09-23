@@ -8,6 +8,7 @@ import shutil
 import weakref
 from collections.abc import AsyncIterator, Awaitable, Callable, Iterable, Sequence
 from contextlib import asynccontextmanager
+from dataclasses import replace
 from pathlib import Path
 from typing import Any, cast
 
@@ -40,11 +41,21 @@ from opensquilla.gateway.adapters.skill_management_contract import (
     register_skill_management_contract,
 )
 from opensquilla.gateway.guest_rpc_policy import is_guest_rpc_method_allowed
+from opensquilla.gateway.protocol import ERROR_UNAUTHORIZED
 from opensquilla.gateway.rpc import RpcContext, RpcHandlerError, get_dispatcher
+from opensquilla.gateway.scopes import ADMIN_SCOPE
 from opensquilla.paths import default_opensquilla_home
 from opensquilla.skills.capability_runtime import trusted_capability_consumers_for_meta_plan
+from opensquilla.skills.catalog_policy import (
+    is_invokable_meta,
+    is_public_ordinary,
+    is_user_invocable_ordinary,
+    project_public_catalog,
+    public_sort_key,
+)
 from opensquilla.skills.dependency_summary import build_dependency_summary
 from opensquilla.skills.eligibility import (
+    CODING_MODE_SKILLS,
     EligibilityContext,
     EligibilityReport,
     diagnose_eligibility,
@@ -81,7 +92,9 @@ from opensquilla.skills.hub.management import (
 from opensquilla.skills.hub.router import search_router_with_diagnostics
 from opensquilla.skills.hub.transaction import journal_path_for_state
 from opensquilla.skills.loader import PinnedSkillLoader, SkillLoader
+from opensquilla.skills.meta.enabled import is_meta_skill_enabled
 from opensquilla.skills.meta.parser import MetaPlanError, parse_meta_plan
+from opensquilla.skills.types import SkillVisibility
 
 _d = get_dispatcher()
 
@@ -92,9 +105,7 @@ _deps_locks: weakref.WeakValueDictionary[tuple[str, str], asyncio.Lock] = (
 )
 
 _ACTIVE_SKILL_INSTALLS_STATE_KEY = "_active_skill_installs"
-_PENDING_SKILL_INSTALL_CANCELLATIONS_STATE_KEY = (
-    "_pending_skill_install_cancellations"
-)
+_PENDING_SKILL_INSTALL_CANCELLATIONS_STATE_KEY = "_pending_skill_install_cancellations"
 _MAX_PENDING_SKILL_INSTALL_CANCELLATIONS_PER_CONNECTION = 8
 _MAX_PENDING_SKILL_INSTALL_CANCELLATIONS = 256
 
@@ -297,9 +308,7 @@ def _recovery_required_payload(
 
     state = getattr(ctx, "skill_management_state", None)
     startup_diagnostics = (
-        tuple(state.get("recovery_diagnostics", ()))
-        if isinstance(state, dict)
-        else ()
+        tuple(state.get("recovery_diagnostics", ())) if isinstance(state, dict) else ()
     )
     # A legacy/degraded startup may still have no management service. In that
     # case RPC must synthesize a fail-closed response from retained diagnostics.
@@ -600,11 +609,12 @@ def _skill_to_dict(
         "os": list(meta.os) if meta else [],
         "disabled": report.disabled,
         "user_invocable": bool(getattr(spec, "user_invocable", False)),
-        "disable_model_invocation": bool(
-            getattr(spec, "disable_model_invocation", False)
-        ),
+        "disable_model_invocation": bool(getattr(spec, "disable_model_invocation", False)),
         "install": install_entries,
         "kind": kind,
+        "visibility": str(getattr(spec, "visibility", "public")),
+        "invocation_mode": str(getattr(spec, "invocation", "direct")),
+        "owner_meta_skills": list(getattr(spec, "owner_meta_skills", []) or []),
         "sub_skills": sub_skills,
         "provider_check_at_launch": _provider_check_at_launch(
             spec,
@@ -769,24 +779,23 @@ def _lifecycle_rows(
             )
             install_id = ""
             installed = False
+        if row.get("disabled") is True:
+            lifecycle = replace(
+                lifecycle, selection_state=SkillSelectionState.DISABLED,
+                invocation=SkillInvocationCapabilities(),
+            )
         row.update(
             {
                 "instance_id": getattr(spec, "instance_id", ""),
                 "install_id": install_id,
                 "installed": installed,
                 "active": (
-                    doctor_item.active
-                    if doctor_item is not None
-                    else (
-                        lifecycle.selection_state.value == "active"
-                        and lifecycle.load_state.value == "loaded"
-                    )
+                    lifecycle.selection_state.value == "active"
+                    and lifecycle.load_state in {
+                        SkillLoadState.LOADED, SkillLoadState.SERVING_PREVIOUS,
+                    }
                 ),
-                "instruction_usable": (
-                    doctor_item.instruction_usable
-                    if doctor_item is not None
-                    else lifecycle.usable is True
-                ),
+                "instruction_usable": lifecycle.usable is True,
                 "lifecycle": lifecycle.to_dict(),
                 "diagnostics": [item.to_dict() for item in diagnostics],
                 "invocation": lifecycle.invocation.to_dict(),
@@ -819,11 +828,7 @@ def _lifecycle_rows(
         if path_key in represented_paths:
             continue
         spec = next(
-            (
-                item
-                for item in candidates
-                if _path_key(getattr(item, "base_dir", "")) == path_key
-            ),
+            (item for item in candidates if _path_key(getattr(item, "base_dir", "")) == path_key),
             None,
         )
         if spec is not None:
@@ -867,7 +872,7 @@ def _lifecycle_rows(
 
 @_d.method("skills.status", scope="operator.read")
 async def _handle_skills_status(params: dict | None, ctx: RpcContext) -> list[dict[str, Any]]:
-    """Return all skills with their eligibility status."""
+    """Return public Skills, with an owner/admin-only internal diagnostic view."""
     loader = _get_loader(ctx)
     if loader is None:
         return []
@@ -876,12 +881,22 @@ async def _handle_skills_status(params: dict | None, ctx: RpcContext) -> list[di
     # Operator gate: skills governed by the coding-mode toggle (code-task) are
     # hidden from the skill manager when the toggle is OFF — unreachable through
     # every skill API, not just the agent prompt (codex review).
-    skills = [
-        s
-        for s in await _catalog_skills(loader, reason="rpc.skills.status")
-        if is_skill_available_live(s.name)
-    ]
-    skill_index = {skill.name: skill for skill in skills}
+    all_skills = await _catalog_skills(loader, reason="rpc.skills.status")
+    skill_index = {skill.name: skill for skill in all_skills}
+    include_internal = bool(isinstance(params, dict) and params.get("include_internal") is True)
+    if include_internal:
+        if not (ctx.principal.is_owner or ADMIN_SCOPE in ctx.principal.scopes):
+            raise RpcHandlerError(
+                ERROR_UNAUTHORIZED,
+                "internal Skill diagnostics require the local owner or an administrator",
+            )
+        skills = [s for s in all_skills if is_skill_available_live(s.name)]
+    else:
+        skills = project_public_catalog(
+            all_skills,
+            coding_mode=is_skill_available_live("code-task"),
+            include_stable_meta=False,
+        )
     return [
         _skill_to_dict(
             skill,
@@ -908,11 +923,20 @@ async def _list_catalog_skills(
     all_skills = snapshot.skills
     skill_index = {skill.name: skill for skill in all_skills}
     # Operator gate: coding-mode-gated skills (code-task when OFF) stay out.
-    skills = [
-        skill
-        for skill in all_skills
-        if skill.user_invocable and is_skill_available_live(skill.name)
-    ]
+    skills = project_public_catalog(
+        all_skills,
+        coding_mode=is_skill_available_live("code-task"),
+        include_stable_meta=is_meta_skill_enabled(ctx.config),
+    )
+    # The management surface also exposes user-only Skills. This does not add
+    # them to the model's automatic catalog.
+    known = {id(skill) for skill in skills}
+    skills.extend(
+        skill for skill in all_skills
+        if id(skill) not in known and is_user_invocable_ordinary(
+            skill, coding_mode=is_skill_available_live("code-task"),
+        )
+    )
     if include_lifecycle:
         return cast(
             Sequence[SkillProjection],
@@ -943,6 +967,148 @@ async def _list_catalog_skills(
 
 async def _handle_skills_list(params: dict | None, ctx: RpcContext) -> dict[str, Any]:
     return await _skill_catalog(ctx).list(params)
+
+
+async def _handle_skills_candidates(params: dict | None, ctx: RpcContext) -> dict[str, Any]:
+    """Read only winning manual-skill metadata, without Doctor or resource scans.
+
+    The loader is shared with the turn runtime. Session keys are accepted for
+    callers binding this request to a composer; they do not create a second,
+    filesystem-derived catalog that could diverge from the runtime snapshot.
+    Meta roots retain the existing command-candidate/launch preflight path.
+    """
+    if params is not None and not isinstance(params, dict):
+        raise ValueError("params must be an object")
+    if params and "sessionKey" in params and not isinstance(params["sessionKey"], str):
+        raise ValueError("sessionKey must be a string")
+    loader = _get_loader(ctx)
+    if loader is None:
+        return {"generation": 0, "candidates": []}
+    snapshot = await _catalog_snapshot(loader, reason="rpc.skills.candidates")
+    eligibility = _eligibility_context(ctx)
+    eligibility.passive_managed_bins = True
+    coding_mode = "code-task" not in eligibility.disabled_set
+    from opensquilla.session.keys import parse_agent_id
+    from opensquilla.tools.policy_config import coding_mode_denied_tools
+    from opensquilla.tools.policy_helpers import apply_tool_policy_from_config
+    from opensquilla.tools.policy_runtime import (
+        resolve_runtime_tool_surface,
+        tool_surface_capabilities_from_runtime,
+    )
+    from opensquilla.tools.types import CallerKind, ToolContext
+    from opensquilla.tools.visibility import is_tool_visible, profile_allows_tool, resolve_profile
+
+    registry = getattr(ctx, "tool_registry", None)
+    registered = set(registry.list_names()) if registry is not None else set()
+    policy = apply_tool_policy_from_config(
+        ToolContext(
+            is_owner=ctx.principal.is_owner,
+            caller_kind=CallerKind.WEB,
+            agent_id=parse_agent_id((params or {}).get("sessionKey", "")),
+            session_key=(params or {}).get("sessionKey"),
+            coding_mode=coding_mode,
+            surfaced_tools={"skill_list", "skill_view"},
+        ),
+        available_tools=list(registered),
+        config=getattr(ctx, "config", None),
+    )
+    policy = resolve_runtime_tool_surface(
+        policy,
+        capabilities=tool_surface_capabilities_from_runtime(
+            session_manager=ctx.session_manager,
+            task_runtime=ctx.task_runtime,
+            scheduler=ctx.cron_scheduler,
+            gateway_config=ctx.config,
+            channel_manager=ctx.channel_manager,
+        ),
+    )
+    policy.denied_tools.update(coding_mode_denied_tools(coding_mode))
+    profile = resolve_profile(policy)
+    allowed = {
+        name for name in registered
+        if registry is not None and (tool := registry.get(name)) is not None
+        and is_tool_visible(tool, policy)
+        and profile_allows_tool(name, profile, explicitly_allowed=policy.allowed_tools)
+    }
+
+    def project() -> list[dict[str, Any]]:
+        result = []
+        for skill in sorted(snapshot.skills, key=public_sort_key):
+            if not is_user_invocable_ordinary(skill, coding_mode=coding_mode):
+                continue
+            report = diagnose_eligibility(skill, eligibility)
+            tools_available = (
+                "skill_view" in allowed and set(skill.requires_tools).issubset(allowed)
+            )
+            reason_code = (
+                "disabled" if report.disabled else "unsupported_platform" if report.wrong_os
+                else "missing_dependencies" if not report.eligible else ""
+            )
+            reason = "; ".join(report.reasons)[:800]
+            if not reason_code and not tools_available:
+                reason_code = "tools_unavailable"
+                reason = "Required tools are unavailable in this conversation."
+            result.append({
+                "name": skill.name,
+                "instanceId": skill.instance_id,
+                "digest": skill.tree_digest,
+                "generation": snapshot.generation,
+                "description": skill.description[:800],
+                "descriptionZh": skill.description_zh[:800],
+                "aliases": [str(alias)[:160] for alias in skill.triggers[:16]],
+                "kind": "skill",
+                "source": skill.layer.value,
+                "disabled": report.disabled,
+                "manualOnly": skill.disable_model_invocation,
+                "ready": report.eligible and tools_available,
+                **({"reasonCode": reason_code, "reason": reason}
+                   if reason_code else {}),
+            })
+        return result
+
+    return {"generation": snapshot.generation, "candidates": await asyncio.to_thread(project)}
+
+
+async def _handle_skills_set_enabled(params: dict | None, ctx: RpcContext) -> dict[str, Any]:
+    """Change only this logical name's allow-use bit through the settings owner."""
+    if not isinstance(params, dict):
+        raise ValueError("name and enabled are required")
+    name, enabled = params.get("name"), params.get("enabled")
+    if not isinstance(name, str) or not name.strip() or len(name) > 256:
+        raise ValueError("name must be a non-empty skill name")
+    if not isinstance(enabled, bool):
+        raise ValueError("enabled must be a boolean")
+    name = name.strip()
+    if name in CODING_MODE_SKILLS:
+        raise ValueError("This skill is controlled by Coding mode")
+    loader = _get_loader(ctx)
+    if loader is None:
+        raise KeyError("No skill loader available")
+    snapshot = await _catalog_snapshot(loader, reason="rpc.skills.setEnabled")
+    skill = snapshot.get_by_name(name)
+    if skill is None or not (
+        is_public_ordinary(skill, coding_mode=False)
+        or is_user_invocable_ordinary(skill, coding_mode=False)
+    ):
+        raise KeyError(f"Skill not found: {name}")
+    from opensquilla.gateway.adapters.app_settings import app_settings_for_rpc
+
+    settings = app_settings_for_rpc(ctx, source="skills.setEnabled")
+    result = await settings.set_skill_enabled(name, enabled)
+    if result["refreshed"]:
+        try:
+            from opensquilla.engine.steps.skill_catalog_projection import (
+                invalidate_skill_eligibility_cache,
+            )
+
+            invalidate_skill_eligibility_cache()
+        except Exception:
+            result.update(
+                refreshed=False,
+                message="Saved. Skill readiness refresh failed; reload the Gateway before use.",
+            )
+    result["generation"] = snapshot.generation
+    return result
 
 
 @_d.method("skills.bins", scope="node")
@@ -1035,9 +1201,44 @@ async def _get_catalog_skill(
         resolved_name = doctor_item.name
     if requested_name is not None and resolved_name != requested_name:
         raise KeyError(f"Skill identity does not match name: {requested_name}")
-    if not is_skill_available_live(resolved_name):
+    available = resolved_name not in _eligibility_context(ctx).disabled_set
+    if not available and (
+        resolved_name in CODING_MODE_SKILLS
+        or skill is None
+        or not (
+            is_public_ordinary(skill, coding_mode=False)
+            or is_user_invocable_ordinary(skill, coding_mode=False)
+        )
+    ):
         # Gated coding-mode skills are reported as not-found so their content is
         # never returned while the toggle is OFF (codex review).
+        raise KeyError(f"Skill not found: {resolved_name}")
+
+    # Existing clients inspect public Meta roots through skills.get. Exact
+    # managed identities retain lifecycle diagnostics, but cannot expose an
+    # internal helper body or a retired/experimental definition.
+    exact_lookup = bool(instance_id or install_id)
+    public_meta = bool(
+        skill is not None
+        and is_meta_skill_enabled(ctx.config)
+        and is_invokable_meta(skill)
+        and not getattr(skill, "disable_model_invocation", False)
+    )
+    if skill is not None and (
+        getattr(skill, "visibility", SkillVisibility.PUBLIC)
+        in {SkillVisibility.INTERNAL, SkillVisibility.EXPERIMENTAL, SkillVisibility.TOMBSTONE}
+        or (
+            not exact_lookup
+            and not public_meta
+            and not is_public_ordinary(
+                skill,
+                coding_mode=is_skill_available_live("code-task"),
+            )
+            and not is_user_invocable_ordinary(
+                skill, coding_mode=is_skill_available_live("code-task"),
+            )
+        )
+    ):
         raise KeyError(f"Skill not found: {resolved_name}")
 
     # An install may be present in the managed store yet rejected by the
@@ -1056,10 +1257,14 @@ async def _get_catalog_skill(
         loader=loader,
         eligibility_ctx=ctx_eligible,
     )
-    result["content"] = skill.content
-    result["file_path"] = skill.file_path
-    result["base_dir"] = skill.base_dir
-    exact_lookup = bool(instance_id or install_id)
+    if available:
+        result["content"] = skill.content
+        result["file_path"] = skill.file_path
+        result["base_dir"] = skill.base_dir
+    else:
+        # Disabled public definitions remain manageable without making their
+        # instruction body available through the execution gate.
+        result.pop("file_path", None)
     if exact_lookup:
         result["instance_id"] = getattr(skill, "instance_id", "")
         result["install_id"] = doctor_item.install_id if doctor_item is not None else ""
@@ -1089,9 +1294,7 @@ async def _get_catalog_skill(
                     "active": doctor_item.active,
                     "instruction_usable": doctor_item.instruction_usable,
                     "lifecycle": doctor_item.lifecycle.to_dict(),
-                    "diagnostics": [
-                        item.to_dict() for item in doctor_item.diagnostics
-                    ],
+                    "diagnostics": [item.to_dict() for item in doctor_item.diagnostics],
                     "invocation": doctor_item.lifecycle.invocation.to_dict(),
                 }
             )
@@ -1120,9 +1323,7 @@ async def _get_catalog_skill(
                     ),
                     "instruction_usable": lifecycle.usable is True,
                     "lifecycle": lifecycle.to_dict(),
-                    "diagnostics": [
-                        item.to_dict() for item in lifecycle_diagnostics
-                    ],
+                    "diagnostics": [item.to_dict() for item in lifecycle_diagnostics],
                     "invocation": lifecycle.invocation.to_dict(),
                 }
             )
@@ -1173,6 +1374,12 @@ async def _search_skill_catalog(
                 "identifier": r.identifier,
                 "installReference": r.canonical_identifier or r.identifier,
                 "installed": is_skill_meta_installed(r, installed),
+                "license": r.license,
+                "homepage": r.homepage,
+                "upstream_url": r.upstream_url,
+                "origin_source": r.origin_source,
+                "signature_status": r.signature_status,
+                "content_hash": r.content_hash,
             }
             for r in results
         ],
@@ -1240,6 +1447,7 @@ async def _handle_skills_search(
 
 for _skill_catalog_method, _skill_catalog_implementation in (
     ("skills.list", _handle_skills_list),
+    ("skills.candidates", _handle_skills_candidates),
     ("skills.get", _handle_skills_get),
     ("skills.search", _handle_skills_search),
 ):
@@ -1261,7 +1469,7 @@ async def _reload_skills(ctx: RpcContext) -> SkillReloadResult:
             _reload_failure_payload("No skill loader configured", loader=None),
         )
 
-    from opensquilla.engine.steps.skills_filter import (
+    from opensquilla.engine.steps.skill_catalog_projection import (
         invalidate_skill_eligibility_cache,
     )
 
@@ -1288,13 +1496,21 @@ async def _install_skill(
 ) -> SkillMutationResult:
     """Install a skill from a Community source."""
     operation_id = command.operation_id
+    installer = _management_service(ctx)
+    if operation_id and isinstance(installer, SkillManagementService):
+        result = await installer.install_operations.run(
+            _install_owner(ctx), operation_id,
+            {"identifier": command.identifier, "source": command.source, "force": command.force,
+             "replaceSource": command.replace_source,
+             "riskConfirmation": command.risk_confirmation},
+            lambda: _run_skill_install(command, ctx),
+        )
+        return cast(SkillMutationResult, result)
     operation_key = (
         _skill_install_operation_key(ctx, operation_id) if operation_id else None
     )
     active_installs = _active_skill_installs(ctx) if operation_key else None
-    pending_cancellations = (
-        _pending_skill_install_cancellations(ctx) if operation_key else None
-    )
+    pending_cancellations = _pending_skill_install_cancellations(ctx) if operation_key else None
     if operation_key and pending_cancellations is not None:
         if operation_key in pending_cancellations:
             pending_cancellations.discard(operation_key)
@@ -1333,7 +1549,7 @@ async def _run_skill_install(
         return {"success": False, "message": "No skill installer configured"}
 
     identifier = command.identifier
-    source_id = command.source
+    source_id = command.source or "clawhub"
     force = command.force
     replace_source = command.replace_source
     risk_confirmation = command.risk_confirmation
@@ -1397,7 +1613,12 @@ async def _cancel_skill_install(
     command: CancelSkillInstall,
     ctx: RpcContext,
 ) -> SkillCancelResult:
-    """Cancel one install owned by this connection and await its cleanup."""
+    """Cancel an owned install and wait for its commit or rollback result."""
+    installer = _management_service(ctx)
+    if isinstance(installer, SkillManagementService):
+        return cast(SkillCancelResult, await installer.install_operations.cancel(
+            _install_owner(ctx), command.operation_id,
+        ))
     operation_key = _skill_install_operation_key(ctx, command.operation_id)
     active_installs = _active_skill_installs(ctx)
     task = active_installs.get(operation_key)
@@ -1471,9 +1692,12 @@ async def _handle_skills_update(params: dict | None, ctx: RpcContext) -> dict[st
                 install_id=install_id,
             )
             return {**_install_result_to_dict(unsupported), "results": []}
-        if not isinstance(installer, SkillManagementService) and force and (
-            not risk_confirmation
-            or not supports_keyword_argument(update, "risk_confirmation")
+        if (
+            not isinstance(installer, SkillManagementService)
+            and force
+            and (
+                not risk_confirmation or not supports_keyword_argument(update, "risk_confirmation")
+            )
         ):
             unsupported = unsupported_installer_result(
                 operation="update",
@@ -1505,9 +1729,7 @@ async def _handle_skills_update(params: dict | None, ctx: RpcContext) -> dict[st
             "success": False,
             "message": f"Skill update unavailable: {exc}",
         }
-    return {
-        "results": [_install_result_to_dict(r) for r in results]
-    }
+    return {"results": [_install_result_to_dict(r) for r in results]}
 
 
 async def _uninstall_skill(
@@ -1707,7 +1929,7 @@ async def _install_skill_dependencies(
         results = await install_deps([spec])
         r = results[0]
         if r.success:
-            from opensquilla.engine.steps.skills_filter import (
+            from opensquilla.engine.steps.skill_catalog_projection import (
                 invalidate_skill_eligibility_cache,
             )
 
@@ -1768,6 +1990,34 @@ async def _handle_skills_install(
     return await _skill_management(ctx).install(params)
 
 
+def _install_owner(ctx: RpcContext) -> str:
+    principal = ctx.principal
+    if principal.token_public_id:
+        return f"token:{principal.token_public_id}"
+    if principal.is_owner:
+        return "local-owner"
+    raise ValueError("Stable caller identity is required for Skill installation operations")
+
+
+async def _handle_skills_install_status(
+    params: dict[str, Any] | None, ctx: RpcContext,
+) -> dict[str, Any]:
+    if not isinstance(params, dict):
+        raise ValueError("params.operationId is required")
+    operation_id = GatewaySkillManagementAdapter._operation_id(params, required=True)
+    installer = _management_service(ctx)
+    if not isinstance(installer, SkillManagementService):
+        return {"operationId": operation_id, "state": "unknown", "phase": "unknown",
+                "terminal": True, "scope": ""}
+    owner = _install_owner(ctx)
+    receipt = installer.install_operations.store.read(owner, operation_id)
+    import hashlib
+    scope = hashlib.sha256(
+        f"{installer.journal_path}:{owner}".encode(),
+    ).hexdigest()
+    return {**receipt, "scope": scope}
+
+
 async def _handle_skills_install_cancel(
     params: dict[str, Any] | None,
     ctx: RpcContext,
@@ -1790,9 +2040,11 @@ async def _handle_skills_uninstall(
 
 
 for _skill_management_method, _skill_management_implementation in (
+    ("skills.setEnabled", _handle_skills_set_enabled),
     ("skills.reload", _handle_skills_reload),
     ("skills.install", _handle_skills_install),
     ("skills.install.cancel", _handle_skills_install_cancel),
+    ("skills.install.status", _handle_skills_install_status),
     ("skills.deps.install", _handle_skills_deps_install),
     ("skills.uninstall", _handle_skills_uninstall),
 ):
@@ -1808,6 +2060,7 @@ for _skill_management_method, _skill_management_implementation in (
 # ---------------------------------------------------------------------------
 # Default router/installer (lazy init)
 # ---------------------------------------------------------------------------
+
 
 def _get_default_router():
     return get_default_skill_router()

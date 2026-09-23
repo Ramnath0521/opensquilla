@@ -43,6 +43,7 @@
         "src/opensquilla/gateway/rpc_sessions.py": [
           "_GatewaySessionLifecyclePorts",
           "_SessionLifecycleDeletionPort",
+          "_accepts_explicit_keyword_arg",
           "_agent_registry_has",
           "_agent_registry_model",
           "_buffer_session_event",
@@ -62,6 +63,7 @@
           "_handle_sessions_fork",
           "_handle_sessions_fork_through_turn",
           "_handle_sessions_rename",
+          "_initial_user_message_owner_kwargs",
           "_list_transcript_titles",
           "_model_value",
           "_next_fork_display_name",
@@ -140,7 +142,6 @@
         "src/opensquilla/gateway/rpc_sessions.py": [
           "_GatewayAdmissionPrimitives",
           "_GatewayCancellationPorts",
-          "_IngressTurnAuthorityScope",
           "_accepted_turn_response",
           "_active_task_runtime_ids",
           "_agent_registry_model",
@@ -154,7 +155,6 @@
           "_coerce_positive_int",
           "_consume_abort_background_result",
           "_create_session_key",
-          "_desktop_artifact_bridge_supports_candidate_loop",
           "_drain_cancelled_task_runtime",
           "_effective_agent_id_for_session",
           "_emit_steer_metric",
@@ -168,18 +168,15 @@
           "_guest_profile_for_principal",
           "_handle_sessions_abort_contract",
           "_handle_sessions_send_contract",
-          "_handle_sessions_steer_contract",
           "_handle_sessions_steer_v2_contract",
           "_is_remote_web_guest",
           "_list_transcript_titles",
-          "_load_followup_annotation_focus",
           "_model_value",
           "_next_fork_display_name",
           "_normalize_terminal_event_payload",
           "_optional_string_param",
           "_plan_collaboration_snapshot",
           "_prepare_session_event_payload",
-          "_prompt_annotation_source_only_context",
           "_publish_admission_collaboration",
           "_publish_admission_disposition",
           "_publish_admission_forked",
@@ -204,6 +201,7 @@
           "_trusted_elevated_hint",
           "_trusted_run_mode_hint",
           "_turn_source_scope",
+          "_validate_initial_session_model",
           "build_gateway_turn_admission_adapter",
           "build_turn_admission_application"
         ]
@@ -262,6 +260,11 @@
       "path": "src/opensquilla/gateway/rpc_chat.py",
       "symbol": "_chat_turn_admission_adapter",
       "owner": "TurnAdmission"
+    },
+    {
+      "path": "src/opensquilla/gateway/rpc_sessions.py",
+      "symbol": "_validate_rpc_session_deployment",
+      "owner": "SessionLifecycle"
     }
   ]
 }

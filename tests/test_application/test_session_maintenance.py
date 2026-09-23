@@ -12,9 +12,6 @@ from opensquilla.application.session_maintenance import (
     SessionCompactionDeadlineError,
     SessionCompactionEvent,
     SessionCompactionExecutionResult,
-    SessionCompactionFlushSafetyError,
-    SessionCompactionMemoryAssessment,
-    SessionCompactionMemoryResult,
     SessionCompactionMilestone,
     SessionCompactionPhaseTimeoutError,
     SessionCompactionPlan,
@@ -58,9 +55,8 @@ class _Ports:
             kept_count=1,
         )
         self.execution_error: BaseException | None = None
-        self.allow_memory = True
-        self.memory_available = True
         self.cancel_observed_broadcast = False
+        self.cancel_completed_prepare = False
         self.executor_gate: asyncio.Event | None = None
         self.background_task: asyncio.Task[object] | None = None
 
@@ -69,9 +65,6 @@ class _Ports:
             total_timeout_seconds=5.0,
             heartbeat_interval_seconds=10.0,
         )
-
-    def default_context_window_tokens(self) -> int:
-        return 100_000
 
     async def load_session(self, session_key: str) -> SessionCompactionSession | None:
         self.calls.append(f"session.load:{session_key}")
@@ -83,15 +76,15 @@ class _Ports:
     def resolve_context_window_tokens(
         self,
         session: SessionCompactionSession | None,
-        requested_tokens: int,
+        requested_tokens: int | None,
     ) -> int:
         self.calls.append("budget.resolve")
-        return min(requested_tokens, 8_192)
+        return min(requested_tokens, 8_192) if requested_tokens is not None else 8_192
 
     def build_plan(
         self,
         session: SessionCompactionSession | None,
-        requested_tokens: int,
+        requested_tokens: int | None,
         compaction_id: str,
         operation_deadline: float,
     ) -> SessionCompactionPlan:
@@ -101,68 +94,10 @@ class _Ports:
     def for_session(self, session_key: str) -> _Lock:
         return _Lock(self.calls)
 
-    @property
-    def flush_enabled(self) -> bool:
-        return True
-
-    @property
-    def flush_available(self) -> bool:
-        return self.memory_available
-
-    async def transcript(self, session_key: str) -> tuple[object, ...]:
-        self.calls.append("memory.transcript")
-        return ("entry",)
-
-    async def flush(
-        self,
-        session: SessionCompactionSession,
-        transcript: tuple[object, ...],
-        plan: SessionCompactionPlan,
-        compaction_id: str,
-    ) -> object:
-        self.calls.append("memory.flush")
-        return {"status": "flushed"}
-
-    def receipt_status(self, receipt: object | None) -> str:
-        return "flushed" if receipt is not None else "missing"
-
-    def receipt_is_successful(self, receipt: object) -> bool:
-        return True
-
-    @property
-    def requires_safe_receipt(self) -> bool:
-        return True
-
-    async def checkpoint_covers(
-        self,
-        session: SessionCompactionSession,
-        transcript: tuple[object, ...],
-    ) -> bool:
-        self.calls.append("memory.checkpoint")
-        return self.allow_memory
-
-    def assess(
-        self,
-        receipt: object | None,
-        *,
-        checkpoint_safe: bool,
-        required: bool,
-    ) -> SessionCompactionMemoryAssessment:
-        self.calls.append("memory.assess")
-        return SessionCompactionMemoryAssessment(
-            allows_destructive_compaction=self.allow_memory,
-            safety_status="safe" if self.allow_memory else "unsafe",
-            semantic_status="durable" if self.allow_memory else "missing",
-        )
-
-    def record(self, outcome: str, **details: object) -> None:
-        self.calls.append(f"memory.record:{outcome}")
-
     async def compact(
         self,
         command: CompactSession,
         plan: SessionCompactionPlan,
-        memory: SessionCompactionMemoryResult,
     ) -> SessionCompactionExecutionResult:
         self.calls.append("executor.compact")
         if self.executor_gate is not None:
@@ -173,6 +108,9 @@ class _Ports:
 
     async def prepare(self, event: SessionCompactionEvent) -> object:
         self.calls.append(f"event.prepare:{event.status}")
+        if self.cancel_completed_prepare and event.status == "completed":
+            self.cancel_completed_prepare = False
+            raise asyncio.CancelledError
         return event
 
     def claim_and_buffer(
@@ -227,7 +165,6 @@ def _application(ports: _Ports) -> SessionMaintenance:
     return SessionMaintenance(
         planning=ports,
         locking=ports,
-        memory=ports,
         executor=ports,
         lifecycle=ports,
         ownership=ports,
@@ -249,37 +186,11 @@ async def test_compaction_orders_safety_before_destructive_execution() -> None:
 
     assert result.status == "completed"
     assert result.context_window_tokens == 8_192
-    assert result.flush_receipt_status == "flushed"
-    assert ports.calls.index("lock.acquire") < ports.calls.index("memory.flush")
-    assert ports.calls.index("memory.assess") < ports.calls.index("executor.compact")
+    assert ports.calls.index("lock.acquire") < ports.calls.index("executor.compact")
     assert ports.calls.index("executor.compact") < ports.calls.index("lock.release")
     assert ports.calls.index("usage.exit") < ports.calls.index("lock.release")
     assert [event.status for event in ports.events].count("completed") == 1
     assert ports.events[-1].terminal is True
-
-
-async def test_unsafe_memory_flush_blocks_compactor() -> None:
-    ports = _Ports()
-    ports.allow_memory = False
-
-    with pytest.raises(SessionCompactionFlushSafetyError):
-        await _application(ports).compact(CompactSession("agent:main:webchat:one"))
-
-    assert "executor.compact" not in ports.calls
-    assert [event.status for event in ports.events if event.terminal] == ["failed"]
-
-
-async def test_missing_flush_service_still_enforces_checkpoint_safety() -> None:
-    ports = _Ports()
-    ports.memory_available = False
-    ports.allow_memory = False
-
-    with pytest.raises(SessionCompactionFlushSafetyError):
-        await _application(ports).compact(CompactSession("agent:main:webchat:one"))
-
-    assert "memory.flush" not in ports.calls
-    assert ports.calls.index("memory.checkpoint") < ports.calls.index("memory.assess")
-    assert "executor.compact" not in ports.calls
 
 
 async def test_timeout_claims_one_terminal_result() -> None:
@@ -290,7 +201,9 @@ async def test_timeout_claims_one_terminal_result() -> None:
         await _application(ports).compact(CompactSession("agent:main:webchat:one"))
 
     assert raised.value.phase == "summarizing"
-    assert [event.status for event in ports.events if event.terminal] == ["timed_out"]
+    assert [event.status for event in ports.events if event.terminal] == ["failed"]
+    assert ports.events[-1].reason == "compaction_deadline_exceeded"
+    assert {event.compaction_id for event in ports.events} == {"compact-1"}
 
 
 async def test_cancel_after_commit_reconciles_exactly_one_completed_terminal() -> None:
@@ -328,6 +241,22 @@ async def test_background_owner_is_registered_before_started_event() -> None:
     assert [event.status for event in ports.events if event.terminal] == ["completed"]
 
 
+async def test_cancel_during_completed_preparation_preserves_durable_terminal() -> None:
+    ports = _Ports()
+    ports.cancel_completed_prepare = True
+
+    with pytest.raises(asyncio.CancelledError):
+        await _application(ports).compact(CompactSession("agent:main:webchat:one"))
+
+    terminals = [event for event in ports.events if event.terminal]
+    assert len(terminals) == 1
+    assert terminals[0].status == "completed"
+    assert terminals[0].cancellation_reconciled is True
+    assert terminals[0].result is not None
+    assert terminals[0].result.applied is True
+    assert {event.compaction_id for event in ports.events} == {"compact-1"}
+
+
 async def test_invalid_compaction_budget_never_loads_session() -> None:
     ports = _Ports()
 
@@ -337,3 +266,69 @@ async def test_invalid_compaction_budget_never_loads_session() -> None:
         )
 
     assert ports.calls == []
+
+
+@pytest.mark.parametrize(
+    ("reason", "status"),
+    [
+        ("within_compaction_budget", "skipped"),
+        ("no_compression_benefit", "skipped"),
+        ("no_safe_turn_boundary", "skipped"),
+        ("stale_preimage", "skipped"),
+        ("stale_context_state", "skipped"),
+        ("consumer_admission_stale", "skipped"),
+        ("consumer_admission_failed", "failed"),
+        ("summary_target_unavailable", "failed"),
+        ("coverage_blocked", "failed"),
+        ("quality_gate_failed", "failed"),
+        ("summary_replay_incomplete", "failed"),
+        ("invalid_source_boundary", "failed"),
+        (None, "failed"),
+    ],
+)
+async def test_manual_compaction_classifies_unapplied_candidates(reason, status) -> None:
+    ports = _Ports()
+    ports.execution = SessionCompactionExecutionResult(
+        applied=False, summary_len=0, summary_source="skipped", skip_reason=reason,
+    )
+
+    result = await _application(ports).compact(CompactSession("agent:main:webchat:one"))
+
+    assert result.status == status
+    assert result.reason == (reason or "empty_summary")
+    assert result.applied is False
+    assert result.removed_count == 0
+    terminal = [event for event in ports.events if event.terminal]
+    assert len(terminal) == 1
+    assert terminal[0].status == status
+    assert terminal[0].reason == result.reason
+    assert {event.compaction_id for event in ports.events} == {result.compaction_id}
+
+
+@pytest.mark.parametrize("background", [False, True])
+async def test_cancel_before_commit_closes_same_manual_operation(background: bool) -> None:
+    ports = _Ports()
+    ports.executor_gate = asyncio.Event()
+    application = _application(ports)
+    if background:
+        result = await application.compact(
+            CompactSession("agent:main:webchat:one", wait=False),
+        )
+        task = ports.background_task
+        assert result.compaction_id == "compact-1"
+        assert task is not None
+    else:
+        task = asyncio.create_task(application.compact(
+            CompactSession("agent:main:webchat:one"),
+        ))
+        while not ports.events:
+            await asyncio.sleep(0)
+
+    task.cancel()
+    await asyncio.gather(task, return_exceptions=True)
+
+    assert {event.compaction_id for event in ports.events} == {"compact-1"}
+    terminals = [event for event in ports.events if event.terminal]
+    assert len(terminals) == 1
+    assert terminals[0].status == "failed"
+    assert terminals[0].reason == "cancelled"

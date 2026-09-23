@@ -2,6 +2,59 @@
   "format": 1,
   "targets": [
     {
+      "kind": "method",
+      "wireName": "sessions.processes.list",
+      "roles": ["params", "result"]
+    },
+    {
+      "kind": "method",
+      "wireName": "sessions.processes.log",
+      "roles": ["params", "result"]
+    },
+    {
+      "kind": "method",
+      "wireName": "sessions.processes.stop",
+      "roles": ["params", "result"]
+    },
+    {
+      "kind": "method",
+      "wireName": "telemetry.product_active.record",
+      "roles": [
+        "result"
+      ]
+    },
+    {
+      "kind": "method",
+      "wireName": "sessions.executionLog.read",
+      "roles": [
+        "params",
+        "result"
+      ]
+    },
+    {
+      "kind": "event",
+      "wireName": "transport.flow.dirty",
+      "roles": [
+        "payload"
+      ]
+    },
+    {
+      "kind": "method",
+      "wireName": "transport.flow.update",
+      "roles": [
+        "params",
+        "result"
+      ]
+    },
+    {
+      "kind": "method",
+      "wireName": "sessions.messages.snapshot.read",
+      "roles": [
+        "params",
+        "result"
+      ]
+    },
+    {
       "kind": "event",
       "wireName": "approval.events",
       "roles": [
@@ -178,41 +231,6 @@
     },
     {
       "kind": "method",
-      "wireName": "artifacts.prompt_annotations.create",
-      "roles": [
-        "result"
-      ]
-    },
-    {
-      "kind": "method",
-      "wireName": "artifacts.prompt_annotations.discard",
-      "roles": [
-        "result"
-      ]
-    },
-    {
-      "kind": "method",
-      "wireName": "artifacts.prompt_annotations.focus",
-      "roles": [
-        "result"
-      ]
-    },
-    {
-      "kind": "method",
-      "wireName": "artifacts.prompt_annotations.list",
-      "roles": [
-        "result"
-      ]
-    },
-    {
-      "kind": "method",
-      "wireName": "artifacts.prompt_annotations.update",
-      "roles": [
-        "result"
-      ]
-    },
-    {
-      "kind": "method",
       "wireName": "artifacts.revisions.list",
       "roles": [
         "result"
@@ -221,13 +239,6 @@
     {
       "kind": "method",
       "wireName": "artifacts.revisions.restore",
-      "roles": [
-        "result"
-      ]
-    },
-    {
-      "kind": "method",
-      "wireName": "artifacts.source.patch",
       "roles": [
         "result"
       ]
@@ -306,7 +317,6 @@
       "kind": "method",
       "wireName": "chat.abort",
       "roles": [
-        "params",
         "result"
       ]
     },
@@ -329,7 +339,6 @@
       "kind": "method",
       "wireName": "chat.send",
       "roles": [
-        "params",
         "result"
       ]
     },
@@ -427,27 +436,6 @@
     {
       "kind": "method",
       "wireName": "doctor.status",
-      "roles": [
-        "result"
-      ]
-    },
-    {
-      "kind": "method",
-      "wireName": "documents.editSessions.close",
-      "roles": [
-        "result"
-      ]
-    },
-    {
-      "kind": "method",
-      "wireName": "documents.editSessions.heartbeat",
-      "roles": [
-        "result"
-      ]
-    },
-    {
-      "kind": "method",
-      "wireName": "documents.editSessions.start",
       "roles": [
         "result"
       ]
@@ -642,6 +630,20 @@
     },
     {
       "kind": "method",
+      "wireName": "meta.inspect",
+      "roles": [
+        "result"
+      ]
+    },
+    {
+      "kind": "method",
+      "wireName": "meta.list",
+      "roles": [
+        "result"
+      ]
+    },
+    {
+      "kind": "method",
       "wireName": "meta.run",
       "roles": [
         "result"
@@ -706,8 +708,17 @@
     },
     {
       "kind": "method",
+      "wireName": "models.capacity.resolve",
+      "roles": [
+        "params",
+        "result"
+      ]
+    },
+    {
+      "kind": "method",
       "wireName": "models.list",
       "roles": [
+        "params",
         "result"
       ]
     },
@@ -721,6 +732,14 @@
     {
       "kind": "method",
       "wireName": "models.routing.set",
+      "roles": [
+        "params",
+        "result"
+      ]
+    },
+    {
+      "kind": "method",
+      "wireName": "models.routing.resetRecommended",
       "roles": [
         "params",
         "result"
@@ -833,6 +852,14 @@
     },
     {
       "kind": "method",
+      "wireName": "onboarding.llmProfile.upsertAndActivate",
+      "roles": [
+        "params",
+        "result"
+      ]
+    },
+    {
+      "kind": "method",
       "wireName": "onboarding.memory_embedding.configure",
       "roles": [
         "result"
@@ -890,6 +917,13 @@
     {
       "kind": "method",
       "wireName": "onboarding.status",
+      "roles": [
+        "result"
+      ]
+    },
+    {
+      "kind": "method",
+      "wireName": "plans.setPresentation",
       "roles": [
         "result"
       ]
@@ -1086,6 +1120,13 @@
     },
     {
       "kind": "method",
+      "wireName": "sessions.list",
+      "roles": [
+        "result"
+      ]
+    },
+    {
+      "kind": "method",
       "wireName": "sessions.messages.hydrate",
       "roles": [
         "params",
@@ -1127,7 +1168,6 @@
       "kind": "method",
       "wireName": "sessions.pending_inputs.dispatch",
       "roles": [
-        "params",
         "result"
       ]
     },
@@ -1156,7 +1196,6 @@
       "kind": "method",
       "wireName": "sessions.pending_inputs.steer",
       "roles": [
-        "params",
         "result"
       ]
     },
@@ -1228,7 +1267,6 @@
       "kind": "method",
       "wireName": "sessions.steer.v2",
       "roles": [
-        "params",
         "result"
       ]
     },
@@ -1256,6 +1294,13 @@
     {
       "kind": "method",
       "wireName": "skills.install.cancel",
+      "roles": [
+        "result"
+      ]
+    },
+    {
+      "kind": "method",
+      "wireName": "skills.install.status",
       "roles": [
         "result"
       ]
@@ -1383,6 +1428,44 @@
       "kind": "method",
       "wireName": "workspaces.update",
       "roles": [
+        "result"
+      ]
+    },
+    {
+      "kind": "method",
+      "wireName": "skills.candidates",
+      "roles": [
+        "result"
+      ]
+    },
+    {
+      "kind": "method",
+      "wireName": "skills.setEnabled",
+      "roles": [
+        "result"
+      ]
+    },
+    {
+      "kind": "method",
+      "wireName": "workspaces.references.read",
+      "roles": [
+        "params",
+        "result"
+      ]
+    },
+    {
+      "kind": "method",
+      "wireName": "sessions.messages.resume",
+      "roles": [
+        "params",
+        "result"
+      ]
+    },
+    {
+      "kind": "method",
+      "wireName": "sessions.messages.snapshot.release",
+      "roles": [
+        "params",
         "result"
       ]
     }

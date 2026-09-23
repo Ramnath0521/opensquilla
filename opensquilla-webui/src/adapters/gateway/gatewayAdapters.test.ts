@@ -8,14 +8,15 @@ describe('Gateway Adapter composition', () => {
     const call = vi.fn(async (method: string) => (
       method === 'sessions.pending_inputs.list'
         ? { items: [] }
-        : { sessions: [] }
+        : { sessions: [], count: 0, ts: 1 }
     )) as <T = unknown>(
       method: string,
       params?: Record<string, unknown>,
       options?: RpcCallOptions,
     ) => Promise<T>
     const adapters = createGatewayAdapters({
-      state: 'connected',
+    state: 'connected',
+    health: 'healthy',
       error: null,
       isLocalOwner: true,
       canManageProjectWorkspaces: true,
@@ -23,6 +24,7 @@ describe('Gateway Adapter composition', () => {
       auth: { principal: { authState: 'authenticated' } },
       policy: null,
       connectionGeneration: 1,
+      deliveryContext: null,
       connect: vi.fn(async () => undefined),
       disconnect: vi.fn(),
       recoverConnectionGeneration: vi.fn(() => true),
@@ -51,10 +53,13 @@ describe('Gateway Adapter composition', () => {
       'planCenter',
       'metaRunCenter',
       'appSettings',
+      'productActivity',
       'providerConfiguration',
       'setupWorkflow',
       'migrationOperations',
       'workspaceCatalog',
+      'workspaceReferences',
+      'workspaceFiles',
       'sandboxRuntime',
       'usageReporting',
       'commandCatalog',
@@ -62,6 +67,7 @@ describe('Gateway Adapter composition', () => {
       'promptCacheLease',
       'clarificationSubmission',
       'sessionMaintenance',
+      'sessionProcesses',
       'observability',
       'skillCatalog',
       'agentCatalog',

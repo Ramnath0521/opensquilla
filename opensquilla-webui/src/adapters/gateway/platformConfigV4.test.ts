@@ -10,6 +10,12 @@ function rpc() {
     if (method === 'config.effective') return { fields: { theme: { value: 'dark', source: 'config' } } } as T
     if (method === 'config.patch.safe') return { patched: ['theme'], restartRequired: true } as T
     if (method === 'config.patch') return { patched: ['llm.model'], restartRequired: false } as T
+    if (method === 'telemetry.consent.set') return {
+      scope: params?.scope,
+      enabled: params?.enabled,
+      noticeVersion: params?.enabled ? `${params?.scope}-v1` : null,
+      consentedAtUtc: params?.enabled ? '2026-09-03T00:00:00Z' : null,
+    } as T
     if (method === 'models.list') return { models: [], errors: [] } as T
     if (method === 'onboarding.catalog') return { providers: [{ providerId: 'openai', label: 'OpenAI' }] } as T
     if (method === 'models.routing.get') return { mode: 'direct', provider: 'openai' } as T
@@ -61,6 +67,15 @@ function rpc() {
 }
 
 describe('Platform configuration adapters', () => {
+  it('requests configured model scope explicitly while preserving default catalog requests', async () => {
+    const source = rpc()
+    const providers = createV4ProviderConfiguration(source, { subscribe: () => ({ close() {} }) })
+    await providers.list()
+    expect(source.request).toHaveBeenLastCalledWith('models.list', undefined, expect.any(Object))
+    await providers.list({ scope: 'configured' })
+    expect(source.request).toHaveBeenLastCalledWith('models.list', { scope: 'configured' }, expect.any(Object))
+  })
+
   it('maps config operations to AppSettings domain values', async () => {
     const source = rpc()
     const settings = createV4AppSettings(source)
@@ -84,6 +99,17 @@ describe('Platform configuration adapters', () => {
     )
     await settings.merge({ llm: { model: 'gpt-4' } })
     expect(source.request).toHaveBeenCalledWith('config.patch', { patch: { llm: { model: 'gpt-4' } } }, expect.any(Object))
+    await expect(settings.setTelemetryConsent('reliability', true)).resolves.toEqual({
+      scope: 'reliability',
+      enabled: true,
+      noticeVersion: 'reliability-v1',
+      consentedAtUtc: '2026-09-03T00:00:00Z',
+    })
+    expect(source.request).toHaveBeenCalledWith(
+      'telemetry.consent.set',
+      { scope: 'reliability', enabled: true },
+      expect.objectContaining({ timeoutAction: 'reject', abortAction: 'reject' }),
+    )
   })
 
   it('normalizes provider and setup snapshots without exposing transport details', async () => {
@@ -148,6 +174,63 @@ describe('Platform configuration adapters', () => {
       restartRequired: false,
     })
     expect(source.request).toHaveBeenCalledWith('onboarding.router.configure', { mode: 'recommended' }, expect.any(Object))
+  })
+
+  it('passes provider probe modes, cancellation, and caller-specific timeouts to transport', async () => {
+    const source = rpc()
+    const setup = createV4SetupWorkflow(source)
+    const controller = new AbortController()
+
+    await setup.provider.probePrimary(
+      { providerId: 'openai', mode: 'reachability' },
+      { signal: controller.signal, timeoutMs: 70_000 },
+    )
+    expect(source.request).toHaveBeenLastCalledWith(
+      'onboarding.provider.probe',
+      { providerId: 'openai', mode: 'reachability' },
+      {
+        timeoutMs: 70_000,
+        timeoutAction: 'reject',
+        abortAction: 'reject',
+        cancelOnAbort: true,
+        signal: controller.signal,
+      },
+    )
+
+    await setup.provider.probePrimary(
+      { providerId: 'openai', model: 'gpt-4o', mode: 'model' },
+      { timeoutMs: 65_000 },
+    )
+    expect(source.request).toHaveBeenLastCalledWith(
+      'onboarding.provider.probe',
+      { providerId: 'openai', model: 'gpt-4o', mode: 'model' },
+      expect.objectContaining({ timeoutMs: 65_000, cancelOnAbort: true }),
+    )
+
+    await setup.profile.probeProfile({ providerId: 'openai', mode: 'model' })
+    expect(source.request).toHaveBeenLastCalledWith(
+      'onboarding.llmProfile.probe',
+      { providerId: 'openai', mode: 'model' },
+      expect.objectContaining({ cancelOnAbort: true }),
+    )
+
+    await setup.profile.probeDraftProfile({ providerId: 'openai', mode: 'reachability' })
+    expect(source.request).toHaveBeenLastCalledWith(
+      'onboarding.llmProfile.draft.probe',
+      { providerId: 'openai', mode: 'reachability' },
+      expect.objectContaining({ cancelOnAbort: true }),
+    )
+
+    await setup.profile.probeProfile({ providerId: 'openai', model: 'gpt-4o' })
+    expect(source.request).toHaveBeenLastCalledWith(
+      'onboarding.llmProfile.probe',
+      { providerId: 'openai', model: 'gpt-4o' },
+      {
+        timeoutMs: 20_000,
+        timeoutAction: 'reject',
+        abortAction: 'reject',
+      },
+    )
   })
 
   it('keeps migration discovery and preview read-only behind the domain seam', async () => {

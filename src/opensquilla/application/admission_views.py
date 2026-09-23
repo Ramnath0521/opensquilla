@@ -56,6 +56,14 @@ class PreparedAdmissionIntent(Protocol):
     def initial_transcript_entries(self) -> tuple[TranscriptMessage, ...]: ...
 
 
+@runtime_checkable
+class AdmissionPreparation(Protocol):
+    """Optional, process-local resources; absent on legacy preparation adapters."""
+
+    def mark_committed(self, session_id: str) -> None: ...
+    async def close(self) -> None: ...
+
+
 class AdmissionReceipt(Protocol):
     @property
     def request_fingerprint(self) -> str: ...
@@ -103,6 +111,17 @@ class AdmissionTaskRecord(Protocol):
     def task_id(self) -> str: ...
 
 
+class ActivationTask(Protocol):
+    @property
+    def task_id(self) -> str: ...
+
+    @property
+    def session_key(self) -> str: ...
+
+    @property
+    def status(self) -> str: ...
+
+
 @runtime_checkable
 class AdmissionPlanRevision(Protocol):
     @property
@@ -144,14 +163,8 @@ class AdmissionMetaControl(Protocol):
     def replay_mode(self) -> str | None: ...
 
 
-class AdmissionAnnotation(Protocol):
-    @property
-    def annotation_id(self) -> str: ...
 
 
-class AdmissionAnnotationTarget(Protocol):
-    @property
-    def expected_annotation(self) -> AdmissionAnnotation: ...
 
 
 class AdmissionGuestCleanup(Protocol):
@@ -249,8 +262,6 @@ class AdmissionCommit:
     expected_active_plan_revision_id: str | None = None
     require_idle_for_current_plan_implementation: bool = False
     claim_current_goal: bool = False
-    prepared_prompt_annotation_targets: Sequence[AdmissionAnnotationTarget] = ()
-    prompt_annotation_turn_id: str | None = None
     pending_input_id: str | None = None
     pending_input_fingerprint: str | None = None
     pending_input_revision: int | None = None

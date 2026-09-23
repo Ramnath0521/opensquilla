@@ -177,6 +177,9 @@ describe('v4 SessionHistory Adapter', () => {
           turn_id: 'turn-1',
           future_context: { inner_snake: true },
         },
+        page_context: { targetRef: 'target-1', resourceId: 'document:doc-1', annotations: [{ text: 'Larger heading', selectionText: 'Welcome', locatorHint: 'h1' }] },
+        prompt_annotations: [{ body: 'Read-only legacy annotation' }],
+        selectedSkills: [{ name: 'synthetic-table', instanceId: 'instance-one', digest: 'digest-one' }],
         additive_message: { nested_snake: true },
       }],
       has_more: false,
@@ -220,9 +223,12 @@ describe('v4 SessionHistory Adapter', () => {
     expect(requestSpy).toHaveBeenCalledWith(
       CHAT_HISTORY_METHOD,
       expect.objectContaining({ sessionKey: 'session-1', includeCanonical: true }),
-      expect.objectContaining({ timeoutAction: 'reject' }),
+      expect.objectContaining({ timeoutAction: 'reject', recoveryClass: 'safe-read' }),
     )
     const message = page.messages[0]
+    expect(message?.pageContext).toEqual({ targetRef: 'target-1', resourceId: 'document:doc-1', annotations: [{ text: 'Larger heading', selectionText: 'Welcome', locatorHint: 'h1' }] })
+    expect(message?.promptAnnotations).toEqual([{ body: 'Read-only legacy annotation' }])
+    expect(message?.selectedSkills).toEqual([{ name: 'synthetic-table', instanceId: 'instance-one', digest: 'digest-one' }])
     const toolCall = message?.toolCalls[0] as Record<string, unknown>
     expect(toolCall).toMatchObject({
       tool_use_id: 'tool-1',

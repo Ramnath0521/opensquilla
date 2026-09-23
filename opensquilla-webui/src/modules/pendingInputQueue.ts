@@ -1,5 +1,7 @@
+import type { SelectedSkillRef } from '@/types/selectedSkills'
+import type { ChatPageContext } from '@/types/pageContext'
 import type { InjectionKey } from 'vue'
-import type { Attachment } from '@/types/chat'
+import type { Attachment, WorkspaceFileReference } from '@/types/chat'
 
 /** Domain-facing representation of a durable pending-input row. */
 export interface PendingInputServerItem {
@@ -9,10 +11,12 @@ export interface PendingInputServerItem {
   readonly message?: string
   readonly displayText?: string
   readonly attachments?: readonly PendingInputServerAttachment[]
+  readonly workspaceFiles?: readonly WorkspaceFileReference[]
   readonly position?: number
   readonly revision?: number
   readonly requestFingerprint?: string
-  readonly promptAnnotationIds?: readonly string[]
+  readonly selectedSkills?: readonly SelectedSkillRef[]
+  readonly pageContext?: ChatPageContext
   readonly intent?: string | null
   readonly confirmedPlainText?: boolean
 }
@@ -30,7 +34,9 @@ export interface PendingInputEnqueueRequest {
   clientMessageId?: string
   message: string
   attachments: readonly unknown[]
-  promptAnnotationIds?: readonly string[]
+  workspaceFiles?: readonly WorkspaceFileReference[]
+  selectedSkills?: readonly SelectedSkillRef[]
+  pageContext?: ChatPageContext
   confirmedPlainText?: boolean
   displayText?: string
   intent?: string | null

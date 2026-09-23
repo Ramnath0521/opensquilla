@@ -18,7 +18,6 @@ import {
 } from '@/workbench/workbenchResourceItems'
 import { normalizeWorkbenchResource } from '@/workbench/workbenchResourceProvider'
 import ArtifactDocumentPanel from './ArtifactDocumentPanel.vue'
-import artifactDocumentPanelSource from './ArtifactDocumentPanel.vue?raw'
 
 const officeArtifact: ArtifactPayload = {
   id: 'artifact-office',
@@ -74,10 +73,53 @@ afterEach(() => {
 })
 
 describe('ArtifactDocumentPanel', () => {
-  it('routes a successful source save through the canonical head-change event', () => {
-    expect(artifactDocumentPanelSource).toContain('@source-saved="onSourceSaved"')
-    expect(artifactDocumentPanelSource).toContain("type: 'artifact-head-changed'")
-    expect(artifactDocumentPanelSource).toContain('payload: { revisionId }')
+  it('keeps current-version restore available and follows the restored pointer without another row', async () => {
+    const htmlArtifact: ArtifactPayload = {
+      id: 'artifact-html', name: 'page.html', mime: 'text/html',
+      download_url: '/api/v1/artifacts/artifact-html',
+    }
+    const legacy = createLegacyArtifactWorkspace(htmlArtifact, 'session-a')
+    const initial = { ...legacy.revisions[0]!, revisionId: 'revision-1', generation: 1 }
+    const updated = { ...initial, revisionId: 'revision-2', generation: 2, source: 'agent' as const }
+    const state = ref<ArtifactDocumentWorkspaceSnapshot>({
+      key: 'restore-pointer', loading: false, loaded: true, stale: false, error: null,
+      workspace: {
+        ...legacy, source: 'document-api',
+        document: { ...legacy.document, headRevisionId: updated.revisionId,
+          capabilities: { ...legacy.document.capabilities, revisions: true } },
+        revisions: [updated, initial],
+      },
+    })
+    const actions = { restoreRevision: vi.fn(async (_artifact, _sessionKey, revisionId) => {
+      state.value.workspace!.document.headRevisionId = revisionId
+      return state.value.workspace!
+    }) }
+    const mounted = mountPanel({
+      artifact: htmlArtifact, documentSnapshot: state.value, documentActions: actions,
+      sessionKey: 'session-a', initialSection: 'versions', nativeHtml: true, suspended: true,
+    })
+    await nextTick()
+    const panel = mounted.element.querySelector('[data-document-section="versions"]')!
+    const rows = [...panel.querySelectorAll('li')]
+    expect(rows).toHaveLength(2)
+    expect(rows[0]?.textContent).toContain('Current')
+    const currentRestore = rows[0]!.querySelector<HTMLButtonElement>('[data-artifact-action="restore-revision"]')!
+    expect(currentRestore).not.toBeNull()
+    expect(currentRestore.disabled).toBe(false)
+    currentRestore.click()
+    await vi.waitFor(() => expect(actions.restoreRevision).toHaveBeenCalledWith(htmlArtifact, 'session-a', 'revision-2'))
+    await nextTick()
+
+    rows[1]!.querySelector<HTMLButtonElement>('[data-artifact-action="restore-revision"]')!.click()
+    await vi.waitFor(() => expect(actions.restoreRevision).toHaveBeenLastCalledWith(htmlArtifact, 'session-a', 'revision-1'))
+    await nextTick()
+    expect(panel.querySelectorAll('li')).toHaveLength(2)
+    expect(rows[0]?.textContent).not.toContain('Current')
+    expect(rows[1]?.textContent).toContain('Current')
+    expect(rows[1]!.querySelector('[data-artifact-action="restore-revision"]')).not.toBeNull()
+    expect([...mounted.element.querySelectorAll('[role="tab"]')]
+      .find(tab => tab.textContent?.includes('Versions'))?.textContent?.replace(/\s/g, '')).toBe('Versions2')
+    mounted.unmount()
   })
 
   it('keeps immutable artifacts read-only without exposing an editable-copy action', async () => {
@@ -498,7 +540,6 @@ describe('ArtifactDocumentPanel', () => {
         annotationId: 'annotation-1',
         body: 'Initial draft',
         reason: 'overlay-crashed',
-        screenshotUrl: 'blob:frozen-preview',
       },
       onWorkbenchEvent,
     })
@@ -507,7 +548,7 @@ describe('ArtifactDocumentPanel', () => {
     const dialog = mounted.element.querySelector('[role="dialog"]')
     const input = dialog?.querySelector<HTMLTextAreaElement>('textarea')
     expect(dialog?.textContent).toContain('Continue annotation')
-    expect(dialog?.querySelector<HTMLImageElement>('img')?.src).toContain('blob:frozen-preview')
+    expect(dialog?.querySelector('img')).toBeNull()
     expect(input?.value).toBe('Initial draft')
     expect(dialog?.textContent).toContain('Shift + Enter for a new line')
     if (input) {
@@ -561,7 +602,6 @@ describe('ArtifactDocumentPanel', () => {
         annotationId: 'annotation-mac',
         body: '',
         reason: 'overlay-crashed',
-        screenshotUrl: '',
       },
     })
     await nextTick()

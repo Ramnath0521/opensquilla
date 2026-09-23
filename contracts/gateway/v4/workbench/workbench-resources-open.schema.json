@@ -20,16 +20,16 @@
   "x-opensquilla-codegen": {
     "python": {
       "tool": "datamodel-code-generator",
-      "version": "0.75.1",
+      "version": "0.81.0",
       "target": "pydantic_v2.BaseModel"
     },
     "typescript": {
       "tool": "json-schema-to-typescript",
-      "version": "15.0.4"
+      "version": "16.0.0"
     },
     "runtimeValidation": {
       "tool": "ajv",
-      "version": "8.17.1",
+      "version": "8.20.0",
       "mode": "standalone-adapter-only"
     }
   },
@@ -242,6 +242,25 @@
         "reasonCode": {
           "type": "string",
           "minLength": 1
+        },
+        "pageContext": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "resourceId"
+          ],
+          "properties": {
+            "resourceId": {
+              "type": "string",
+              "pattern": "^document:.+",
+              "maxLength": 512
+            }
+          }
+        },
+        "workingFile": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Absolute path to the ordinary editable working file, in the Gateway filesystem."
         }
       }
     },

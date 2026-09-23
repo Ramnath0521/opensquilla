@@ -26,6 +26,7 @@ export type GoalProviderEvent = ProviderCall | ProviderGateEvent
 
 export type RealGoalGateway = {
   wsUrl: string
+  flowEnabled: boolean
   readProviderEvents: () => Promise<GoalProviderEvent[]>
   readProviderCalls: () => Promise<ProviderCall[]>
   releaseFirstTask: () => Promise<void>
@@ -103,7 +104,14 @@ export async function startRealGoalGateway(options: {
   outputDir: string
   webuiOrigin: string
   scenario?: RealGoalGatewayScenario
+  authMode?: 'none' | 'token'
 }): Promise<RealGoalGateway> {
+  const requestedFlow = process.env.OPENSQUILLA_GATEWAY_WS_TRANSPORT_FLOW_ENABLED
+    ?.trim().toLowerCase()
+  if (requestedFlow && requestedFlow !== 'true' && requestedFlow !== 'false') {
+    throw new Error('Goal fixture transport flow flag must be true or false')
+  }
+  const flowEnabled = requestedFlow === 'true'
   const repoRoot = fileURLToPath(new URL('../..', import.meta.url))
   const fixturePath = fileURLToPath(new URL('./goal-mode-gateway.py', import.meta.url))
   const stateDir = join(options.outputDir, 'state')
@@ -130,8 +138,8 @@ export async function startRealGoalGateway(options: {
     )
   const child = spawn(python, ['-u', fixturePath], {
     // Keep OpenSquilla's normal dotenv bootstrap away from both the checkout
-    // and the user's profile.  The editable virtualenv still resolves the
-    // package by absolute path, while the fixture gets a private home/cwd.
+    // and the user's profile. Pin imports to this checkout while the fixture
+    // gets a private home/cwd, regardless of editable virtualenv metadata.
     cwd: stateDir,
     env: Object.assign(
       Object.fromEntries(
@@ -162,12 +170,14 @@ export async function startRealGoalGateway(options: {
         TEMP: tempDir,
         TMP: tempDir,
         PYTHONNOUSERSITE: '1',
+        PYTHONPATH: join(repoRoot, 'src'),
         OPENSQUILLA_WEBUI_GOAL_E2E_PORT: String(port),
         OPENSQUILLA_WEBUI_GOAL_E2E_STATE: stateDir,
         OPENSQUILLA_WEBUI_GOAL_E2E_EVENT_LOG: eventLog,
         OPENSQUILLA_WEBUI_GOAL_E2E_RELEASE_FIRST: firstReleaseFile,
         OPENSQUILLA_WEBUI_GOAL_E2E_RELEASE: secondReleaseFile,
         OPENSQUILLA_WEBUI_GOAL_E2E_SCENARIO: options.scenario || 'continuation',
+        OPENSQUILLA_WEBUI_GOAL_E2E_AUTH_MODE: options.authMode || 'none',
         OPENSQUILLA_WEBUI_GOAL_E2E_ORIGIN: options.webuiOrigin,
         OPENSQUILLA_HOME: stateDir,
         OPENSQUILLA_STATE_DIR: stateDir,
@@ -175,6 +185,9 @@ export async function startRealGoalGateway(options: {
         OPENSQUILLA_OPENROUTER_LIVE_PRICING: '0',
         OPENSQUILLA_MEMORY_DREAM_DISABLED: '1',
         OPENSQUILLA_PRIVACY_DISABLE_NETWORK_OBSERVABILITY: 'true',
+        // This is the only inherited OpenSquilla policy. Never spread the
+        // developer environment or allow credentials into the real fixture.
+        OPENSQUILLA_GATEWAY_WS_TRANSPORT_FLOW_ENABLED: String(flowEnabled),
       },
     ),
     stdio: 'pipe',
@@ -223,6 +236,7 @@ export async function startRealGoalGateway(options: {
 
   return {
     wsUrl: `ws://127.0.0.1:${port}/ws`,
+    flowEnabled,
     async readProviderEvents() {
       let raw = ''
       try {

@@ -5,6 +5,7 @@ import type {
 } from '@/types/chat'
 import {
   SessionReadSessionMissingError,
+  SessionReadFailure,
   type SessionReadActivity,
   type SessionReadLease,
   type SessionReadLeaseReader,
@@ -19,6 +20,7 @@ import {
   SESSION_PHASE_ATTEMPT_BUDGET_MS,
   isRpcAbort,
   type SessionBootstrapPhaseContext,
+  type SessionPhaseResult,
 } from '@/composables/chat/sessionBootstrapContract'
 
 export interface UseChatSessionSubscriptionOptions {
@@ -47,10 +49,16 @@ export interface UseChatSessionSubscriptionOptions {
     taskId: string
     startedAt?: number | string | null
   }) => boolean | void
-  loadHistory: () => void | Promise<unknown>
+  loadHistory: () => void | Promise<SessionPhaseResult | void>
+  reconcileHistory?: () => Promise<SessionPhaseResult | void>
   resetStreamIdleTimer: () => void
   resetStreamLiveTurnState: () => void
+  /** Retire maintenance owned by a replaced process before replaying its successor. */
+  onStreamGenerationReset?: () => void
   onLiveSnapshot?: (snapshot: SessionReadSnapshot) => void
+  onReadStarted?: () => void
+  onSnapshotInstalled?: () => void
+  onReconciliationInstalled?: () => Promise<void>
   onAuthoritativeIdle?: () => void
   onRunModeLock?: (lock: SessionReadRunModeLock) => void
   beginSessionMetadataResolution?: (key: string) => number
@@ -134,6 +142,7 @@ function waitForMetadataRetry<T>(
 
 export function useChatSessionSubscription(options: UseChatSessionSubscriptionOptions) {
   const isHydrating = ref(false)
+  const metadataRecoveryError = ref<unknown>(null)
   const streamGeneration = ref<string | null>(null)
   const conversationRuntime = options.conversationRuntime
   let activeSubscriptionController: AbortController | null = null
@@ -155,6 +164,7 @@ export function useChatSessionSubscription(options: UseChatSessionSubscriptionOp
 
   function subscribeSession(
     bootstrap?: SessionBootstrapPhaseContext,
+    reconciliation = false,
   ): Promise<SessionSubscriptionOutcome> {
     if (!options.sessionKey.value) return Promise.resolve(UNAVAILABLE_SUBSCRIPTION)
     if (options.ownershipHydrationRequired?.() !== false) {
@@ -170,7 +180,7 @@ export function useChatSessionSubscription(options: UseChatSessionSubscriptionOp
     const relayAbort = () => controller.abort()
     if (bootstrap?.signal.aborted) controller.abort()
     else bootstrap?.signal.addEventListener('abort', relayAbort, { once: true })
-    return runSubscription(lease, key, sequence, controller.signal, bootstrap)
+    return runSubscription(lease, key, sequence, controller.signal, bootstrap, reconciliation)
       .finally(() => {
         bootstrap?.signal.removeEventListener('abort', relayAbort)
         if (activeSubscriptionController === controller) {
@@ -202,6 +212,7 @@ export function useChatSessionSubscription(options: UseChatSessionSubscriptionOp
     metadata: SessionReadMetadata,
     activity: SessionReadActivity = 'unknown',
   ): SessionSubscriptionOutcome {
+    metadataRecoveryError.value = null
     if (metadataGeneration !== undefined) {
       options.onSessionMetadata?.(key, metadataGeneration, metadata)
     }
@@ -339,6 +350,7 @@ export function useChatSessionSubscription(options: UseChatSessionSubscriptionOp
         !isCurrentSubscription(lease, key, sequence, signal)
         || metadataHydration !== metadataHydrationSequence
       ) return
+      metadataRecoveryError.value = cause
       if (metadataGeneration !== undefined) {
         options.onSessionMetadataError?.(key, metadataGeneration)
       }
@@ -355,6 +367,7 @@ export function useChatSessionSubscription(options: UseChatSessionSubscriptionOp
     sequence: number,
     signal: AbortSignal,
     bootstrap?: SessionBootstrapPhaseContext,
+    reconciliation = false,
   ): Promise<SessionSubscriptionOutcome> {
     const metadataHydration = ++metadataHydrationSequence
     const metadataGeneration = options.beginSessionMetadataResolution?.(key)
@@ -363,9 +376,27 @@ export function useChatSessionSubscription(options: UseChatSessionSubscriptionOp
       if (signal.aborted || !isCurrentSubscription(lease, key, sequence, signal)) {
         return { ...UNAVAILABLE_SUBSCRIPTION, cancelled: true }
       }
-      const live = await lease.live
+      options.onReadStarted?.()
+      const live = await (reconciliation ? lease.reconcile() : lease.live)
       if (!isCurrentSubscription(lease, key, sequence, signal)) {
         return { ...UNAVAILABLE_SUBSCRIPTION, cancelled: true }
+      }
+      async function finishInstallation() {
+        await live.confirmInstalled?.()
+        if (!isCurrentSubscription(lease, key, sequence, signal)) throw localAbortError('Snapshot owner changed.')
+        options.onSnapshotInstalled?.()
+        // Projection/tail application can itself detect loss. Recheck the
+        // adapter's exact invalidation fence after that final consumer step.
+        live.assertInstalledCurrent?.()
+        if (!isCurrentSubscription(lease, key, sequence, signal)) throw localAbortError('Snapshot owner changed.')
+      }
+      if (live.reloadRequired === 'generationChanged') {
+        // The replacement can be idle and have no event carrying its new
+        // generation. Explicitly retire old owners before installing any new
+        // snapshot; otherwise its maintenance would remain busy indefinitely.
+        options.onStreamGenerationReset?.()
+        syncCursor(conversationRuntime.reset(cursor()))
+        options.resetStreamLiveTurnState()
       }
       let snapshotTaskLive = false
       const snapshot = live.snapshot
@@ -378,19 +409,31 @@ export function useChatSessionSubscription(options: UseChatSessionSubscriptionOp
         snapshotTaskLive = Boolean(snapshotTaskId) && !settledSnapshot
       }
       if (live.reloadRequired) {
-        if (live.reloadRequired === 'generationChanged') {
-          syncCursor(conversationRuntime.reset(cursor()))
-          options.resetStreamLiveTurnState()
+        if (!reconciliation) void options.loadHistory()
+      }
+      // A live snapshot cannot recover a terminal answer whose streaming
+      // projection has already been cleared. Refresh durable history on every
+      // explicit reconciliation, retaining the displayed window while it loads.
+      if (reconciliation) {
+        const history = await (options.reconcileHistory?.() ?? options.loadHistory())
+        if (history && !history.ok) {
+          throw history.error ?? new SessionReadFailure('unavailable', 'History reconciliation is incomplete.', true)
         }
-        void options.loadHistory()
+      }
+      if (!isCurrentSubscription(lease, key, sequence, signal)) {
+        return { ...UNAVAILABLE_SUBSCRIPTION, cancelled: true }
       }
       if (live.initialMetadata.hydrationComplete) {
-        return applyHydratedSubscriptionState(
+        const outcome = applyHydratedSubscriptionState(
           key,
           metadataGeneration,
           live.initialMetadata,
           live.activity,
         )
+        if (reconciliation) await options.onReconciliationInstalled?.()
+        if (!isCurrentSubscription(lease, key, sequence, signal)) return { ...UNAVAILABLE_SUBSCRIPTION, cancelled: true }
+        await finishInstallation()
+        return outcome
       }
       if (options.ownershipHydrationRequired?.() !== false) {
         options.taskOwnership?.applySnapshot(
@@ -416,6 +459,7 @@ export function useChatSessionSubscription(options: UseChatSessionSubscriptionOp
         || options.hasActiveInterrupt.value
         || live.activity === 'foreground'
       )
+      await finishInstallation()
       return {
         authoritative: true,
         live: taskOrInterruptLive || live.activity === 'background',
@@ -497,6 +541,7 @@ export function useChatSessionSubscription(options: UseChatSessionSubscriptionOp
         options.onSessionMetadataError?.(key, metadataGeneration)
       }
       if (isCurrent()) {
+        metadataRecoveryError.value = cause
         console.warn(
           'Session metadata recovery failed:',
           cause instanceof Error ? cause.message : cause,
@@ -518,6 +563,7 @@ export function useChatSessionSubscription(options: UseChatSessionSubscriptionOp
     activeSubscriptionController = null
     activeMetadataController?.abort()
     activeMetadataController = null
+    metadataRecoveryError.value = null
     isHydrating.value = false
   }
 
@@ -579,9 +625,11 @@ export function useChatSessionSubscription(options: UseChatSessionSubscriptionOp
 
   return {
     isHydrating,
+    metadataRecoveryError,
     streamGeneration,
     observeStreamGeneration,
     subscribeSession,
+    reconcileSession: (bootstrap?: SessionBootstrapPhaseContext) => subscribeSession(bootstrap, true),
     retrySessionMetadata,
     unsubscribeSession,
     cancelActiveSubscription,

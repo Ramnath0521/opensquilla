@@ -46,6 +46,9 @@ def _enable_telemetry_for_test(monkeypatch) -> None:
     monkeypatch.delenv("GITHUB_ACTIONS", raising=False)
     monkeypatch.delenv("PYTEST_CURRENT_TEST", raising=False)
     monkeypatch.delenv(install_telemetry.TELEMETRY_TESTING_ENV, raising=False)
+    monkeypatch.delenv("CI", raising=False)
+    monkeypatch.delenv(network_policy.DO_NOT_TRACK_ENV, raising=False)
+    monkeypatch.delenv(network_policy.PRODUCT_ANALYTICS_DISABLED_ENV, raising=False)
 
 
 async def test_records_only_completed_interactive_turns(tmp_path, monkeypatch):
@@ -134,6 +137,89 @@ async def test_opt_out_does_not_create_daily_row(tmp_path, monkeypatch):
         )
         assert recorded is False
         assert await storage.list_pending_daily_usage(before_day="9999-12-31") == []
+    finally:
+        await storage.close()
+
+
+@pytest.mark.parametrize(
+    ("env_name", "config_field"),
+    [
+        ("CI", None),
+        (network_policy.DO_NOT_TRACK_ENV, None),
+        (network_policy.PRODUCT_ANALYTICS_DISABLED_ENV, None),
+        (network_policy.NETWORK_OBSERVABILITY_DISABLED_ENV, None),
+        (network_policy.LEGACY_TELEMETRY_DISABLED_ENV, None),
+        (network_policy.LEGACY_UPDATE_CHECK_DISABLED_ENV, None),
+        (None, "disable_network_observability"),
+        (None, "reliability_diagnostics_enabled"),
+        (None, "product_analytics_enabled"),
+    ],
+)
+async def test_reporting_veto_pauses_daily_collection_and_preserves_pending_usage(
+    tmp_path, monkeypatch, env_name, config_field
+):
+    _enable_telemetry_for_test(monkeypatch)
+    monkeypatch.setenv(
+        usage_telemetry.USAGE_TELEMETRY_ENDPOINT_ENV, "https://example.test/v1/usage"
+    )
+    config = _config(tmp_path)
+    if env_name is not None:
+        monkeypatch.setenv(env_name, "true")
+    else:
+        setattr(config.privacy, config_field, config_field == "disable_network_observability")
+    identity_calls: list[Any] = []
+    payloads: list[dict[str, Any]] = []
+
+    def ensure_id(*, config):
+        identity_calls.append(config)
+        return "synthetic-install-id"
+
+    async def fake_post(endpoint, payload):
+        payloads.append(payload)
+        return True, None
+
+    monkeypatch.setattr(install_telemetry, "ensure_install_telemetry_id", ensure_id)
+    monkeypatch.setattr(usage_telemetry, "_post_payload", fake_post)
+    storage = await SessionStorage.open(str(tmp_path / "sessions.db"))
+    try:
+        assert not await usage_telemetry.record_completed_turn(
+            storage,
+            config=config,
+            run_kind="default",
+            done_event=_done(),
+            now=datetime(2026, 7, 20, 12, tzinfo=UTC),
+        )
+        assert await storage.list_pending_daily_usage(before_day="9999-12-31") == []
+
+        await storage.record_daily_usage(
+            day="2026-07-19",
+            input_tokens=100,
+            output_tokens=20,
+            cached_tokens=30,
+            cache_write_tokens=4,
+            updated_at=1,
+        )
+        retained = await storage.list_pending_daily_usage(before_day="2026-07-21")
+        assert await usage_telemetry.upload_pending_daily_usage(
+            storage, config=config, today=date(2026, 7, 21)
+        ) == 0
+        assert identity_calls == []
+        assert payloads == []
+        assert not (tmp_path / "state" / "install_telemetry.json").exists()
+        assert await storage.list_pending_daily_usage(before_day="2026-07-21") == retained
+
+        if env_name is not None:
+            monkeypatch.delenv(env_name)
+        else:
+            setattr(config.privacy, config_field, config_field != "disable_network_observability")
+        assert await usage_telemetry.upload_pending_daily_usage(
+            storage, config=config, today=date(2026, 7, 21)
+        ) == 1
+        assert identity_calls == [config]
+        assert len(payloads) == 1
+        assert payloads[0]["day"] == "2026-07-19"
+        assert payloads[0]["input_tokens"] == 100
+        assert await storage.list_pending_daily_usage(before_day="2026-07-21") == []
     finally:
         await storage.close()
 
@@ -583,3 +669,189 @@ async def test_post_uses_event_id_as_idempotency_key(monkeypatch):
             "headers": {"Idempotency-Key": "stable-event-id"},
         }
     ]
+
+
+@pytest.mark.parametrize("disabled,child", [(True, False), (False, True)])
+async def test_standalone_veto_does_not_create_usage_store(tmp_path, monkeypatch, disabled, child):
+    _enable_telemetry_for_test(monkeypatch)
+    if child:
+        monkeypatch.setenv("OPENSQUILLA_CODETASK_CHILD", "1")
+    config = _config(tmp_path, disabled=disabled)
+    runtime = usage_telemetry.StandaloneUsageTelemetry(config=config, legacy_storage=None)
+    runtime.start()
+    await runtime.record_turn(run_kind="default", done_event=_done())
+    await runtime.close()
+    assert not usage_telemetry.standalone_daily_usage_path(config).exists()
+    assert not (tmp_path / "state" / "install_telemetry.json").exists()
+
+
+async def test_standalone_policy_can_be_enabled_then_disabled_live(tmp_path, monkeypatch):
+    from opensquilla.observability.daily_usage_store import DailyUsageStore
+
+    _enable_telemetry_for_test(monkeypatch)
+    config = _config(tmp_path, disabled=True)
+    runtime = usage_telemetry.StandaloneUsageTelemetry(config=config, legacy_storage=None)
+    await runtime.record_turn(run_kind="default", done_event=_done())
+    assert not usage_telemetry.standalone_daily_usage_path(config).exists()
+    config.privacy.disable_network_observability = False
+    await runtime.record_turn(run_kind="default", done_event=_done())
+    config.privacy.disable_network_observability = True
+    await runtime.record_turn(run_kind="default", done_event=_done())
+    await runtime.close()
+    storage = await DailyUsageStore.open(usage_telemetry.standalone_daily_usage_path(config))
+    try:
+        rows = await storage.list_pending_daily_usage(before_day="9999-12-31")
+        assert len(rows) == 1
+        assert rows[0]["conversation_turns"] == 1
+    finally:
+        await storage.close()
+
+
+async def test_gateway_loop_drains_standalone_rows_despite_failed_legacy_store(
+    tmp_path, monkeypatch,
+):
+    from opensquilla.observability.daily_usage_store import DailyUsageStore
+
+    _enable_telemetry_for_test(monkeypatch)
+    config = _config(tmp_path)
+    standalone = await DailyUsageStore.open(usage_telemetry.standalone_daily_usage_path(config))
+    await usage_telemetry.record_completed_turn(
+        standalone, config=config, run_kind="default", done_event=_done(),
+        now=datetime(2020, 1, 1, tzinfo=UTC),
+    )
+    await standalone.close()
+    sent = []
+
+    class BrokenLegacy:
+        async def list_pending_daily_usage(self, *, before_day):
+            raise RuntimeError("synthetic unavailable legacy database")
+
+    async def post(endpoint, payload):
+        sent.append(payload)
+        return True, None
+
+    async def stop_after_first_cycle(_delay):
+        raise asyncio.CancelledError
+
+    monkeypatch.setattr(usage_telemetry, "_post_payload", post)
+    monkeypatch.setattr(usage_telemetry.asyncio, "sleep", stop_after_first_cycle)
+    with pytest.raises(asyncio.CancelledError):
+        await usage_telemetry.run_daily_usage_upload_loop(BrokenLegacy(), config=config)
+    assert len(sent) == 1
+    assert sent[0]["day"] == "2020-01-01"
+    assert sent[0]["conversation_turns"] == 1
+    assert sent[0]["input_tokens"] == 100
+    restored = await DailyUsageStore.open(usage_telemetry.standalone_daily_usage_path(config))
+    try:
+        assert await restored.list_pending_daily_usage(before_day="9999-12-31") == []
+    finally:
+        await restored.close()
+
+
+async def test_standalone_close_preserves_usage_after_upload_timeout(tmp_path, monkeypatch):
+    from opensquilla.observability.daily_usage_store import DailyUsageStore
+
+    _enable_telemetry_for_test(monkeypatch)
+    config = _config(tmp_path)
+    path = usage_telemetry.standalone_daily_usage_path(config)
+    storage = await DailyUsageStore.open(path)
+    await usage_telemetry.record_completed_turn(
+        storage, config=config, run_kind="default", done_event=_done(),
+        now=datetime(2020, 1, 1, tzinfo=UTC),
+    )
+    await storage.close()
+    entered = asyncio.Event()
+    cancelled = asyncio.Event()
+    close_timeout = asyncio.timeout(None)
+
+    def timeout_after_upload_started(delay):
+        assert delay == 0.05
+        return close_timeout
+
+    async def blocked_post(endpoint, payload):
+        entered.set()
+        # Exercise cancellation of an active request without charging cold
+        # SQLite and identity initialization to this synthetic short deadline.
+        close_timeout.reschedule(asyncio.get_running_loop().time() + 0.05)
+        try:
+            await asyncio.Event().wait()
+        finally:
+            cancelled.set()
+
+    monkeypatch.setattr(usage_telemetry, "_post_payload", blocked_post)
+    monkeypatch.setattr(usage_telemetry, "STANDALONE_CLOSE_TIMEOUT_SECONDS", 0.05)
+    monkeypatch.setattr(
+        usage_telemetry, "asyncio",
+        SimpleNamespace(**(vars(asyncio) | {"timeout": timeout_after_upload_started})),
+    )
+    runtime = usage_telemetry.StandaloneUsageTelemetry(config=config, legacy_storage=None)
+    await asyncio.wait_for(runtime.close(), timeout=5)
+    assert entered.is_set()
+    assert cancelled.is_set()
+    restored = await DailyUsageStore.open(path)
+    try:
+        rows = await restored.list_pending_daily_usage(before_day="9999-12-31")
+        assert len(rows) == 1
+        assert rows[0]["uploaded_at"] is None
+    finally:
+        await restored.close()
+
+
+async def test_standalone_starts_install_once_and_waits_for_worker(tmp_path, monkeypatch):
+    _enable_telemetry_for_test(monkeypatch)
+    config = _config(tmp_path)
+    started = []
+    joined = []
+
+    class Worker:
+        def join(self, timeout):
+            joined.append(timeout)
+
+    def start_install(*, config):
+        started.append(config)
+        return Worker()
+
+    monkeypatch.setattr(install_telemetry, "start_background_install_telemetry", start_install)
+    runtime = usage_telemetry.StandaloneUsageTelemetry(config=config, legacy_storage=None)
+    runtime.start()
+    runtime.start()
+    await runtime.close()
+    await runtime.close()
+    assert started == [config]
+    assert joined == [usage_telemetry.STANDALONE_CLOSE_TIMEOUT_SECONDS]
+
+
+async def test_standalone_drains_custom_legacy_database_without_changing_its_identity(
+    tmp_path, monkeypatch,
+):
+    from opensquilla.observability.daily_usage_store import DailyUsageStore
+
+    _enable_telemetry_for_test(monkeypatch)
+    config = _config(tmp_path)
+    legacy = await SessionStorage.open(str(tmp_path / "custom-sessions.db"))
+    sidecar = await DailyUsageStore.open(usage_telemetry.standalone_daily_usage_path(config))
+    old_id = await legacy.ensure_daily_usage_store_id()
+    for storage in (legacy, sidecar):
+        await usage_telemetry.record_completed_turn(
+            storage, config=config, run_kind="default", done_event=_done(),
+            now=datetime(2020, 1, 1, tzinfo=UTC),
+        )
+    await sidecar.close()
+    sent = []
+
+    async def post(endpoint, payload):
+        sent.append(payload)
+        return True, None
+
+    monkeypatch.setattr(usage_telemetry, "_post_payload", post)
+    runtime = usage_telemetry.StandaloneUsageTelemetry(config=config, legacy_storage=legacy)
+    try:
+        await runtime.close()
+        assert len(sent) == 2
+        assert sent[0]["event_id"] == usage_telemetry._daily_event_id(old_id, "2020-01-01")
+        assert sent[0]["event_id"] != sent[1]["event_id"]
+        assert {row["conversation_turns"] for row in sent} == {1}
+        assert await legacy.ensure_daily_usage_store_id() == old_id
+        assert await legacy.list_pending_daily_usage(before_day="9999-12-31") == []
+    finally:
+        await legacy.close()

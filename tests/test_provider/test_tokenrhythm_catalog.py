@@ -1,5 +1,9 @@
 from __future__ import annotations
 
+import json
+import subprocess
+import sys
+from collections import OrderedDict
 from decimal import Decimal
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -156,6 +160,76 @@ def test_tokenrhythm_authority_identity_normalizes_equivalent_official_roots() -
     ) is None
 
 
+def test_private_catalog_identities_survive_process_restart_and_isolate_secrets(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = tokenrhythm_catalog_module
+    kwargs = {
+        "provider": "tokenrhythm",
+        "base_url": "https://tokenrhythm.studio/v1",
+        "api_key": "synthetic-restart-key",
+    }
+    authority = tokenrhythm_authority_identity(**kwargs)
+    assert authority is not None
+    transport = module.tokenrhythm_transport_fingerprint(
+        authority, proxy="http://user:synthetic-password@proxy.test:8080",
+    )
+    monkeypatch.setattr(module, "_IDENTITY_MEMO", OrderedDict())
+    monkeypatch.setattr(module, "_IDENTITY_MEMO_KEY", b"replacement-process-key" * 2)
+    assert tokenrhythm_authority_identity(**kwargs) == authority
+    # A fresh interpreter also creates a new random memo key.
+    code = (
+        "import json; from opensquilla.provider.tokenrhythm_catalog import "
+        "tokenrhythm_authority_identity, tokenrhythm_transport_fingerprint; "
+        f"authority = tokenrhythm_authority_identity(**{kwargs!r}); "
+        "print(json.dumps([authority, tokenrhythm_transport_fingerprint(authority, "
+        "proxy='http://user:synthetic-password@proxy.test:8080')]))"
+    )
+    restarted = subprocess.run(
+        [sys.executable, "-c", code], check=True, capture_output=True, text=True,
+    )
+    assert json.loads(restarted.stdout) == [authority, transport]
+    assert tokenrhythm_authority_identity(**{
+        **kwargs, "api_key": "synthetic-rotated-key",
+    }) != authority
+    assert module.tokenrhythm_transport_fingerprint(
+        authority, proxy="http://user:rotated-password@proxy.test:8080",
+    ) != transport
+    assert module._identity_digest("domain-a", "x\0y", "z") != (
+        module._identity_digest("domain-a", "x", "y\0z")
+    )
+    assert module._identity_digest("domain-a", "same") != (
+        module._identity_digest("domain-b", "same")
+    )
+    assert "synthetic" not in repr(module._IDENTITY_MEMO)
+
+
+def test_private_catalog_identity_memo_is_bounded_and_avoids_repeated_kdf(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = tokenrhythm_catalog_module
+    monkeypatch.setattr(module, "_IDENTITY_MEMO", OrderedDict())
+    calls = 0
+
+    def derive(*_args: Any, **_kwargs: Any) -> bytes:
+        nonlocal calls
+        calls += 1
+        return calls.to_bytes(32, "big")
+
+    monkeypatch.setattr(module.hashlib, "pbkdf2_hmac", derive)
+    first = module._identity_digest("memo", "synthetic-0")
+    for index in range(1, 256):
+        module._identity_digest("memo", f"synthetic-{index}")
+    assert module._identity_digest("memo", "synthetic-0") == first
+    assert calls == 256
+    module._identity_digest("memo", "synthetic-256")
+    assert len(module._IDENTITY_MEMO) == 256
+    assert module._identity_digest("memo", "synthetic-0") == first
+    module._identity_digest("memo", "synthetic-1")  # Evicted least-recent entry.
+    assert calls == 258
+    assert "synthetic" not in repr(module._IDENTITY_MEMO)
+
+
 def test_deployment_limits_and_capabilities_are_isolated_by_authority() -> None:
     published = parse_tokenrhythm_published({"data": [_published_row()]})
     declared_a = parse_tokenrhythm_declared(
@@ -223,6 +297,8 @@ def test_deployment_limits_and_capabilities_are_isolated_by_authority() -> None:
         131_072,
     )
     assert (limits_b.context_window, limits_b.max_output_tokens) == (64_000, 8_192)
+    assert limits_a.context_window_known is True
+    assert limits_b.context_window_known is True
     caps_a = catalog.resolve_deployment_capabilities(
         "qwen3.8-max",
         provider="tokenrhythm",
@@ -294,8 +370,10 @@ def test_custom_tokenrhythm_deployment_never_uses_website_projection() -> None:
     )
     assert (official.context_window, official.max_output_tokens) == (900_000, 77_777)
     assert official.max_output_tokens_known is True
+    assert official.context_window_known is True
     assert (custom.context_window, custom.max_output_tokens) == (200_000, 16_384)
     assert custom.max_output_tokens_known is False
+    assert custom.context_window_known is False
     assert custom_caps.supports_tools is True
     assert custom_caps.supports_vision is False
 

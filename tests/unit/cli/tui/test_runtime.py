@@ -7,6 +7,7 @@ from typing import Any
 
 import pytest
 
+from opensquilla.cli.chat.user_input import GatewayUserInput
 from opensquilla.cli.tui.adapters.runtime_helpers import classify_chat_input
 from opensquilla.cli.tui.backend.contracts import (
     TuiInputKind,
@@ -97,6 +98,154 @@ async def _wait_until(predicate: Callable[[], bool], *, timeout: float = 2.0) ->
         await asyncio.sleep(0)
 
 
+@pytest.mark.asyncio
+async def test_question_reply_bypasses_active_turn_queue_and_steering() -> None:
+    inputs: asyncio.Queue[str | None] = asyncio.Queue()
+    surface = _FakeSurface(inputs)
+    started = asyncio.Event()
+    answered = asyncio.Event()
+    dispatched: list[str] = []
+    answers: list[str] = []
+
+    async def dispatch(text: str) -> bool:
+        dispatched.append(text)
+        started.set()
+        await answered.wait()
+        return True
+
+    async def answer(text: str) -> bool:
+        if not started.is_set():
+            return False
+        answers.append(text)
+        answered.set()
+        return True
+
+    async def steer(_text: str) -> bool:
+        raise AssertionError("question replies must bypass steering")
+
+    runtime = asyncio.create_task(run_tui_runtime(
+        dispatch=dispatch,
+        surface_factory=_surface_factory(surface),
+        config=_runtime_config(concurrent_input_during_turn=True),
+        hooks=_runtime_hooks(on_answer_user_input=answer, on_steer_active_turn=steer),
+    ))
+    inputs.put_nowait("task")
+    await asyncio.wait_for(started.wait(), timeout=2)
+    inputs.put_nowait("blue")
+    await asyncio.wait_for(answered.wait(), timeout=2)
+    inputs.put_nowait(None)
+    state = await asyncio.wait_for(runtime, timeout=2)
+    assert dispatched == ["task"]
+    assert answers == ["blue"]
+    assert state.pending_size == 0
+
+
+@pytest.mark.asyncio
+async def test_cancel_external_question_without_local_turn() -> None:
+    inputs: asyncio.Queue[str | None] = asyncio.Queue()
+    surface = _FakeSurface(inputs)
+    cancelled = asyncio.Event()
+
+    async def cancel() -> bool:
+        cancelled.set()
+        return True
+
+    runtime = asyncio.create_task(run_tui_runtime(
+        dispatch=lambda _text: asyncio.sleep(0, result=True),
+        surface_factory=_surface_factory(surface),
+        config=_runtime_config(concurrent_input_during_turn=True),
+        hooks=_runtime_hooks(on_cancel_user_input=cancel),
+    ))
+    await _wait_until(lambda: bool(surface.cancel_callbacks))
+    surface.cancel_callbacks[0]()
+    await asyncio.wait_for(cancelled.wait(), timeout=2)
+    inputs.put_nowait(None)
+    await asyncio.wait_for(runtime, timeout=2)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("exit_input", ["/exit", "exit", "quit", ":q", None])
+@pytest.mark.parametrize("question_during_exit", [False, True])
+@pytest.mark.parametrize("abort_receipt_lost", [False, True])
+async def test_exit_cancels_pending_question_without_submitting_answer(
+    monkeypatch: pytest.MonkeyPatch,
+    exit_input: str | None,
+    question_during_exit: bool,
+    abort_receipt_lost: bool,
+) -> None:
+    monkeypatch.setattr(
+        "opensquilla.cli.tui.backend.runtime._ABORT_DRAIN_TIMEOUT_S", 0.01,
+    )
+    inputs: asyncio.Queue[str | None] = asyncio.Queue()
+    surface = _FakeSurface(inputs)
+    started = asyncio.Event()
+    show_question = asyncio.Event()
+    question_ready = asyncio.Event()
+    cancellation_checked = asyncio.Event()
+    turn_cancelled = asyncio.Event()
+    dispatched: list[str] = []
+    aborts: list[str] = []
+
+    async def submit(_key: str, **_kwargs: Any) -> dict[str, Any]:
+        raise AssertionError("exit must never be submitted as a questionnaire answer")
+
+    questions = GatewayUserInput(submit=submit, write=surface.write_through)
+    questions.reset("agent:main:cli:exit-test", {})
+
+    async def dispatch(text: str) -> bool:
+        dispatched.append(text)
+        if text != "task":
+            return False
+        started.set()
+        if question_during_exit:
+            await show_question.wait()
+        await questions.observe({"event": "session.event.tool_result", "result": {
+            "kind": "user_input", "status": "input_required",
+            "request_id": "question-exit", "run_id": "task-exit",
+            "clarify_schema": {"fields": [{"name": "label", "prompt": "Which label?"}]},
+        }})
+        question_ready.set()
+        try:
+            await asyncio.Event().wait()
+        finally:
+            turn_cancelled.set()
+        return True
+
+    async def cancel_question() -> bool:
+        cancellation_checked.set()
+        if not questions.pending:
+            return False
+        aborts.append("task-exit")
+        if abort_receipt_lost:
+            await asyncio.Event().wait()
+        await questions.observe({"event": "session.event.done", "turn_id": "task-exit"})
+        return True
+
+    runtime = asyncio.create_task(run_tui_runtime(
+        dispatch=dispatch,
+        surface_factory=_surface_factory(surface),
+        config=_runtime_config(classify_input=lambda text: classify_chat_input(
+            text, surface=Surface.CLI_GATEWAY,
+        )),
+        hooks=_runtime_hooks(
+            on_answer_user_input=questions.answer,
+            on_cancel_user_input=cancel_question,
+        ),
+    ))
+    inputs.put_nowait("task")
+    await asyncio.wait_for(started.wait(), timeout=2)
+    if not question_during_exit:
+        await asyncio.wait_for(question_ready.wait(), timeout=2)
+    inputs.put_nowait(exit_input)
+    if question_during_exit:
+        await asyncio.wait_for(cancellation_checked.wait(), timeout=2)
+        show_question.set()
+    await asyncio.wait_for(runtime, timeout=2)
+    assert turn_cancelled.is_set()
+    assert aborts == ["task-exit"]
+    assert dispatched == ["task"] + ([exit_input] if exit_input is not None else [])
+
+
 def _runtime_config(**kwargs: Any) -> TuiRuntimeConfig:
     return TuiRuntimeConfig(task_name="chat-turn-test", **kwargs)
 
@@ -107,6 +256,59 @@ def _runtime_hooks(**kwargs: Any) -> TuiRuntimeHooks:
         on_queued_turn_start=_queued_echo,
         **kwargs,
     )
+
+
+@pytest.mark.asyncio
+async def test_surface_ready_runs_only_after_surface_context_enters() -> None:
+    inputs: asyncio.Queue[str | None] = asyncio.Queue()
+    inputs.put_nowait(None)
+    surface = _FakeSurface(inputs)
+    observations: list[str] = []
+
+    @asynccontextmanager
+    async def factory() -> AsyncIterator[_FakeSurface]:
+        observations.append("entered")
+        yield surface
+
+    async def ready() -> None:
+        observations.append("ready")
+
+    await run_tui_runtime(
+        dispatch=lambda _value: asyncio.sleep(0, result=True),
+        surface_factory=factory,
+        config=_runtime_config(),
+        hooks=_runtime_hooks(on_surface_ready=ready),
+    )
+
+    assert observations == ["entered", "ready"]
+
+
+@pytest.mark.parametrize("activity_fails", [False, True])
+async def test_user_activity_observes_input_without_content(activity_fails: bool) -> None:
+    inputs: asyncio.Queue[str | None] = asyncio.Queue()
+    for value in (" ", "synthetic task", "/help", None):
+        inputs.put_nowait(value)
+    surface = _FakeSurface(inputs)
+    observed: list[str] = []
+    dispatched: list[str] = []
+
+    async def activity() -> None:
+        observed.append("active")
+        if activity_fails:
+            raise RuntimeError("synthetic unavailable")
+
+    async def dispatch(value: str) -> bool:
+        dispatched.append(value)
+        return True
+
+    await run_tui_runtime(
+        dispatch=dispatch,
+        surface_factory=_surface_factory(surface),
+        config=_runtime_config(concurrent_input_during_turn=False),
+        hooks=_runtime_hooks(on_user_activity=activity),
+    )
+    assert observed == ["active", "active"]
+    assert dispatched == ["synthetic task", "/help"]
 
 
 @pytest.mark.asyncio
@@ -915,7 +1117,7 @@ async def test_runtime_ambiguous_steer_retries_with_same_identity() -> None:
 
 
 @pytest.mark.asyncio
-async def test_runtime_legacy_method_missing_steer_uses_visible_queue() -> None:
+async def test_runtime_method_missing_steer_uses_visible_queue() -> None:
     inputs: asyncio.Queue[Any] = asyncio.Queue()
     surface = _FakeSurface(inputs)
     state = TuiRuntimeState()
@@ -932,7 +1134,7 @@ async def test_runtime_legacy_method_missing_steer_uses_visible_queue() -> None:
         return True
 
     async def _missing(_text: str) -> bool:
-        raise MethodMissingError("sessions.steer is unavailable")
+        raise MethodMissingError("sessions.steer.v2 is unavailable")
 
     task = asyncio.create_task(
         run_tui_runtime(
@@ -1432,8 +1634,10 @@ async def test_gateway_routing_does_not_overtake_typed_ahead_input() -> None:
     await _wait_until(lambda: state.pending_items == ("second",))
     await inputs.put("/routing ensemble")
     await _wait_until(
-        lambda: "/routing ensemble" in dispatched
-        or any("requires an empty input queue" in notice for notice in notices)
+        lambda: (
+            "/routing ensemble" in dispatched
+            or any("requires an empty input queue" in notice for notice in notices)
+        )
     )
 
     assert "/routing ensemble" not in dispatched
@@ -1506,8 +1710,10 @@ async def test_standalone_routing_does_not_overtake_pending_ambiguous_steer() ->
 
     await inputs.put("/routing ensemble")
     await _wait_until(
-        lambda: "/routing ensemble" in dispatched
-        or any("requires an empty input queue" in notice for notice in notices)
+        lambda: (
+            "/routing ensemble" in dispatched
+            or any("requires an empty input queue" in notice for notice in notices)
+        )
     )
 
     assert "/routing ensemble" not in dispatched

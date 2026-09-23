@@ -3,14 +3,14 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import inspect
 from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
-from typing import Any, Protocol, cast
+from typing import Any, Protocol
 
 import structlog
 
-from opensquilla.agent_ids import normalize_agent_id
 from opensquilla.application.session_reset import (
     GoalLeasePort,
     PromptCacheInvalidationPort,
@@ -18,44 +18,32 @@ from opensquilla.application.session_reset import (
     SessionEpochPort,
     SessionQuiescencePort,
     SessionResetApplication,
-    SessionResetFlushExecutionError,
-    SessionResetFlushReceipt,
-    SessionResetFlushSafetyError,
-    SessionResetFlushUnavailableError,
     SessionResetForcePermissionError,
     SessionResetLockPort,
-    SessionResetMemoryAssessment,
-    SessionResetMemoryPort,
     SessionResetNotFoundError,
     SessionResetResult,
     SessionResetRotation,
     SessionResetSnapshot,
     SessionResetStorePort,
     SessionResetUnavailableError,
-    SessionResetUsagePort,
 )
-from opensquilla.engine.usage_accounting import bind_usage_accounting_scope
+from opensquilla.engine.cache_break_monitor import cancel_active_compactions
+from opensquilla.engine.steps.router_decision_record import (
+    drain_pending_flushes_for_sessions,
+)
 from opensquilla.gateway.agent_tasks import get_agent_task_registry
 from opensquilla.gateway.rpc.registry import RpcContext, RpcHandlerError
 from opensquilla.gateway.session_event_publisher import emit_session_event
 from opensquilla.gateway.session_maintenance_runtime import (
-    build_session_flush_correlation,
     cancel_task_runtime,
-    durable_checkpoint_covers_transcript,
 )
 from opensquilla.gateway.session_services import (
     get_session_lock,
     get_session_storage,
     set_session_epoch,
 )
-from opensquilla.gateway.usage_ledger_runtime import build_session_usage_scope
-from opensquilla.memory.session_flush import FlushReceipt
-from opensquilla.session.compaction_lifecycle import (
-    compaction_memory_status,
-    flush_receipt_status_for_compaction,
-    flush_receipt_to_dict,
-    flush_trigger_enabled,
-)
+from opensquilla.gateway.session_streams import get_session_streams
+from opensquilla.gateway.subagent_announce import quiesce_background_completion_sessions
 from opensquilla.session.keys import canonicalize_session_key
 from opensquilla.session.models import SessionIntent
 
@@ -94,8 +82,6 @@ class GatewaySessionResetPorts(
     SessionQuiescencePort,
     SessionResetLockPort,
     SessionResetStorePort,
-    SessionResetMemoryPort,
-    SessionResetUsagePort,
     GoalLeasePort,
     SessionEpochPort,
     PromptCacheInvalidationPort,
@@ -109,28 +95,89 @@ class GatewaySessionResetPorts(
         self._context = context
         self._manager = context.session_manager
         self._storage = get_session_storage(self._manager)
+        self._locks_held_by_quiesce: set[str] = set()
 
-    async def quiesce(self, session_key: str) -> None:
+    def _session_reset_busy(
+        self, session_key: str, phase: str, exc: BaseException
+    ) -> RpcHandlerError:
+        log.warning(
+            "sessions.reset.quiesce_failed",
+            session_key=session_key,
+            phase=phase,
+            error_type=type(exc).__name__,
+        )
+        return RpcHandlerError(
+            code="STORAGE_BUSY",
+            message=(
+                "Reset aborted because session work could not be fully drained. "
+                "Wait for the active turn to settle and retry."
+            ),
+            details={"key": session_key, "phase": phase},
+            retryable=True,
+            retry_after_ms=250,
+        )
+
+    @asynccontextmanager
+    async def quiesce(self, session_key: str) -> AsyncIterator[None]:
+        compactions = cancel_active_compactions(session_key)
+        if compactions:
+            _done, pending = await asyncio.wait(
+                compactions, timeout=_RESET_RUNTIME_CANCEL_DRAIN_SECONDS,
+            )
+            if pending:
+                raise self._session_reset_busy(
+                    session_key, "compaction_drain", TimeoutError("compaction is still stopping"),
+                )
         task_runtime = getattr(self._context, "task_runtime", None)
         if task_runtime is not None:
-            await self._quiesce_task_runtime(task_runtime, session_key)
+            try:
+                async with asyncio.timeout(
+                    _RESET_RUNTIME_SETTLE_SECONDS + _RESET_RUNTIME_CANCEL_DRAIN_SECONDS
+                ):
+                    await self._quiesce_task_runtime(task_runtime, session_key)
+            except Exception as exc:  # noqa: BLE001 - reset must fail closed.
+                raise self._session_reset_busy(session_key, "task_runtime_drain", exc) from exc
 
-        active = get_agent_task_registry().get(session_key)
-        if active is None or active.done():
-            return
-        get_agent_task_registry().cancel(session_key)
-        try:
-            await asyncio.wait_for(active, timeout=2.0)
-        except TimeoutError:
-            log.warning("sessions.reset.drain_timeout", session_key=session_key)
-        except asyncio.CancelledError:
-            log.debug("sessions.reset.drain_cancelled", session_key=session_key)
-        except Exception as exc:
-            log.warning(
-                "sessions.reset.drain_failed",
-                session_key=session_key,
-                error=str(exc),
-            )
+        session_keys = (session_key,)
+        turn_runner = getattr(self._context, "turn_runner", None)
+        lock = get_session_lock(turn_runner, session_key)
+        async with contextlib.AsyncExitStack() as fences:
+            try:
+                async with asyncio.timeout(_RESET_RUNTIME_CANCEL_DRAIN_SECONDS):
+                    await fences.enter_async_context(
+                        quiesce_background_completion_sessions(session_keys)
+                    )
+
+                    quiesce_runtime = getattr(task_runtime, "quiesce_sessions", None)
+                    if callable(quiesce_runtime):
+                        quiesce_kwargs: dict[str, str] = {}
+                        if all(
+                            _accepts_keyword_arg(quiesce_runtime, name)
+                            for name in ("cancel_source", "cancel_reason")
+                        ):
+                            quiesce_kwargs = {
+                                "cancel_source": "sessions_reset",
+                                "cancel_reason": "session_reset",
+                            }
+                        await fences.enter_async_context(
+                            quiesce_runtime(session_keys, **quiesce_kwargs)
+                        )
+
+                    await fences.enter_async_context(
+                        get_agent_task_registry().quiesce_sessions(session_keys)
+                    )
+
+                    if lock is not None:
+                        await fences.enter_async_context(lock)
+                        self._locks_held_by_quiesce.add(session_key)
+
+                    await drain_pending_flushes_for_sessions(session_keys)
+            except Exception as exc:  # noqa: BLE001 - rotation must not follow partial drain.
+                raise self._session_reset_busy(session_key, "writer_quiesce", exc) from exc
+            try:
+                yield
+            finally:
+                self._locks_held_by_quiesce.discard(session_key)
 
     async def _quiesce_task_runtime(self, task_runtime: Any, session_key: str) -> None:
         """Let just-finished turns settle, then cancel and drain live work."""
@@ -183,14 +230,19 @@ class GatewaySessionResetPorts(
                 "sessions.reset.task_runtime_drain_timeout",
                 session_key=session_key,
             )
+            raise
         except Exception:
             log.warning(
                 "sessions.reset.task_runtime_drain_failed",
                 session_key=session_key,
             )
+            raise
 
     @asynccontextmanager
     async def hold(self, session_key: str) -> AsyncIterator[None]:
+        if session_key in self._locks_held_by_quiesce:
+            yield
+            return
         lock = get_session_lock(self._context.turn_runner, session_key)
         if lock is None:
             yield
@@ -208,13 +260,10 @@ class GatewaySessionResetPorts(
         session = await self._storage.get_session(session_key)
         if session is None:
             return None
-        transcript = await self._manager.get_transcript(session_key)
         return SessionResetSnapshot(
             session_key=session_key,
             session_id=str(session.session_id),
-            agent_id=normalize_agent_id(getattr(session, "agent_id", None) or "main"),
             epoch=int(getattr(session, "epoch", 0) or 0),
-            transcript=tuple(transcript),
         )
 
     async def rotate(self, session_key: str) -> SessionResetRotation:
@@ -252,106 +301,6 @@ class GatewaySessionResetPorts(
             return 0
         return new_epoch
 
-    @property
-    def flush_enabled(self) -> bool:
-        return flush_trigger_enabled(self._context.config, "session_reset")
-
-    @property
-    def flush_available(self) -> bool:
-        return getattr(self._context, "flush_service", None) is not None
-
-    async def checkpoint_covers(self, snapshot: SessionResetSnapshot) -> bool:
-        return await durable_checkpoint_covers_transcript(
-            self._storage,
-            snapshot.session_key,
-            snapshot.session_id,
-            list(snapshot.transcript),
-        )
-
-    def skipped_receipt(self) -> FlushReceipt:
-        return FlushReceipt(
-            mode="skipped",
-            flushed_paths=[],
-            slug=None,
-            message_count=0,
-            duration_ms=0,
-            raw_reason=None,
-            error=None,
-        )
-
-    def failed_receipt(self, *, message_count: int, error: str) -> FlushReceipt:
-        return FlushReceipt(
-            mode="error",
-            flushed_paths=[],
-            slug=None,
-            message_count=message_count,
-            duration_ms=0,
-            raw_reason=None,
-            error=error,
-            result_status="archive_failed",
-        )
-
-    async def flush(self, snapshot: SessionResetSnapshot) -> SessionResetFlushReceipt:
-        flush_service = self._context.flush_service
-        if flush_service is None:
-            raise RuntimeError("session flush service is unavailable")
-        turn_id, correlation = build_session_flush_correlation(
-            self._context,
-            snapshot.session_id,
-        )
-        kwargs: dict[str, Any] = {
-            "agent_id": snapshot.agent_id,
-            "timeout": 30.0,
-            "message_window": 0,
-            "segment_mode": "auto",
-            "raw_capture_policy": "required",
-        }
-        if _accepts_keyword_arg(flush_service.execute, "turn_id"):
-            kwargs["turn_id"] = turn_id
-        if correlation is not None and _accepts_keyword_arg(
-            flush_service.execute,
-            "provider_request_correlation",
-        ):
-            kwargs["provider_request_correlation"] = correlation
-        receipt = await flush_service.execute(
-            list(snapshot.transcript),
-            snapshot.session_key,
-            **kwargs,
-        )
-        return cast(SessionResetFlushReceipt, receipt)
-
-    async def assess(
-        self,
-        snapshot: SessionResetSnapshot,
-        receipt: SessionResetFlushReceipt,
-    ) -> SessionResetMemoryAssessment:
-        durable_receipt_safe = await self.checkpoint_covers(snapshot)
-        memory_status = compaction_memory_status(
-            receipt,
-            deterministic_receipt_safe=durable_receipt_safe,
-            required=True,
-        )
-        return SessionResetMemoryAssessment(
-            allows_reset=memory_status.allows_destructive_compaction,
-            flush_status=flush_receipt_status_for_compaction(
-                receipt,
-                self._context.config,
-            ),
-            safety_status=memory_status.safety_status,
-            semantic_status=memory_status.semantic_status,
-        )
-
-    @asynccontextmanager
-    async def account_memory_flush(self, session_key: str) -> AsyncIterator[None]:
-        scope = await build_session_usage_scope(
-            getattr(self._context, "usage_event_sink", None),
-            self._manager,
-            session_key,
-            run_kind="memory_flush",
-        )
-        with bind_usage_accounting_scope(scope):
-            yield
-
     def revoke(self, session_key: str) -> None:
         goal_service = getattr(
             getattr(self._context, "task_runtime", None),
@@ -364,6 +313,7 @@ class GatewaySessionResetPorts(
 
     def update_cache(self, session_key: str, epoch: int) -> None:
         set_session_epoch(self._manager, session_key, epoch)
+        get_session_streams().advance_session_epoch(session_key, epoch)
 
     async def publish(self, session_key: str, epoch: int) -> None:
         try:
@@ -412,21 +362,6 @@ class GatewaySessionResetAdapter:
                     force_authorized=self._context.has_scope("operator.admin"),
                 )
             )
-        except SessionResetFlushUnavailableError as exc:
-            raise RpcHandlerError(
-                code="flush_unavailable",
-                message=(
-                    "Reset aborted: flush service is unavailable and the "
-                    "transcript is non-empty. Re-run with force=true (admin) "
-                    "to discard without backup."
-                ),
-                details={
-                    "key": exc.session_key,
-                    "session_id": exc.session_id,
-                    "reason": "flush_service_disabled",
-                    "message_count": exc.message_count,
-                },
-            ) from exc
         except SessionResetForcePermissionError as exc:
             raise RpcHandlerError(
                 code="permission_denied",
@@ -434,33 +369,6 @@ class GatewaySessionResetAdapter:
                 details={
                     "key": exc.session_key,
                     "session_id": exc.session_id,
-                },
-            ) from exc
-        except SessionResetFlushExecutionError as exc:
-            raise RpcHandlerError(
-                code="flush_disk_error",
-                message=f"Reset aborted: flush failed ({exc.receipt.error})",
-                details={
-                    "flush_receipt": flush_receipt_to_dict(exc.receipt),
-                    "key": exc.snapshot.session_key,
-                    "session_id": exc.snapshot.session_id,
-                },
-            ) from exc
-        except SessionResetFlushSafetyError as exc:
-            raise RpcHandlerError(
-                code="flush_disk_error",
-                message=(
-                    f"Reset aborted: flush status {exc.assessment.flush_status!r} "
-                    "is not sufficient for destructive reset."
-                ),
-                details={
-                    "flush_receipt": flush_receipt_to_dict(exc.receipt),
-                    "key": exc.snapshot.session_key,
-                    "session_id": exc.snapshot.session_id,
-                    "reason": "destructive_reset_requires_safe_flush",
-                    "flush_receipt_status": exc.assessment.flush_status,
-                    "memory_safety_status": exc.assessment.safety_status,
-                    "semantic_memory_status": exc.assessment.semantic_status,
                 },
             ) from exc
         except SessionResetUnavailableError as exc:
@@ -475,8 +383,6 @@ class GatewaySessionResetAdapter:
             "session_id": result.session_id,
             "epoch": result.epoch,
         }
-        if result.flush_receipt is not None:
-            payload["flush_receipt"] = flush_receipt_to_dict(result.flush_receipt)
         return payload
 
 
@@ -488,8 +394,6 @@ def build_gateway_session_reset_adapter(
         quiescence=ports,
         lock=ports,
         store=ports,
-        memory=ports,
-        usage=ports,
         goal_leases=ports,
         epochs=ports,
         prompt_cache=ports,

@@ -1676,93 +1676,6 @@ def _scan_source_tree_posix(
         os.close(root_descriptor)
 
 
-def _scan_source_tree_path(
-    root: Path,
-    *,
-    destination_prefix: Path,
-    role: str,
-    excluded: set[Path] | frozenset[Path] = frozenset(),
-    excluded_leaf_suffixes: tuple[str, ...] = (),
-) -> _SourceSnapshot:
-    """Create a stable, no-follow manifest with temporary content digests."""
-    if destination_prefix.is_absolute() or ".." in destination_prefix.parts:
-        raise OSError(f"import destination prefix is unsafe: {destination_prefix}")
-    root_stat = root.lstat()
-    if _supported_entry_type(root, root_stat) != "directory":
-        raise OSError(f"import root is not a directory: {root}")
-    root_identity = _identity_from_stat(root_stat)
-    entries: list[_ManifestEntry] = []
-    pending: list[tuple[Path, Path]] = [(root, Path())]
-    while pending:
-        directory, relative_directory = pending.pop()
-        before_directory = directory.lstat()
-        if _supported_entry_type(directory, before_directory) != "directory":
-            raise OSError(f"source directory changed type during enumeration: {directory}")
-        try:
-            with os.scandir(directory) as iterator:
-                children = sorted(iterator, key=lambda child: child.name)
-        except OSError as exc:
-            raise OSError(f"could not enumerate source directory: {directory}") from exc
-        for child in children:
-            relative = relative_directory / child.name
-            if relative in excluded or any(parent in excluded for parent in relative.parents):
-                continue
-            if child.name.endswith(excluded_leaf_suffixes):
-                continue
-            path = Path(child.path)
-            result = child.stat(follow_symlinks=False)
-            entry_type = _supported_entry_type(path, result)
-            entry = _ManifestEntry(
-                source=path,
-                relative=relative,
-                entry_type=entry_type,
-                identity=_identity_from_stat(result),
-                mode=int(result.st_mode),
-                size=int(result.st_size),
-                mtime_ns=int(result.st_mtime_ns),
-                digest=None,
-            )
-            digest = _digest_regular_file(path, expected=entry) if entry_type == "file" else None
-            entries.append(
-                _ManifestEntry(
-                    source=entry.source,
-                    relative=entry.relative,
-                    entry_type=entry.entry_type,
-                    identity=entry.identity,
-                    mode=entry.mode,
-                    size=entry.size,
-                    mtime_ns=entry.mtime_ns,
-                    digest=digest,
-                )
-            )
-            if entry_type == "directory":
-                pending.append((path, relative))
-        after_directory = directory.lstat()
-        if (
-            _identity_from_stat(after_directory) != _identity_from_stat(before_directory)
-            or (
-                not excluded_leaf_suffixes
-                and int(after_directory.st_mtime_ns) != int(before_directory.st_mtime_ns)
-            )
-        ):
-            raise OSError(f"source directory changed during enumeration: {directory}")
-    after_root = root.lstat()
-    if _identity_from_stat(after_root) != root_identity:
-        raise OSError(f"source root changed during enumeration: {root}")
-    entries.sort(key=lambda entry: (len(entry.relative.parts), entry.relative.as_posix()))
-    return _SourceSnapshot(
-        root=root,
-        destination_prefix=destination_prefix,
-        identity=root_identity,
-        root_mode=int(root_stat.st_mode),
-        root_mtime_ns=int(root_stat.st_mtime_ns),
-        entries=tuple(entries),
-        role=role,
-        excluded=frozenset(excluded),
-        excluded_leaf_suffixes=tuple(excluded_leaf_suffixes),
-    )
-
-
 def _scan_source_tree(
     root: Path,
     *,
@@ -2609,30 +2522,6 @@ def _read_small_regular_bytes(path: Path, *, limit: int) -> bytes | None:
         return None
 
 
-def _tree_size_bytes(root: Path) -> int:
-    total = 0
-    for dirpath, dirnames, filenames in os.walk(root, followlinks=False):
-        directory = Path(dirpath)
-        safe_dirnames: list[str] = []
-        for name in dirnames:
-            path = directory / name
-            try:
-                if _supported_entry_type(path, path.lstat()) == "directory":
-                    safe_dirnames.append(name)
-            except OSError:
-                continue
-        dirnames[:] = safe_dirnames
-        for name in filenames:
-            try:
-                path = directory / name
-                result = path.lstat()
-                if _supported_entry_type(path, result) == "file":
-                    total += result.st_size
-            except OSError:
-                continue
-    return total
-
-
 def _era_hint(home: Path) -> str:
     receipt = home / "install-receipt.json"
     receipt_bytes = _read_small_regular_bytes(receipt, limit=_LAYOUT_RECEIPT_MAX_BYTES)
@@ -2878,9 +2767,11 @@ def _migration_dir_candidates() -> list[Path]:
 
 def _known_migration_ids() -> set[str]:
     """Return the migration ids shipped with this binary (yoyo id == file stem)."""
+    from opensquilla.migration_compatibility import known_migration_ids
+
     for candidate in _migration_dir_candidates():
         try:
-            ids = {entry.stem for entry in candidate.glob("V*.py")}
+            ids = known_migration_ids(candidate)
         except OSError:
             continue
         if ids:
@@ -2888,8 +2779,10 @@ def _known_migration_ids() -> set[str]:
     return set()
 
 
-def _read_applied_migration_ids(db_path: Path) -> set[str] | None:
+def _read_applied_migration_ledger(db_path: Path) -> dict[str, str | None] | None:
     """Read the yoyo ledger read-only; ``None`` when the db cannot be inspected."""
+    from opensquilla.migration_compatibility import read_migration_ledger
+
     try:
         with tempfile.TemporaryDirectory(prefix="opensquilla-sqlite-inspect-") as temporary:
             copied_db = _copy_sqlite_bundle(
@@ -2902,26 +2795,11 @@ def _read_applied_migration_ids(db_path: Path) -> set[str] | None:
                 uri=True,
             )
             try:
-                table_rows = connection.execute(
-                    "SELECT name FROM sqlite_master WHERE type='table' "
-                    "AND name LIKE '%yoyo_migration'"
-                ).fetchall()
-                table = next(
-                    (
-                        name
-                        for (name,) in table_rows
-                        if isinstance(name, str) and name.endswith("yoyo_migration")
-                    ),
-                    None,
-                )
-                if table is None:
-                    return set()
-                rows = connection.execute(f'SELECT migration_id FROM "{table}"').fetchall()
+                return read_migration_ledger(connection)
             finally:
                 connection.close()
     except (OSError, sqlite3.Error):
         return None
-    return {str(migration_id) for (migration_id,) in rows if migration_id}
 
 
 def _read_session_count(db_path: Path) -> int | None:
@@ -4451,7 +4329,7 @@ class OpenSquillaHomeMigrator:
                     f"source sessions.db could not be snapshotted safely ({exc})",
                 )
                 return True
-            applied = _read_applied_migration_ids(copied_db)
+            applied = _read_applied_migration_ledger(copied_db)
             if applied is None:
                 self._record(
                     "preflight/schema",
@@ -4462,15 +4340,25 @@ class OpenSquillaHomeMigrator:
                     "refusing an unverifiable import",
                 )
                 return True
-            unknown = sorted(applied - known)
-            if unknown:
+            from opensquilla.migration_compatibility import classify_migration_ledger
+
+            compatibility = classify_migration_ledger(applied, known)
+            if compatibility.code is not None:
+                unknown = compatibility.conflicting_ids
+                detail = (
+                    "source home uses an unsupported development Goal lineage; "
+                    "keep the original database and WAL and use its original build"
+                    if compatibility.code == "state_unsupported_goal_lineage"
+                    else "source home has an unverified historical migration alias"
+                    if compatibility.code == "state_migration_alias_mismatch"
+                    else "source home was written by a newer OpenSquilla; update OpenSquilla first"
+                )
                 self._record(
                     "preflight/schema",
                     sessions_db,
                     None,
                     "error",
-                    "source home was written by a newer OpenSquilla "
-                    f"(unknown migrations: {', '.join(unknown)}); update OpenSquilla first",
+                    f"{detail} (migrations: {', '.join(unknown)})",
                 )
                 return True
             self._record("preflight/schema", sessions_db, None, "skipped", "ok")

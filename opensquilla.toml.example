@@ -185,16 +185,14 @@ base_url = "https://tokenrhythm.studio/v1"
 "z-ai/glm-5.1" = "z-ai"
 "z-ai/glm-5.2" = "z-ai"
 
-# LLM ensemble routing. The recommended TokenRhythm router lets C3 reuse this
-# shared plan through squilla_router.tiers.c3.ensemble_enabled below. Keep this
-# global switch off when C0-C2 should remain single-model routes. Enabling it
-# applies the same plan to every request; C3 never stores a second plan.
-# C3 fusion itself does not handle images. The dedicated image_model route stays
-# enabled and is preferred; another non-C3 tier with supports_image=true is used
-# only when the dedicated image route is unavailable.
-# The static_tokenrhythm_b5 profile is the TokenRhythm mirror of B5
-# (deepseek-v4-pro, glm-5.2, kimi-k2.7-code, qwen3.7-max + glm-5.2
-# aggregator). It needs a TokenRhythm credential: the [llm] api_key when
+# LLM ensemble routing is an optional feature. The recommended TokenRhythm
+# router uses four single-model tiers; enable the shared plan explicitly when
+# C3 should use fusion. Keep this global switch off for single-model routing.
+# C3 fusion itself does not handle images. Image requests use a configured
+# C0-C3 tier with catalog-proven vision support (Qwen3.7 Flash in this preset).
+# image_model is retained below for legacy configuration compatibility.
+# The static_tokenrhythm_b5 profile remains available as an opt-in legacy
+# fusion plan. It needs a TokenRhythm credential: the [llm] api_key when
 # TokenRhythm is active, or TOKENRHYTHM_API_KEY in the environment. Without
 # one, or whenever fusion cannot complete, requests use the fixed/direct
 # provider and model configured under [llm].
@@ -357,23 +355,8 @@ auto_schedule = false
 # cron = "0 3 * * *"
 
 [skills]
-# Experimental skill relevance filtering. Default is off; deterministic
-# skill gating still runs for visibility, platform, and tool availability.
-filter_enabled = false
-filter_top_k = 5
 max_skills_prompt_chars = 8000
 # injection_mode = "system"  # "system", "user_context", or "user_message"
-
-# The default lexical strategy is dependency-free. "semantic" and "hybrid"
-# are legacy experimental modes that need the bundled BGE ONNX backend
-# (onnxruntime + transformers tokenizer + the int8 ONNX export shipped under
-# squilla_router/models/v4.2_phase3_inference/bge_onnx/). Install via
-# `uv sync --extra recommended`. If unavailable, they degrade to lexical-only.
-# filter_strategy = "lexical"   # "lexical" | "semantic" | "hybrid"
-# filter_lexical_top_n = 20
-# filter_semantic_top_n = 20
-# filter_rrf_k = 60
-# filter_embedding_model = "BAAI/bge-small-zh-v1.5"
 
 [task_runtime]
 # Server-side agent turn queue. Same-session tasks are serialized;
@@ -423,7 +406,6 @@ complaint_upgrade_steps = 1
 complaint_upgrade_max_chars = 160
 require_router_runtime = true
 estimated_output_savings_pct = 0.03
-upgrade_to_c3_compaction_enabled = true
 # What routing does when a tier names a provider other than [llm].provider
 # while cross_provider_tiers is off. "route" (default) preserves the historical
 # behavior: the mismatch is logged but the tier's model runs on the active
@@ -436,28 +418,28 @@ upgrade_to_c3_compaction_enabled = true
 # on C1), and explicit turn settings remain available for compatible models.
 [squilla_router.tiers.c0]
 provider = "tokenrhythm"
-model = "deepseek-v4-flash-0731"
-description = "Fast DeepSeek V4 Flash 0731 route for trivial chat, short rewrites, extraction, low-risk simple Q&A, and lightweight coding"
+model = "qwen3.7-flash"
+description = "Fast Qwen3.7 Flash route for trivial chat, short rewrites, extraction, low-risk simple Q&A, and lightweight coding"
 supports_image = false
 
 [squilla_router.tiers.c1]
 provider = "tokenrhythm"
-model = "deepseek-v4-pro-0813"
-description = "Default DeepSeek V4 Pro 0813 route for normal agent work, coding assistance, debugging, and moderate analysis"
+model = "deepseek-flash"
+description = "Default DeepSeek Flash route for normal agent work, coding assistance, debugging, and moderate analysis"
 supports_image = false
 
 [squilla_router.tiers.c2]
 provider = "tokenrhythm"
-model = "kimi-k2.7-code"
-description = "Stronger Kimi K2.7 Code route for multi-step coding, structured reasoning, larger context synthesis, and harder analysis"
+model = "deepseek-v4-pro-0813"
+description = "Stronger DeepSeek V4 Pro 0813 route for multi-step coding, structured reasoning, larger context synthesis, and harder analysis"
 supports_image = false
 
 [squilla_router.tiers.c3]
 provider = "tokenrhythm"
-model = "glm-5.2"
-description = "Highest tier: shared static TokenRhythm B5 fusion; this provider/model is retained for single-model C3 mode"
+model = "glm-5.3"
+description = "Highest-tier GLM 5.3 route for difficult planning, deep review, complex debugging, and high-stakes synthesis"
 supports_image = false
-ensemble_enabled = true
+ensemble_enabled = false
 
 [squilla_router.tiers.image_model]
 provider = "tokenrhythm"

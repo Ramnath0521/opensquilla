@@ -24,7 +24,73 @@ test('production cannot import or re-export the verification compiler', () => {
 test('production references exactly match the reviewed target policy', () => {
   const result = evaluateProductionTargets()
   assert.deepEqual(result.failures, [])
-  assert.equal(result.targets.length, 215)
+  assert.ok(result.targets.includes('method:skills.install.status:result'))
+  assert.equal(result.targets.length, 235)
+  for (const method of ['sessions.processes.list', 'sessions.processes.log', 'sessions.processes.stop']) {
+    assert.deepEqual(result.targets.filter(target => (
+      target.startsWith(`method:${method}:`)
+    )), [`method:${method}:params`, `method:${method}:result`])
+  }
+  for (const method of ['sessions.messages.resume', 'sessions.messages.snapshot.release']) {
+    assert.deepEqual(result.targets.filter(target => (
+      target.startsWith(`method:${method}:`)
+    )), [`method:${method}:params`, `method:${method}:result`])
+  }
+  assert.deepEqual(result.targets.filter(target => (
+    target.startsWith('method:workspaces.references.read:')
+  )), ['method:workspaces.references.read:params', 'method:workspaces.references.read:result'])
+  assert.deepEqual(result.targets.filter(target => (
+    target.startsWith('method:models.list:')
+  )), ['method:models.list:params', 'method:models.list:result'])
+  for (const method of ['skills.candidates', 'skills.setEnabled']) {
+    assert.deepEqual(result.targets.filter(target => (
+      target.startsWith(`method:${method}:`)
+    )), [`method:${method}:result`])
+  }
+  assert.deepEqual(result.targets.filter(target => (
+    target.startsWith('method:models.capacity.resolve:')
+  )), [
+    'method:models.capacity.resolve:params',
+    'method:models.capacity.resolve:result',
+  ])
+  assert.deepEqual(result.targets.filter(target => (
+    target.startsWith('method:plans.setPresentation:')
+  )), ['method:plans.setPresentation:result'])
+  assert.deepEqual(result.targets.filter(target => (
+    target.startsWith('method:telemetry.product_active.record:')
+  )), ['method:telemetry.product_active.record:result'])
+  assert.deepEqual(result.targets.filter(target => (
+    target.startsWith('method:sessions.executionLog.read:')
+  )), [
+    'method:sessions.executionLog.read:params',
+    'method:sessions.executionLog.read:result',
+  ])
+  assert.deepEqual(result.targets.filter(target => (
+    target.startsWith('method:models.routing.resetRecommended:')
+  )), [
+    'method:models.routing.resetRecommended:params',
+    'method:models.routing.resetRecommended:result',
+  ])
+  assert.deepEqual(result.targets.filter(target => (
+    target.startsWith('method:onboarding.llmProfile.upsertAndActivate:')
+  )), [
+    'method:onboarding.llmProfile.upsertAndActivate:params',
+    'method:onboarding.llmProfile.upsertAndActivate:result',
+  ])
+  assert.deepEqual(result.targets.filter(target => (
+    target.startsWith('method:meta.list:') || target.startsWith('method:meta.inspect:')
+  )), ['method:meta.inspect:result', 'method:meta.list:result'])
+  assert.deepEqual(result.targets.filter(target => (
+    target.startsWith('method:sessions.messages.snapshot.read:')
+      || target.startsWith('method:transport.flow.update:')
+      || target.startsWith('event:transport.flow.dirty:')
+  )), [
+    'event:transport.flow.dirty:payload',
+    'method:sessions.messages.snapshot.read:params',
+    'method:sessions.messages.snapshot.read:result',
+    'method:transport.flow.update:params',
+    'method:transport.flow.update:result',
+  ])
 })
 
 test('named import aliases preserve original validator identity in TS, JS and Vue', () => {

@@ -1,4 +1,4 @@
-import { app, BrowserWindow, clipboard, dialog, Menu, ipcMain, nativeTheme, net as electronNet, protocol, safeStorage, shell, Tray } from 'electron'
+import { app, BrowserWindow, clipboard, dialog, Menu, ipcMain, nativeTheme, net as electronNet, powerMonitor, protocol, safeStorage, shell, Tray } from 'electron'
 import electronUpdater from 'electron-updater'
 import { spawn, spawnSync, type ChildProcess, type ChildProcessWithoutNullStreams } from 'node:child_process'
 import { createHash, randomUUID } from 'node:crypto'
@@ -8,6 +8,8 @@ import net from 'node:net'
 import { homedir, tmpdir } from 'node:os'
 import { basename, dirname, join, resolve } from 'node:path'
 import { fileURLToPath, pathToFileURL } from 'node:url'
+import { NativeAttachmentSelections } from './native-attachments.js'
+import { saveArtifactFile, performSourceFileAction, performWorkspaceFileAction, type SaveArtifactRequest, type SourceFileActionRequest, type WorkspaceFileActionRequest } from './resource-file-actions.js'
 import {
   DESKTOP_LOCALES,
   normalizeGatewayLocale,
@@ -16,6 +18,7 @@ import {
 } from './desktop-locale.js'
 import {
   allProfileContexts as enumerateLegacyDesktopProfiles,
+  channelUserDataPath,
   isRecoveryProfileId,
   primaryProfilePaths,
   type DesktopProfilePaths,
@@ -47,6 +50,43 @@ import {
   type CoordinatedOnboardingFlow,
 } from './onboarding-flow-coordinator.js'
 import { OnboardingSaveTelemetry } from './onboarding-save-telemetry.js'
+import { renderUnconfiguredDesktopConfig } from './desktop-unconfigured-profile.js'
+import {
+  applyDesktopTelemetryConsentPayload,
+  desktopPrivacyTomlLines,
+  emptyDesktopTelemetryConsent,
+  parseDesktopTelemetryConsent,
+  parseLegacyNetworkObservabilityDisabled,
+  replaceDesktopTelemetryConsentInPrivacy,
+  resolveDesktopTelemetryConsent,
+  type DesktopTelemetryConsent,
+} from './telemetry/onboarding-consent.js'
+import {
+  CONSENT_MIRROR_SCHEMA_VERSION,
+  writeConsentMirror,
+  type ConsentMirror,
+} from './telemetry/consent-mirror.js'
+import { DesktopTelemetryRuntimeGate } from './telemetry/early-spool.js'
+import {
+  DesktopReliabilityTelemetry,
+  type AppStartErrorCode,
+  type AppStartFailureStage,
+  type CrashFingerprintReason,
+  type CrashFingerprintSignature,
+  type GatewayStartErrorCode,
+  type GatewayStartFailureStage,
+  type UpdateErrorCode,
+} from './telemetry/reliability.js'
+import {
+  readSourceCommitId,
+  sourceTelemetryVersion,
+} from './telemetry/build-identity.js'
+import { runTelemetrySideEffectFailOpen } from './telemetry/fail-open.js'
+import {
+  DesktopGrowthTelemetry,
+  parseDesktopOnboardingReceipt,
+  type DesktopOnboardingReceipt,
+} from './telemetry/growth.js'
 import { buildCliInvocation } from './cli-invocation.js'
 import {
   cleanupSelectorArgs,
@@ -88,6 +128,16 @@ import {
   streamResponseToVerifiedFile,
 } from './update-verification.js'
 import { isUpdateCheckAllowed, UpdateCheckScheduler } from './update-check-scheduler.js'
+import { WindowsUpdateSecurityError } from './windows-update-security.js'
+import {
+  createWindowsUpdateCacheDescriptor,
+  loadWindowsUpdateCache,
+  saveWindowsUpdateCache,
+  verifyCachedInstaller,
+  type WindowsUpdateCacheDescriptor,
+} from './windows-update-cache.js'
+import { assertUnambiguousWindowsInstallation, launchWindowsInstaller, WindowsUpdateHandoffError } from './windows-update-handoff.js'
+import { WindowsUpdateCoordinator, WindowsUpdatePreparationError } from './windows-update-coordinator.js'
 import {
   canRevealDesktopApp,
   defaultDesktopPreferences,
@@ -102,7 +152,7 @@ import {
 import {
   DESKTOP_DEEP_LINK_SCHEME,
   desktopDeepLinkArguments,
-  parseDesktopDeepLink,
+  parseDesktopDeepLinkTarget,
 } from './desktop-deep-link.js'
 import { projectDirectoryDialogOptions } from './project-directory-picker.js'
 import {
@@ -117,22 +167,17 @@ import {
 } from './native-workbench-surface-contract.js'
 import {
   NativeWorkbenchSurfaceManager,
-  type NativeWorkbenchCandidatePreviewBinding,
 } from './native-workbench-surface.js'
 import {
   parseNativeWorkbenchAnnotationModeRequest,
   parseNativeWorkbenchAnnotationOverlayCloseRequest,
   parseNativeWorkbenchAnnotationOverlayShowRequest,
 } from './native-workbench-annotation-contract.js'
-import { DesktopArtifactBridge } from './desktop-artifact-bridge.js'
-import {
-  DESKTOP_ARTIFACT_BRIDGE_TOKEN_ENV,
-  DESKTOP_ARTIFACT_BRIDGE_URL_ENV,
-  DesktopArtifactBridgeLoopbackTransport,
-} from './desktop-artifact-bridge-loopback.js'
+import { DesktopBrowserServer, DESKTOP_BROWSER_URL_ENV, DESKTOP_BROWSER_TOKEN_ENV } from './desktop-browser.js'
 import { installDesktopZoomShortcuts } from './desktop-zoom-shortcuts.js'
 import {
   buildRendererConsoleLogEntry,
+  isLiveMainFrameConsoleMessage,
   buildRendererGoneLogEntry,
   buildRendererStateLogEntry,
   RendererConsoleLogLimiter,
@@ -145,6 +190,20 @@ import {
   normalizeRouterTiers,
   type RouterTier,
 } from './router-tier-normalization.js'
+import {
+  desktopRouterConfigTomlLines,
+  desktopRouterConfigPreambleLines,
+  desktopRouterPreambleLineIndexes,
+  desktopTomlSectionNames,
+  normalizeRouterPresetBinding,
+  resolveDesktopRouterUpdate,
+  type DesktopRouterWriteIntent,
+  type RouterPresetBinding,
+} from './desktop-router-config.js'
+import {
+  defaultRouterTiers, DesktopRoutingConfigurationError, ROUTER_PROFILES, supportsRouter,
+} from './desktop-router-profiles.js'
+import type { DesktopPrimaryProviderChange } from './desktop-primary-provider-change.js'
 import {
   DESKTOP_RENDERER_ENTRY,
   DESKTOP_RENDERER_SCHEME,
@@ -185,6 +244,12 @@ interface GatewayState {
   status: 'starting' | 'ready' | 'stopped' | 'error'
   logPath: string
   error?: string
+  sandboxUpgrade?: SandboxUpgradeReport | null
+}
+
+interface SandboxUpgradeReport {
+  status?: string
+  error?: string | null
 }
 
 interface DesktopGatewayConnection {
@@ -197,6 +262,7 @@ interface DesktopGatewayConnection {
   wsUrl: string | null
   authToken: string | null
   error: string | null
+  sandboxUpgrade?: SandboxUpgradeReport | null
 }
 
 type SecretEncryption = 'safeStorage' | 'plain'
@@ -238,6 +304,7 @@ interface DesktopConnection {
   routerMode: RouterMode
   routerDefaultTier: TextRouterTier
   routerTiers: Record<string, RouterTier>
+  routerPresetBinding?: RouterPresetBinding
   searchProvider: string
   searchApiKeyEnv: string
   encryptedSearchApiKey?: string
@@ -247,6 +314,7 @@ interface DesktopConnection {
   importTransactionId: string
   createdAt: string
   updatedAt: string
+  growthOnboardingReceipt?: DesktopOnboardingReceipt
 }
 
 interface OnboardingPayload {
@@ -258,11 +326,16 @@ interface OnboardingPayload {
   routerMode?: unknown
   routerDefaultTier?: unknown
   routerTiers?: unknown
+  routerResetToRecommended?: unknown
   searchProvider?: unknown
   searchApiKey?: unknown
   disableNetworkObservability?: unknown
+  reliabilityDiagnosticsEnabled?: unknown
+  productAnalyticsEnabled?: unknown
   locale?: unknown
 }
+
+const desktopTelemetryRuntimeGate = new DesktopTelemetryRuntimeGate()
 
 interface OnboardingProbePayload {
   provider?: unknown
@@ -293,7 +366,7 @@ interface OnboardingFlow extends CoordinatedOnboardingFlow<
   OnboardingSaveResult
 > {
   window: BrowserWindow | null
-  resolve: ((credential: DesktopConnection) => void) | null
+  resolve: ((credential: DesktopConnection | null) => void) | null
   reject: ((error: Error) => void) | null
 }
 
@@ -308,6 +381,7 @@ interface DesktopSettingsSnapshot {
   routerMode: RouterMode
   routerDefaultTier: TextRouterTier
   routerTiers: Record<string, RouterTier>
+  routerPresetBinding?: RouterPresetBinding
   searchProvider: string
   searchApiKeyEnv: string
   searchApiKeyConfigured: boolean
@@ -438,11 +512,24 @@ interface MacInstallContext {
 }
 
 const __dirname = dirname(fileURLToPath(import.meta.url))
+// Keep stable data in its established location. Prerelease binaries receive
+// independent Chromium, credential and Gateway state before any writer starts.
+// Changing the update feed never changes this process's active profile.
+const channelUserData = channelUserDataPath(app.getPath('userData'), app.getVersion())
+if (channelUserData !== resolve(app.getPath('userData'))) {
+  mkdirSync(channelUserData, { recursive: true })
+  app.setPath('userData', channelUserData)
+}
 const packageRoot = resolve(__dirname, '..')
 const defaultRepoRoot = resolve(packageRoot, '..', '..')
 const repoRoot = process.env.OPENSQUILLA_DESKTOP_REPO_ROOT
   ? resolve(process.env.OPENSQUILLA_DESKTOP_REPO_ROOT)
   : defaultRepoRoot
+// Official packaged Desktop builds have no checkout metadata and must keep
+// their ordinary semver.  An unpackaged shell launched from this repository
+// may safely identify the exact source commit for reliability diagnostics;
+// the helper is bounded, read-only, and never invokes Git.
+const desktopSourceCommitId = app.isPackaged ? null : readSourceCommitId(repoRoot)
 const shouldUseNativeApplicationMenu = process.platform === 'darwin'
 
 let mainWindow: BrowserWindow | null = null
@@ -454,6 +541,7 @@ let windowsSessionEndPreviousPhase: DesktopExitPhase | null = null
 let windowsSessionEndResetTimer: NodeJS.Timeout | null = null
 let mainWindowClosePrompt: Promise<void> | null = null
 let pendingDesktopDeepLinkOpen = false
+let pendingDesktopSessionKey: string | null = null
 let desktopDeepLinkActivationReady = false
 let desktopPreferencesCache: {
   value: DesktopPreferencesFile
@@ -492,6 +580,7 @@ function applyDesktopNativeTheme(source: DesktopNativeThemeSource): { source: De
 let gatewayProcess: ChildProcessWithoutNullStreams | null = null
 let gatewayProfileKey: string | null = null
 let isQuitting = false
+let gatewayShutdownRequestInterceptorInstalled = false
 // A child remains lifecycle-owned until its exit event, even after stopGateway
 // clears the current slot so a replacement cannot accidentally reuse it. Quit,
 // update, cleanup, and recovery all join this set before Electron may exit.
@@ -514,6 +603,30 @@ let allowGracefulShutdownWhileQuitting = false
 // rate-limited, and every record must survive an imminent app.exit(). The file
 // sink caps individual records and rotates a bounded backup set.
 const desktopProcessStartedAt = Date.now()
+const desktopReliabilityTelemetry = new DesktopReliabilityTelemetry({
+  runtimeGate: desktopTelemetryRuntimeGate,
+  appVersion: () => app.getVersion(),
+  ...(desktopSourceCommitId === null
+    ? {}
+    : {
+        telemetryAppVersion: () => sourceTelemetryVersion(app.getVersion(), desktopSourceCommitId),
+      }),
+  platform: process.platform === 'darwin'
+    ? 'macos'
+    : process.platform === 'win32'
+      ? 'windows'
+      : 'linux',
+  processStartedAtMs: desktopProcessStartedAt,
+})
+const desktopGrowthTelemetry = new DesktopGrowthTelemetry({
+  runtimeGate: desktopTelemetryRuntimeGate,
+  appVersion: () => app.getVersion(),
+  platform: process.platform === 'darwin'
+    ? 'macos'
+    : process.platform === 'win32'
+      ? 'windows'
+      : 'linux',
+})
 
 function desktopLog(event: string, detail?: Record<string, unknown>): void {
   try {
@@ -544,6 +657,37 @@ function nativeWorkbenchFailureReason(event: NativeWorkbenchSurfaceEvent): strin
   return 'unknown'
 }
 
+function normalizedCrashFingerprintReason(value: unknown): CrashFingerprintReason {
+  if (value === 'crashed') return 'crashed'
+  if (value === 'oom') return 'oom'
+  if (value === 'killed') return 'killed'
+  if (value === 'launch-failed') return 'launch_failed'
+  if (value === 'integrity-failure') return 'integrity_failure'
+  if (value === 'abnormal-exit') return 'abnormal_exit'
+  return 'unknown'
+}
+
+function normalizedCrashFingerprintSignature(error: unknown): CrashFingerprintSignature {
+  if (error instanceof AggregateError) return 'aggregate_error'
+  if (error instanceof TypeError) return 'type_error'
+  if (error instanceof RangeError) return 'range_error'
+  if (error instanceof ReferenceError) return 'reference_error'
+  if (error instanceof SyntaxError) return 'syntax_error'
+  if (error instanceof URIError) return 'uri_error'
+  if (error instanceof EvalError) return 'eval_error'
+  if (error instanceof Error) return 'error'
+  return 'unknown'
+}
+
+function recordRendererCrash(reason: unknown): void {
+  if (reason === 'clean-exit') return
+  desktopReliabilityTelemetry.recordCrash({
+    component: 'desktop_renderer',
+    errorCode: reason === 'killed' ? 'renderer_killed' : 'renderer_crashed',
+    reason: normalizedCrashFingerprintReason(reason),
+  })
+}
+
 let gatewayStartPromise: Promise<GatewayState> | null = null
 const GATEWAY_UNEXPECTED_EXIT_RESTART_DELAYS_MS = [1_000, 2_000, 4_000] as const
 interface GatewayReadyAuthority {
@@ -556,6 +700,103 @@ let gatewayUnexpectedExitRestartAttempt = 0
 let gatewayUnexpectedExitRestartTimer: NodeJS.Timeout | null = null
 let gatewayUnexpectedExitRestartProfileKey: string | null = null
 let gatewayUnexpectedExitRestartOpenFlowRevision = 0
+interface GatewayStartTelemetryAttempt {
+  startedAt: number | null
+  mode: 'spawned' | 'reused' | 'external' | null
+  stage: GatewayStartFailureStage
+  errorCodeHint: GatewayStartErrorCode | null
+  finished: boolean
+}
+let gatewayStartTelemetryAttempt: GatewayStartTelemetryAttempt | null = null
+
+function createGatewayStartTelemetryAttempt(): GatewayStartTelemetryAttempt {
+  return {
+    startedAt: null,
+    mode: null,
+    stage: 'spawn',
+    errorCodeHint: null,
+    finished: false,
+  }
+}
+
+function beginGatewayStartTelemetry(
+  mode: 'spawned' | 'reused' | 'external',
+  stage: GatewayStartFailureStage,
+): void {
+  const attempt = gatewayStartTelemetryAttempt
+  if (!attempt || attempt.finished) return
+  attempt.startedAt ??= Date.now()
+  attempt.mode = mode
+  attempt.stage = stage
+  attempt.errorCodeHint = null
+}
+
+function advanceGatewayStartTelemetry(
+  stage: GatewayStartFailureStage,
+  errorCodeHint: GatewayStartErrorCode | null = null,
+): void {
+  const attempt = gatewayStartTelemetryAttempt
+  if (!attempt || attempt.finished || attempt.startedAt === null) return
+  attempt.stage = stage
+  if (errorCodeHint !== null) attempt.errorCodeHint = errorCodeHint
+}
+
+function classifyGatewayStartFailure(
+  attempt: GatewayStartTelemetryAttempt,
+  error: unknown,
+): { outcome: 'fail' | 'timeout' | 'cancel'; errorCode: GatewayStartErrorCode } {
+  const message = error instanceof Error ? error.message : String(error)
+  if (/superseded|cancelled/i.test(message)) {
+    return { outcome: 'cancel', errorCode: 'startup_cancelled' }
+  }
+  if (attempt.errorCodeHint) {
+    return {
+      outcome: attempt.errorCodeHint === 'health_timeout' || attempt.errorCodeHint === 'control_ui_timeout'
+        ? 'timeout'
+        : 'fail',
+      errorCode: attempt.errorCodeHint,
+    }
+  }
+  if (/ownership|unverified listener/i.test(message)) {
+    return { outcome: 'fail', errorCode: 'ownership_unverified' }
+  }
+  if (/did not become healthy|is not healthy/i.test(message)) {
+    return { outcome: 'timeout', errorCode: 'health_timeout' }
+  }
+  if (/Control UI did not become reachable/i.test(message)) {
+    return { outcome: 'timeout', errorCode: 'control_ui_timeout' }
+  }
+  if (/gateway failed to start|gateway exited|port is already in use/i.test(message)) {
+    return { outcome: 'fail', errorCode: 'spawn_failed' }
+  }
+  return { outcome: 'fail', errorCode: 'internal_error' }
+}
+
+function finishGatewayStartTelemetry(
+  attempt: GatewayStartTelemetryAttempt,
+  error: unknown | null,
+): void {
+  if (attempt.finished || attempt.startedAt === null || attempt.mode === null) return
+  attempt.finished = true
+  if (error === null) {
+    desktopReliabilityTelemetry.recordGatewayStartResult({
+      outcome: 'success',
+      durationMs: Math.max(0, Date.now() - attempt.startedAt),
+      failureStage: null,
+      errorCode: null,
+      startupMode: attempt.mode,
+    })
+    return
+  }
+  const failure = classifyGatewayStartFailure(attempt, error)
+  desktopReliabilityTelemetry.recordGatewayStartResult({
+    outcome: failure.outcome,
+    durationMs: Math.max(0, Date.now() - attempt.startedAt),
+    failureStage: attempt.stage,
+    errorCode: failure.errorCode,
+    startupMode: attempt.mode,
+  })
+}
 let onboardingSaveTelemetryAttempt = 0
 const onboardingFlows = new OnboardingFlowCoordinator<
   OnboardingPayload,
@@ -572,6 +813,7 @@ let bootStatus: BootStatus = {
 }
 let bootError: BootError | null = null
 let forceOnboardingOnNextStartup = false
+let onboardingPromptProfileKey: string | null = null
 let recoveryInspection: RecoveryProtocolResult | null = null
 let primaryRecoveryInspection: RecoveryProtocolResult | null = null
 let recoveryOperationBusy = false
@@ -620,33 +862,76 @@ const gatewayState: GatewayState = {
   url: '',
   port: 0,
   owned: false,
-  status: 'stopped',
+  // The first renderer loads while profile preflight is still preparing the runtime.
+  status: 'starting',
   logPath: '',
+  sandboxUpgrade: null,
+}
+
+function desktopGatewayConnectionSuspendedForExit(): boolean {
+  return appExitPhase === 'draining' || appExitPhase === 'committed'
 }
 
 function desktopGatewayConnectionSnapshot(): DesktopGatewayConnection {
-  const ready = gatewayState.status === 'ready' && Boolean(gatewayState.url)
+  // Retain internal ownership and readiness for the authenticated drain, while
+  // withdrawing renderer reconnect admission before shutdown closes sockets.
+  const status = desktopGatewayConnectionSuspendedForExit() ? 'stopped' : gatewayState.status
+  const ready = status === 'ready' && Boolean(gatewayState.url)
   const authToken = ready && gatewayState.owned && gatewayProcess
     ? gatewayProcessOwnershipContexts.get(gatewayProcess)?.nonce ?? null
     : null
   return {
     schemaVersion: 1,
     revision: gatewayConnectionRevision,
-    status: gatewayState.status,
+    status,
     instanceId: gatewayConnectionInstanceId,
     profileFingerprint: desktopProfileFingerprint(activeDesktopProfile().home),
     httpUrl: gatewayState.url || null,
     wsUrl: ready ? gatewayState.url.replace(/^http/i, 'ws') + '/ws' : null,
     authToken: authToken ? desktopGatewayAuthToken(authToken) : null,
     error: gatewayState.error || null,
+    sandboxUpgrade: gatewayState.sandboxUpgrade ?? null,
+  }
+}
+
+let sandboxUpgradeRefreshInFlight = false
+
+async function refreshSandboxUpgradeReport(): Promise<void> {
+  if (sandboxUpgradeRefreshInFlight || gatewayState.status !== 'ready' || !gatewayState.url) return
+  sandboxUpgradeRefreshInFlight = true
+  try {
+    const response = await proxyDesktopRendererRequest(
+      new Request('opensquilla-app://desktop/api/system/status'),
+      '/api/system/status',
+    )
+    if (!response.ok) return
+    const payload = await response.json() as { sandboxUpgrade?: unknown }
+    const raw = payload.sandboxUpgrade
+    if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return
+    const value = raw as Record<string, unknown>
+    gatewayState.sandboxUpgrade = {
+      ...(typeof value.status === 'string' ? { status: value.status } : {}),
+      ...(value.error === null || typeof value.error === 'string' ? { error: value.error } : {}),
+    }
+    publishGatewayConnection()
+  } catch {
+    // The Gateway connection remains authoritative when the optional
+    // diagnostic endpoint is unavailable.
+  } finally {
+    sandboxUpgradeRefreshInFlight = false
   }
 }
 
 function publishGatewayConnection(): void {
   gatewayConnectionRevision += 1
+  if (gatewayState.status !== 'ready') gatewayState.sandboxUpgrade = null
   const window = currentMainWindow()
   if (!window || !isDesktopRendererDocumentUrl(window.webContents.getURL())) return
-  window.webContents.send('gateway:connection-changed', desktopGatewayConnectionSnapshot())
+  const snapshot = desktopGatewayConnectionSnapshot()
+  window.webContents.send('gateway:connection-changed', snapshot)
+  if (snapshot.status === 'ready' && gatewayState.sandboxUpgrade === null) {
+    void refreshSandboxUpgradeReport()
+  }
 }
 
 interface GatewayConnectionTransition {
@@ -692,9 +977,6 @@ const nativeWorkbenchSurfaces = new NativeWorkbenchSurfaceManager({
       : null
   ),
   getWindow: () => currentMainWindow(),
-  resolveCandidatePreview: resolveCandidatePreviewFromGateway,
-  releaseCandidatePreview: releaseCandidatePreviewFromGateway,
-  pinArtifactPreview: grant => artifactPreviewLeaseBroker.pinSurface(grant),
   emit: event => {
     if (event.type === 'error' || event.type === 'crashed') {
       desktopLog('native_workbench_surface_failed', {
@@ -702,6 +984,12 @@ const nativeWorkbenchSurfaces = new NativeWorkbenchSurfaceManager({
         type: event.type,
         reason: nativeWorkbenchFailureReason(event),
       })
+    }
+    // The surface manager maps an owner-window hang to a synthetic `crashed`
+    // surface event so its UI can recover. Count that as a stall only; the
+    // owner's real render-process-gone seam below remains the crash authority.
+    if (event.type === 'crashed' && event.detail?.reason !== 'owner-unresponsive') {
+      recordRendererCrash(event.detail?.reason)
     }
     const window = currentMainWindow()
     if (
@@ -712,139 +1000,12 @@ const nativeWorkbenchSurfaces = new NativeWorkbenchSurfaceManager({
     window.webContents.send('desktop:workbench:surface-event', event)
   },
 })
-const desktopArtifactBridge = new DesktopArtifactBridge({
-  getActiveTarget: () => nativeWorkbenchSurfaces.getActiveArtifactBridgeTarget(),
-  acquireActiveTargetBinding: () => nativeWorkbenchSurfaces.acquireArtifactBridgeTargetBinding(),
-})
-const desktopArtifactBridgeLoopback = new DesktopArtifactBridgeLoopbackTransport(
-  desktopArtifactBridge,
-  {
-    audit: entry => desktopLog(entry.event, {
-      operation: entry.operation,
-      outcome: entry.outcome,
-      code: entry.code,
-      durationMs: entry.durationMs,
-    }),
-  },
+const desktopBrowser = new DesktopBrowserServer(
+  (request, signal) => nativeWorkbenchSurfaces.executeBrowser(request, signal),
+  entry => desktopLog(entry.event, { operation: entry.operation, outcome: entry.outcome,
+    code: entry.code, durationMs: entry.durationMs }),
 )
 
-async function resolveCandidatePreviewFromGateway(
-  candidateHandle: string,
-  signal: AbortSignal,
-): Promise<NativeWorkbenchCandidatePreviewBinding> {
-  const gatewayOrigin = gatewayState.owned && gatewayState.status === 'ready'
-    ? gatewayState.url
-    : null
-  const token = desktopArtifactBridgeLoopback.token()
-  if (!gatewayOrigin || !token) {
-    throw new Error('The Desktop candidate preview service is unavailable.')
-  }
-  const response = await fetch(
-    new URL('/api/v1/desktop-artifact-candidate-preview/resolve', gatewayOrigin),
-    {
-      method: 'POST',
-      headers: {
-        Authorization: `Bearer ${token}`,
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify({ version: 1, candidateHandle }),
-      redirect: 'error',
-      cache: 'no-store',
-      credentials: 'omit',
-      signal,
-    },
-  )
-  const contentType = response.headers.get('content-type')
-    ?.split(';', 1)[0]
-    ?.trim()
-    .toLowerCase()
-  const declaredLength = response.headers.get('content-length')
-  if (
-    contentType !== 'application/json'
-    || (declaredLength !== null && (
-      !/^\d+$/.test(declaredLength)
-      || Number(declaredLength) > 1024 * 1024
-    ))
-  ) throw new Error('The Desktop candidate preview response is invalid.')
-  const text = await response.text()
-  if (!response.ok || text.length > 1024 * 1024) {
-    throw new Error('The Desktop candidate preview service rejected the request.')
-  }
-  let raw: unknown
-  try {
-    raw = JSON.parse(text)
-  } catch {
-    throw new Error('The Desktop candidate preview response is invalid.')
-  }
-  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) {
-    throw new Error('The Desktop candidate preview response is invalid.')
-  }
-  const value = raw as Record<string, unknown>
-  const launchUrl = value.launch_url
-  const expectedOrigin = value.preview_origin
-  const candidateArtifactId = value.candidate_artifact_id
-  const leaseId = value.lease_id
-  const scopeId = value.scope_id
-  const effectiveMode = value.effective_mode
-  if (
-    typeof launchUrl !== 'string'
-    || typeof expectedOrigin !== 'string'
-    || typeof candidateArtifactId !== 'string'
-    || typeof leaseId !== 'string'
-    || typeof scopeId !== 'string'
-    || scopeId.length === 0
-    || scopeId.length > 512
-    || /[\u0000-\u001f\u007f]/.test(scopeId)
-    // Candidate previews are always rendered in the offline realm. Keep this
-    // check at the Gateway→Electron boundary as well as in the native surface
-    // so a compromised/stale response cannot widen browser-action authority.
-    || effectiveMode !== 'offline'
-    || value.candidate_handle !== candidateHandle
-  ) throw new Error('The Desktop candidate preview response is invalid.')
-  return {
-    candidateHandle,
-    candidateArtifactId,
-    leaseId,
-    launchUrl,
-    expectedOrigin,
-    scopeId,
-    mode: effectiveMode,
-  }
-}
-
-async function releaseCandidatePreviewFromGateway(
-  candidateHandle: string,
-  signal: AbortSignal,
-): Promise<void> {
-  const gatewayOrigin = gatewayState.owned && gatewayState.status === 'ready'
-    ? gatewayState.url
-    : null
-  const token = desktopArtifactBridgeLoopback.token()
-  // A missing Gateway/bridge identity is not a successful restore.  Native
-  // cleanup callers may intentionally swallow this error during shutdown,
-  // while the interactive discard path must retain the candidate handle and
-  // retry instead of claiming that the canonical preview was restored.
-  if (!gatewayOrigin || !token) {
-    throw new Error('The Desktop candidate preview cleanup service is unavailable.')
-  }
-  const response = await fetch(
-    new URL(
-      `/api/v1/desktop-artifact-candidate-preview/${encodeURIComponent(candidateHandle)}`,
-      gatewayOrigin,
-    ),
-    {
-      method: 'DELETE',
-      headers: { Authorization: `Bearer ${token}` },
-      redirect: 'error',
-      cache: 'no-store',
-      credentials: 'omit',
-      signal,
-    },
-  )
-  if (!response.ok) {
-    throw new Error('The Desktop candidate preview cleanup was rejected.')
-  }
-}
 function activeDesktopProfile(): DesktopProfilePaths {
   return primaryProfilePaths(app.getPath('userData'))
 }
@@ -907,8 +1068,8 @@ function desktopChildEnvironment(
   // Never let inherited/stale bridge credentials flow into helper, recovery,
   // probe, or migration children. startGateway adds its freshly generated
   // process-lifetime credentials only to the owned Gateway spawn.
-  delete environment[DESKTOP_ARTIFACT_BRIDGE_URL_ENV]
-  delete environment[DESKTOP_ARTIFACT_BRIDGE_TOKEN_ENV]
+  delete environment[DESKTOP_BROWSER_URL_ENV]
+  delete environment[DESKTOP_BROWSER_TOKEN_ENV]
   return {
     ...environment,
     ...additions,
@@ -1325,6 +1486,13 @@ async function proxyDesktopRendererRequest(
   const body = method === 'GET' || method === 'HEAD'
     ? undefined
     : new Uint8Array(await request.arrayBuffer())
+  if (isCurrentGatewayShutdownRequest(`${gatewayState.url}${pathAndQuery}`, method)) {
+    const child = gatewayProcess
+    if (child && gatewayState.owned) {
+      trackStoppingGatewayProcess(child)
+      cancelGatewayUnexpectedExitRestart('Gateway shutdown endpoint requested')
+    }
+  }
   const response = await electronNet.fetch(`${gatewayState.url}${pathAndQuery}`, {
     method,
     headers,
@@ -1363,7 +1531,7 @@ function secureDesktopRendererDocument(response: Response): Response {
       "font-src 'self' opensquilla-app://desktop data:",
       "media-src 'self' opensquilla-app://desktop blob: data: http: https:",
       "connect-src 'self' opensquilla-app://desktop http: https: ws: wss:",
-      "frame-src blob: http: https:",
+      "frame-src blob: data: http: https:",
       "worker-src 'self' opensquilla-app://desktop blob:",
     ].join('; '),
   )
@@ -1484,6 +1652,7 @@ async function openMacKeychainAccess(): Promise<boolean> {
 
 function sendBootStatus(phaseId: BootPhaseId): void {
   bootStatus = { phaseId, label: desktopT('boot.' + phaseId), at: new Date().toISOString() }
+  desktopReliabilityTelemetry.observeAppStartStage(appStartFailureStage(phaseId))
   bootError = null
   desktopStartupLog('boot_phase', { phaseId })
   mainWindow?.webContents.send('desktop:boot:status', bootStatus)
@@ -1496,6 +1665,81 @@ function sendBootError(error: unknown): void {
     ...(error instanceof DesktopStartupError ? { code: error.code } : {}),
   }
   mainWindow?.webContents.send('desktop:boot:error', bootError)
+}
+
+let appStartResultRecorded = false
+
+function appStartFailureStage(phase: BootPhaseId): AppStartFailureStage {
+  if (phase === 'gateway-start') return 'gateway_start'
+  if (phase === 'gateway-health') return 'gateway_health'
+  if (phase === 'control') return 'control_ui'
+  return phase
+}
+
+function classifyAppStartFailure(error: unknown): {
+  outcome: 'fail' | 'timeout' | 'cancel'
+  errorCode: AppStartErrorCode
+} {
+  if (error instanceof DesktopStartupError && error.code === 'keychain_unavailable') {
+    return { outcome: 'fail', errorCode: 'keychain_unavailable' }
+  }
+  const message = error instanceof Error ? error.message : String(error)
+  if (/superseded|cancelled/i.test(message)) {
+    return { outcome: 'cancel', errorCode: 'startup_cancelled' }
+  }
+  if (gatewayExitLooksLikeProfileInUse(message)) {
+    return { outcome: 'fail', errorCode: 'profile_in_use' }
+  }
+  if (/ownership|unverified listener/i.test(message)) {
+    return { outcome: 'fail', errorCode: 'ownership_unverified' }
+  }
+  if (/did not become healthy|is not healthy/i.test(message)) {
+    return { outcome: 'timeout', errorCode: 'health_timeout' }
+  }
+  if (/Control UI did not become reachable/i.test(message)) {
+    return { outcome: 'timeout', errorCode: 'control_ui_timeout' }
+  }
+  if (/gateway failed to start|gateway exited|port is already in use/i.test(message)) {
+    return { outcome: 'fail', errorCode: 'spawn_failed' }
+  }
+  if (bootStatus.phaseId === 'gateway-start') {
+    return { outcome: 'fail', errorCode: 'runtime_unavailable' }
+  }
+  if (bootStatus.phaseId === 'control') {
+    return { outcome: 'fail', errorCode: 'renderer_load_failed' }
+  }
+  return { outcome: 'fail', errorCode: 'internal_error' }
+}
+
+function finishAppStartSuccess(): void {
+  // Growth owns its durable milestone dedupe; an earlier failed startup result
+  // must not suppress the first successful ready transition in this process.
+  desktopGrowthTelemetry.recordFirstAppReady()
+  if (appStartResultRecorded) return
+  appStartResultRecorded = true
+  desktopReliabilityTelemetry.recordAppStartResult({
+    outcome: 'success',
+    durationMs: Math.max(0, Date.now() - desktopProcessStartedAt),
+    failureStage: null,
+    errorCode: null,
+  })
+}
+
+function finishAppStartFailure(
+  error: unknown,
+  override?: { stage: AppStartFailureStage; errorCode: AppStartErrorCode },
+): void {
+  if (appStartResultRecorded) return
+  appStartResultRecorded = true
+  const classified = override
+    ? { outcome: 'fail' as const, errorCode: override.errorCode }
+    : classifyAppStartFailure(error)
+  desktopReliabilityTelemetry.recordAppStartResult({
+    outcome: classified.outcome,
+    durationMs: Math.max(0, Date.now() - desktopProcessStartedAt),
+    failureStage: override?.stage ?? appStartFailureStage(bootStatus.phaseId),
+    errorCode: classified.errorCode,
+  })
 }
 
 const TEXT_ROUTER_TIERS: TextRouterTier[] = ['c0', 'c1', 'c2', 'c3']
@@ -1512,40 +1756,15 @@ const LEGACY_TEXT_TIER_ALIASES: Record<string, TextRouterTier> = {
 function canonicalTierKey(name: string): string {
   return LEGACY_TEXT_TIER_ALIASES[name] ?? name
 }
-const ROUTER_PROFILE_IDS = new Set(['tokenrhythm', 'openrouter', 'dashscope', 'deepseek', 'gemini', 'volcengine', 'openai', 'zhipu', 'moonshot'])
-const INLINE_ROUTER_PROFILE_IDS = new Set(['tokenrhythm'])
 const TOKENRHYTHM_REGISTER_URL = 'https://tokenrhythm.studio/register'
-const DESKTOP_ENSEMBLE_PROFILES: Record<StaticEnsembleSelectionMode, {
-  provider: string
-  proposers: string[]
-  aggregator: string
-}> = {
-  static_tokenrhythm_b5: {
-    provider: 'tokenrhythm',
-    proposers: ['deepseek-v4-pro', 'glm-5.2', 'kimi-k2.7-code', 'qwen3.7-max'],
-    aggregator: 'glm-5.2',
-  },
-  static_openrouter_b5: {
-    provider: 'openrouter',
-    proposers: [
-      'deepseek/deepseek-v4-pro',
-      'z-ai/glm-5.2',
-      'moonshotai/kimi-k2.7-code',
-      'qwen/qwen3.7-max',
-    ],
-    aggregator: 'z-ai/glm-5.2',
-  },
-}
-
-const PROVIDER_CATALOG: ProviderCatalogEntry[] = [
+const PROVIDER_CATALOG: ProviderCatalogEntry[] = ([
   {
     id: 'tokenrhythm',
     label: 'TokenRhythm',
-    model: 'deepseek-v4-pro-0813',
+    model: ROUTER_PROFILES.tokenrhythm.c1.model,
     baseUrl: 'https://tokenrhythm.studio/v1',
     apiKeyEnv: 'TOKENRHYTHM_API_KEY',
     requiresApiKey: true,
-    routerSupported: true,
     ensembleSelectionMode: 'static_tokenrhythm_b5',
     deployment: 'cloud',
     note: 'DeepSeek, GLM, MiniMax and Kimi model families on one key.',
@@ -1553,11 +1772,10 @@ const PROVIDER_CATALOG: ProviderCatalogEntry[] = [
   {
     id: 'openrouter',
     label: 'OpenRouter',
-    model: 'deepseek/deepseek-v4-pro',
+    model: ROUTER_PROFILES.openrouter.c1.model,
     baseUrl: 'https://openrouter.ai/api/v1',
     apiKeyEnv: 'OPENROUTER_API_KEY',
     requiresApiKey: true,
-    routerSupported: true,
     ensembleSelectionMode: 'static_openrouter_b5',
     deployment: 'cloud',
     note: 'One account for mixed-model routing.',
@@ -1569,7 +1787,6 @@ const PROVIDER_CATALOG: ProviderCatalogEntry[] = [
     baseUrl: 'https://api.openai.com/v1',
     apiKeyEnv: 'OPENAI_API_KEY',
     requiresApiKey: true,
-    routerSupported: true,
     deployment: 'cloud',
     note: 'OpenAI-only tier profile.',
   },
@@ -1580,7 +1797,6 @@ const PROVIDER_CATALOG: ProviderCatalogEntry[] = [
     baseUrl: 'https://api.openai.com/v1',
     apiKeyEnv: 'OPENAI_API_KEY',
     requiresApiKey: true,
-    routerSupported: false,
     deployment: 'cloud',
     note: 'OpenAI Responses-API shape (chat + responses).',
   },
@@ -1591,7 +1807,6 @@ const PROVIDER_CATALOG: ProviderCatalogEntry[] = [
     baseUrl: 'https://api.anthropic.com',
     apiKeyEnv: 'ANTHROPIC_API_KEY',
     requiresApiKey: true,
-    routerSupported: false,
     deployment: 'cloud',
     note: 'Direct Claude access without SquillaRouter tiers.',
   },
@@ -1602,7 +1817,6 @@ const PROVIDER_CATALOG: ProviderCatalogEntry[] = [
     baseUrl: 'https://dashscope.aliyuncs.com/compatible-mode/v1',
     apiKeyEnv: 'DASHSCOPE_API_KEY',
     requiresApiKey: true,
-    routerSupported: true,
     deployment: 'cloud',
     note: 'Qwen tier profile for Mainland-friendly access.',
   },
@@ -1613,7 +1827,6 @@ const PROVIDER_CATALOG: ProviderCatalogEntry[] = [
     baseUrl: 'https://coding.dashscope.aliyuncs.com/v1',
     apiKeyEnv: 'BAILIAN_API_KEY',
     requiresApiKey: true,
-    routerSupported: false,
     deployment: 'cloud',
     note: 'Mainland China Coding Plan. Requires a dedicated sk-sp- API key.',
   },
@@ -1624,7 +1837,6 @@ const PROVIDER_CATALOG: ProviderCatalogEntry[] = [
     baseUrl: 'https://coding-intl.dashscope.aliyuncs.com/v1',
     apiKeyEnv: 'BAILIAN_API_KEY',
     requiresApiKey: true,
-    routerSupported: false,
     deployment: 'cloud',
     note: 'International Coding Plan. Requires a dedicated sk-sp- API key.',
   },
@@ -1635,7 +1847,6 @@ const PROVIDER_CATALOG: ProviderCatalogEntry[] = [
     baseUrl: 'https://api.deepseek.com',
     apiKeyEnv: 'DEEPSEEK_API_KEY',
     requiresApiKey: true,
-    routerSupported: true,
     deployment: 'cloud',
     note: 'DeepSeek-only fast and pro routing.',
   },
@@ -1646,7 +1857,6 @@ const PROVIDER_CATALOG: ProviderCatalogEntry[] = [
     baseUrl: 'https://generativelanguage.googleapis.com/v1beta/openai',
     apiKeyEnv: 'GEMINI_API_KEY',
     requiresApiKey: true,
-    routerSupported: true,
     deployment: 'cloud',
     note: 'Gemini OpenAI-compatible tier profile.',
   },
@@ -1657,7 +1867,6 @@ const PROVIDER_CATALOG: ProviderCatalogEntry[] = [
     baseUrl: 'https://api.moonshot.ai/v1',
     apiKeyEnv: 'MOONSHOT_API_KEY',
     requiresApiKey: true,
-    routerSupported: true,
     deployment: 'cloud',
     note: 'Kimi text and image-capable routes.',
   },
@@ -1668,7 +1877,6 @@ const PROVIDER_CATALOG: ProviderCatalogEntry[] = [
     baseUrl: 'http://localhost:11434',
     apiKeyEnv: '',
     requiresApiKey: false,
-    routerSupported: false,
     deployment: 'local',
     note: 'Local direct model path.',
   },
@@ -1679,9 +1887,8 @@ const PROVIDER_CATALOG: ProviderCatalogEntry[] = [
     baseUrl: 'https://qianfan.baidubce.com/v2',
     apiKeyEnv: 'QIANFAN_API_KEY',
     requiresApiKey: true,
-    routerSupported: false,
     deployment: 'cloud',
-    note: 'Direct provider model id required.',
+    note: 'Qianfan text and image-capable routes.',
   },
   {
     id: 'kimi_coding_openai',
@@ -1690,7 +1897,6 @@ const PROVIDER_CATALOG: ProviderCatalogEntry[] = [
     baseUrl: 'https://api.kimi.com/coding/v1',
     apiKeyEnv: 'KIMI_CODING_API_KEY',
     requiresApiKey: true,
-    routerSupported: false,
     deployment: 'cloud',
     note: 'Kimi coding-plan endpoint.',
   },
@@ -1701,7 +1907,6 @@ const PROVIDER_CATALOG: ProviderCatalogEntry[] = [
     baseUrl: 'https://api.kimi.com/coding',
     apiKeyEnv: 'KIMI_CODING_API_KEY',
     requiresApiKey: true,
-    routerSupported: false,
     deployment: 'cloud',
     note: 'Kimi coding-plan Anthropic-shaped endpoint.',
   },
@@ -1712,7 +1917,6 @@ const PROVIDER_CATALOG: ProviderCatalogEntry[] = [
     baseUrl: 'https://api.minimaxi.com/anthropic',
     apiKeyEnv: 'MINIMAX_API_KEY',
     requiresApiKey: true,
-    routerSupported: false,
     deployment: 'cloud',
     note: 'MiniMax Anthropic-compatible endpoint.',
   },
@@ -1723,7 +1927,6 @@ const PROVIDER_CATALOG: ProviderCatalogEntry[] = [
     baseUrl: 'https://api.minimaxi.com/anthropic',
     apiKeyEnv: 'MINIMAX_CN_API_KEY',
     requiresApiKey: true,
-    routerSupported: false,
     deployment: 'cloud',
     note: 'MiniMax mainland Anthropic-compatible endpoint.',
   },
@@ -1734,7 +1937,6 @@ const PROVIDER_CATALOG: ProviderCatalogEntry[] = [
     baseUrl: 'https://api.minimax.io/anthropic',
     apiKeyEnv: 'MINIMAX_API_KEY',
     requiresApiKey: true,
-    routerSupported: false,
     deployment: 'cloud',
     note: 'MiniMax global Anthropic-compatible endpoint.',
   },
@@ -1745,7 +1947,6 @@ const PROVIDER_CATALOG: ProviderCatalogEntry[] = [
     baseUrl: 'https://api.minimax.io/v1',
     apiKeyEnv: 'MINIMAX_API_KEY',
     requiresApiKey: true,
-    routerSupported: false,
     deployment: 'cloud',
     note: 'MiniMax OpenAI-compatible endpoint.',
   },
@@ -1756,7 +1957,6 @@ const PROVIDER_CATALOG: ProviderCatalogEntry[] = [
     baseUrl: 'https://api.minimaxi.com/v1',
     apiKeyEnv: 'MINIMAX_CODING_API_KEY',
     requiresApiKey: true,
-    routerSupported: false,
     deployment: 'cloud',
     note: 'MiniMax coding-plan OpenAI-compatible endpoint.',
   },
@@ -1767,7 +1967,6 @@ const PROVIDER_CATALOG: ProviderCatalogEntry[] = [
     baseUrl: 'https://api.minimaxi.com/anthropic',
     apiKeyEnv: 'MINIMAX_CODING_API_KEY',
     requiresApiKey: true,
-    routerSupported: false,
     deployment: 'cloud',
     note: 'MiniMax coding-plan Anthropic-shaped endpoint.',
   },
@@ -1778,7 +1977,6 @@ const PROVIDER_CATALOG: ProviderCatalogEntry[] = [
     baseUrl: 'https://token-plan-cn.xiaomimimo.com/v1',
     apiKeyEnv: 'MIMO_API_KEY',
     requiresApiKey: true,
-    routerSupported: false,
     deployment: 'cloud',
     note: 'MiMo coding-plan endpoint.',
   },
@@ -1789,7 +1987,6 @@ const PROVIDER_CATALOG: ProviderCatalogEntry[] = [
     baseUrl: 'https://token-plan-cn.xiaomimimo.com/anthropic',
     apiKeyEnv: 'MIMO_API_KEY',
     requiresApiKey: true,
-    routerSupported: false,
     deployment: 'cloud',
     note: 'MiMo coding-plan Anthropic-shaped endpoint.',
   },
@@ -1800,7 +1997,6 @@ const PROVIDER_CATALOG: ProviderCatalogEntry[] = [
     baseUrl: 'https://ark.cn-beijing.volces.com/api/v3',
     apiKeyEnv: 'VOLCENGINE_API_KEY',
     requiresApiKey: true,
-    routerSupported: true,
     deployment: 'cloud',
     note: 'Doubao tier profile.',
   },
@@ -1811,7 +2007,6 @@ const PROVIDER_CATALOG: ProviderCatalogEntry[] = [
     baseUrl: 'https://ark.cn-beijing.volces.com/api/coding/v3',
     apiKeyEnv: 'VOLCENGINE_API_KEY',
     requiresApiKey: true,
-    routerSupported: false,
     deployment: 'cloud',
     note: 'Volcengine coding-plan endpoint.',
   },
@@ -1822,11 +2017,13 @@ const PROVIDER_CATALOG: ProviderCatalogEntry[] = [
     baseUrl: 'https://open.bigmodel.cn/api/paas/v4',
     apiKeyEnv: 'ZAI_API_KEY',
     requiresApiKey: true,
-    routerSupported: true,
     deployment: 'cloud',
     note: 'GLM tier profile.',
   },
-]
+] satisfies Omit<ProviderCatalogEntry, 'routerSupported'>[]).map(provider => ({
+  ...provider,
+  routerSupported: supportsRouter(provider.id),
+}))
 
 const PROVIDER_BY_ID = new Map(PROVIDER_CATALOG.map((provider) => [provider.id, provider]))
 
@@ -1885,141 +2082,6 @@ const SEARCH_PROVIDER_BY_ID = new Map(
   SEARCH_PROVIDER_CATALOG.map((provider) => [provider.providerId, provider]),
 )
 
-function textRouterProfile(
-  provider: string,
-  c0: string,
-  c1: string,
-  c2: string,
-  c3: string,
-  subject: string,
-): Record<string, RouterTier> {
-  return {
-    c0: { provider, model: c0, description: `${subject} fast route`, thinkingLevel: 'off' },
-    c1: { provider, model: c1, description: `${subject} balanced route`, thinkingLevel: 'low' },
-    c2: { provider, model: c2, description: `${subject} strong route`, thinkingLevel: 'medium' },
-    c3: { provider, model: c3, description: `${subject} highest route`, thinkingLevel: 'high' },
-  }
-}
-
-function minimaxRouterProfile(provider: string): Record<string, RouterTier> {
-  return textRouterProfile(
-    provider,
-    'MiniMax-M2.7',
-    'MiniMax-M2.7',
-    'MiniMax-M3',
-    'MiniMax-M3',
-    'MiniMax',
-  )
-}
-
-const ROUTER_PROFILES: Record<string, Record<string, RouterTier>> = {
-  tokenrhythm: {
-    c0: { provider: 'tokenrhythm', model: 'deepseek-v4-flash-0731', description: 'Fast DeepSeek V4 Flash 0731 route for simple work', supportsImage: false },
-    c1: { provider: 'tokenrhythm', model: 'deepseek-v4-pro-0813', description: 'Default DeepSeek V4 Pro 0813 route for normal agent work', supportsImage: false },
-    c2: { provider: 'tokenrhythm', model: 'kimi-k2.7-code', description: 'Strong Kimi 2.7 Code route for harder coding and analysis', supportsImage: false },
-    c3: { provider: 'tokenrhythm', model: 'glm-5.2', description: 'Highest tier: shared B5 fusion; GLM 5.2 is retained for single-model C3 mode', supportsImage: false, ensembleEnabled: true },
-    image_model: { provider: 'tokenrhythm', model: 'kimi-k2.6', description: 'Vision route for image attachments', supportsImage: true, imageOnly: true },
-  },
-  openrouter: {
-    c0: { provider: 'openrouter', model: 'deepseek/deepseek-v4-flash', description: 'Fast everyday work', thinkingLevel: 'high' },
-    c1: { provider: 'openrouter', model: 'deepseek/deepseek-v4-pro', description: 'Balanced agent work', thinkingLevel: 'high' },
-    c2: { provider: 'openrouter', model: 'z-ai/glm-5.2', description: 'Complex reasoning', thinkingLevel: 'high' },
-    c3: { provider: 'openrouter', model: 'anthropic/claude-opus-4.8', description: 'Highest quality review and planning', thinkingLevel: 'high' },
-    image_model: { provider: 'openrouter', model: 'moonshotai/kimi-k2.6', description: 'Vision route for image attachments', supportsImage: true, imageOnly: true, thinkingLevel: 'medium' },
-  },
-  openai: {
-    c0: { provider: 'openai', model: 'gpt-5.4-nano', description: 'Fast simple work', thinkingLevel: 'none' },
-    c1: { provider: 'openai', model: 'gpt-5.4-mini', description: 'Balanced agent work', thinkingLevel: 'low' },
-    c2: { provider: 'openai', model: 'gpt-5.5', description: 'Complex text tasks', thinkingLevel: 'medium' },
-    c3: { provider: 'openai', model: 'gpt-5.5', description: 'Deep review and analysis', thinkingLevel: 'high' },
-  },
-  dashscope: {
-    c0: { provider: 'dashscope', model: 'qwen3.6-flash', description: 'Fast simple work' },
-    c1: { provider: 'dashscope', model: 'qwen3.7-plus', description: 'Balanced agent work' },
-    c2: { provider: 'dashscope', model: 'qwen3.7-max', description: 'Complex text tasks' },
-    c3: { provider: 'dashscope', model: 'qwen3.7-max', description: 'Deep reasoning' },
-  },
-  deepseek: {
-    c0: { provider: 'deepseek', model: 'deepseek-v4-flash', description: 'Fast simple work' },
-    c1: { provider: 'deepseek', model: 'deepseek-v4-flash', description: 'Balanced agent work' },
-    c2: { provider: 'deepseek', model: 'deepseek-v4-pro', description: 'Complex text tasks' },
-    c3: { provider: 'deepseek', model: 'deepseek-v4-pro', description: 'Deep reasoning' },
-  },
-  gemini: {
-    c0: { provider: 'gemini', model: 'gemini-3.1-flash-lite', description: 'Fast simple work' },
-    c1: { provider: 'gemini', model: 'gemini-3.5-flash', description: 'Balanced agent work', thinkingLevel: 'low' },
-    c2: { provider: 'gemini', model: 'gemini-3.1-pro-preview', description: 'Complex text tasks', thinkingLevel: 'medium' },
-    c3: { provider: 'gemini', model: 'gemini-3.1-pro-preview', description: 'Deep reasoning', thinkingLevel: 'high' },
-  },
-  moonshot: {
-    c0: { provider: 'moonshot', model: 'kimi-k2.6', description: 'Fast multimodal work', supportsImage: true, thinkingLevel: 'low' },
-    c1: { provider: 'moonshot', model: 'kimi-k2.6', description: 'Balanced multimodal work', supportsImage: true, thinkingLevel: 'medium' },
-    c2: { provider: 'moonshot', model: 'kimi-k2.6', description: 'Complex text and image work', supportsImage: true, thinkingLevel: 'medium' },
-    c3: { provider: 'moonshot', model: 'kimi-k2.7-code', description: 'Code-heavy deep reasoning', supportsImage: true, thinkingLevel: 'high' },
-  },
-  kimi_coding_openai: textRouterProfile(
-    'kimi_coding_openai',
-    'kimi-for-coding',
-    'kimi-for-coding',
-    'kimi-for-coding',
-    'kimi-for-coding',
-    'Kimi Coding',
-  ),
-  kimi_coding_anthropic: textRouterProfile(
-    'kimi_coding_anthropic',
-    'kimi-for-coding',
-    'kimi-for-coding',
-    'kimi-for-coding',
-    'kimi-for-coding',
-    'Kimi Coding',
-  ),
-  volcengine: {
-    c0: { provider: 'volcengine', model: 'doubao-seed-2-0-lite-260215', description: 'Fast simple work' },
-    c1: { provider: 'volcengine', model: 'doubao-seed-2-0-lite-260215', description: 'Balanced agent work' },
-    c2: { provider: 'volcengine', model: 'doubao-seed-2-0-pro-260215', description: 'Complex text tasks' },
-    c3: { provider: 'volcengine', model: 'doubao-seed-2-0-pro-260215', description: 'Deep review and analysis' },
-  },
-  volcengine_coding_plan: textRouterProfile(
-    'volcengine_coding_plan',
-    'doubao-seed-2.0-lite',
-    'doubao-seed-2.0-pro',
-    'doubao-seed-2.0-code',
-    'doubao-seed-2.0-code',
-    'Volcengine Coding Plan',
-  ),
-  zhipu: {
-    c0: { provider: 'zhipu', model: 'glm-5-turbo', description: 'Fast simple work' },
-    c1: { provider: 'zhipu', model: 'glm-5', description: 'Balanced agent work' },
-    c2: { provider: 'zhipu', model: 'glm-5.1', description: 'Complex text tasks' },
-    c3: { provider: 'zhipu', model: 'glm-5.2', description: 'Deep reasoning', thinkingLevel: 'high' },
-  },
-  minimax: minimaxRouterProfile('minimax'),
-  minimax_cn: minimaxRouterProfile('minimax_cn'),
-  minimax_global: minimaxRouterProfile('minimax_global'),
-  minimax_coding_openai: minimaxRouterProfile('minimax_coding_openai'),
-  minimax_coding_anthropic: minimaxRouterProfile('minimax_coding_anthropic'),
-  mimo_openai: textRouterProfile(
-    'mimo_openai',
-    'mimo-v2.5',
-    'mimo-v2.5',
-    'mimo-v2.5-pro',
-    'mimo-v2.5-pro',
-    'MiMo',
-  ),
-  mimo_anthropic: textRouterProfile(
-    'mimo_anthropic',
-    'mimo-v2.5',
-    'mimo-v2.5',
-    'mimo-v2.5-pro',
-    'mimo-v2.5-pro',
-    'MiMo',
-  ),
-}
-
-function cloneRouterTiers(tiers: Record<string, RouterTier>): Record<string, RouterTier> {
-  return Object.fromEntries(Object.entries(tiers).map(([name, tier]) => [name, { ...tier }]))
-}
-
 function providerDefaults(provider: string): { model: string; baseUrl: string; apiKeyEnv: string; requiresApiKey: boolean; routerSupported: boolean } {
   const defaults = PROVIDER_BY_ID.get(provider) || PROVIDER_BY_ID.get('openrouter')!
   return {
@@ -2027,7 +2089,7 @@ function providerDefaults(provider: string): { model: string; baseUrl: string; a
     baseUrl: defaults.baseUrl,
     apiKeyEnv: defaults.apiKeyEnv,
     requiresApiKey: defaults.requiresApiKey,
-    routerSupported: defaults.routerSupported,
+    routerSupported: supportsRouter(provider),
   }
 }
 
@@ -2045,11 +2107,12 @@ function normalizeTextTier(raw: unknown): TextRouterTier {
 }
 
 function normalizeRouterMode(raw: unknown, provider: string): RouterMode {
-  const value = String(raw || '').trim().toLowerCase()
+  const value = String(raw ?? '').trim().toLowerCase()
   if (value === 'disabled') return 'disabled'
+  if (!value) return supportsRouter(provider) ? 'recommended' : 'disabled'
   if (value === 'openrouter-mix' && provider === 'openrouter') return 'openrouter-mix'
-  if (ROUTER_PROFILE_IDS.has(provider)) return 'recommended'
-  return 'disabled'
+  if (value === 'recommended' && supportsRouter(provider)) return 'recommended'
+  throw new DesktopRoutingConfigurationError()
 }
 
 function modelRoutingModeAllowed(mode: ModelRoutingMode, provider: string): boolean {
@@ -2057,17 +2120,21 @@ function modelRoutingModeAllowed(mode: ModelRoutingMode, provider: string): bool
   if (mode === 'llm_ensemble') {
     return Boolean(PROVIDER_BY_ID.get(provider)?.ensembleSelectionMode)
   }
-  return ROUTER_PROFILE_IDS.has(provider)
+  return supportsRouter(provider)
 }
 
 function modelRoutingModeForRouterMode(routerMode: RouterMode, provider: string): ModelRoutingMode {
   if (routerMode === 'disabled') return 'direct'
   if (routerMode === 'openrouter-mix' && provider === 'openrouter') return 'llm_ensemble'
-  return modelRoutingModeAllowed('squilla_router', provider) ? 'squilla_router' : 'direct'
+  if (modelRoutingModeAllowed('squilla_router', provider)) return 'squilla_router'
+  throw new DesktopRoutingConfigurationError()
 }
 
 function normalizeModelRoutingMode(raw: unknown, provider: string, fallbackRouterMode?: RouterMode): ModelRoutingMode {
-  const value = String(raw || '').trim().toLowerCase()
+  const value = String(raw ?? '').trim().toLowerCase()
+  if (value && !['squilla_router', 'direct', 'llm_ensemble'].includes(value)) {
+    throw new DesktopRoutingConfigurationError()
+  }
   const requested = ['squilla_router', 'direct', 'llm_ensemble'].includes(value)
     ? value as ModelRoutingMode
     : fallbackRouterMode
@@ -2075,20 +2142,19 @@ function normalizeModelRoutingMode(raw: unknown, provider: string, fallbackRoute
       : modelRoutingModeAllowed('squilla_router', provider)
         ? 'squilla_router'
         : 'direct'
-  if (modelRoutingModeAllowed(requested, provider)) return requested
-  return modelRoutingModeAllowed('squilla_router', provider) ? 'squilla_router' : 'direct'
+  if (!modelRoutingModeAllowed(requested, provider)) throw new DesktopRoutingConfigurationError()
+  if (value && fallbackRouterMode
+    && fallbackRouterMode !== routerModeForModelRoutingMode(requested, provider)
+    && !(fallbackRouterMode === 'openrouter-mix' && requested === 'llm_ensemble')) {
+    throw new DesktopRoutingConfigurationError()
+  }
+  return requested
 }
 
 function routerModeForModelRoutingMode(mode: ModelRoutingMode, provider: string): RouterMode {
   if (mode === 'direct') return 'disabled'
   if (mode === 'llm_ensemble' && modelRoutingModeAllowed(mode, provider)) return 'recommended'
   return normalizeRouterMode('recommended', provider)
-}
-
-function defaultRouterTiers(provider: string, mode: RouterMode): Record<string, RouterTier> {
-  if (mode === 'disabled') return {}
-  if (mode === 'openrouter-mix') return cloneRouterTiers(ROUTER_PROFILES.openrouter)
-  return cloneRouterTiers(ROUTER_PROFILES[provider] || ROUTER_PROFILES.openrouter)
 }
 
 function routerDefaultModel(tiers: Record<string, RouterTier>, defaultTier: TextRouterTier): string {
@@ -2132,42 +2198,6 @@ function inlineScriptJson(value: unknown): string {
     .replace(/\u2029/g, '\\u2029')
 }
 
-function routerTierTomlLines(name: string, tier: RouterTier): string[] {
-  const lines = [
-    `[squilla_router.tiers.${name}]`,
-    `provider = ${tomlString(tier.provider)}`,
-    `model = ${tomlString(tier.model)}`,
-  ]
-  if (tier.description) lines.push(`description = ${tomlString(tier.description)}`)
-  if (tier.supportsImage !== undefined) lines.push(`supports_image = ${tier.supportsImage ? 'true' : 'false'}`)
-  if (tier.imageOnly !== undefined) lines.push(`image_only = ${tier.imageOnly ? 'true' : 'false'}`)
-  if (tier.thinkingLevel) lines.push(`thinking_level = ${tomlString(tier.thinkingLevel)}`)
-  if (tier.ensembleEnabled !== undefined) lines.push(`ensemble_enabled = ${tier.ensembleEnabled ? 'true' : 'false'}`)
-  return lines
-}
-
-function routerConfigTomlLines(credential: DesktopConnection): string[] {
-  if (credential.routerMode === 'disabled') {
-    return [
-      '[squilla_router]',
-      'enabled = false',
-    ]
-  }
-  const tierLines = Object.entries(credential.routerTiers)
-    .filter(([, tier]) => tier.provider && tier.model)
-    .flatMap(([name, tier]) => ['', ...routerTierTomlLines(name, tier)])
-  return [
-    '[squilla_router]',
-    'enabled = true',
-    'rollout_phase = "full"',
-    `default_tier = ${tomlString(credential.routerDefaultTier)}`,
-    ...(credential.routerMode === 'recommended' && !INLINE_ROUTER_PROFILE_IDS.has(credential.provider)
-      ? [`tier_profile = ${tomlString(credential.provider)}`]
-      : []),
-    ...tierLines,
-  ]
-}
-
 function ensembleConfigTomlLines(credential: DesktopConnection): string[] {
   if (credential.modelRoutingMode !== 'llm_ensemble') {
     return [
@@ -2180,31 +2210,22 @@ function ensembleConfigTomlLines(credential: DesktopConnection): string[] {
   if (!selectionMode) {
     throw new Error(`LLM Ensemble is not supported for provider ${credential.provider}.`)
   }
-  const profile = DESKTOP_ENSEMBLE_PROFILES[selectionMode]
-  const candidates = profile.proposers.flatMap(model => [
-    '',
-    '[[llm_ensemble.candidates]]',
-    `provider = ${tomlString(profile.provider)}`,
-    `model = ${tomlString(model)}`,
-    'source = "custom"',
-    'enabled = true',
-    'role = "proposer"',
-  ])
-  candidates.push(
-    '',
-    '[[llm_ensemble.candidates]]',
-    `provider = ${tomlString(profile.provider)}`,
-    `model = ${tomlString(profile.aggregator)}`,
-    'source = "custom"',
-    'enabled = true',
-    'role = "aggregator"',
-  )
   return [
     '',
     '[llm_ensemble]',
     'enabled = true',
-    'selection_mode = "custom_b5"',
-    ...candidates,
+    `selection_mode = ${tomlString(selectionMode)}`,
+  ]
+}
+
+function privacyConfigTomlLines(
+  credential: DesktopConnection,
+): string[] {
+  if (!desktopConfigShouldWritePrivacySection(credential)) return []
+  return [
+    '',
+    '[privacy]',
+    `disable_network_observability = ${credential.disableNetworkObservability ? 'true' : 'false'}`,
   ]
 }
 
@@ -2212,13 +2233,140 @@ function desktopConfigShouldWritePrivacySection(credential: DesktopConnection): 
   return credential.disableNetworkObservability || readDesktopConfigNetworkObservabilitySetting() !== null
 }
 
-function privacyConfigTomlLines(credential: DesktopConnection): string[] {
-  if (!desktopConfigShouldWritePrivacySection(credential)) return []
-  return [
-    '',
-    '[privacy]',
-    `disable_network_observability = ${credential.disableNetworkObservability ? 'true' : 'false'}`,
-  ]
+function scopedPrivacyConfigTomlLines(
+  credential: DesktopConnection,
+  existingRaw: string | null,
+  consentOverride: DesktopTelemetryConsent | null,
+): string[] {
+  const persistedConsent = parseDesktopTelemetryConsent(existingRaw)
+  const consent = consentOverride ?? persistedConsent
+  const persistedLegacy = parseLegacyNetworkObservabilityDisabled(existingRaw)
+  const includeLegacy = credential.disableNetworkObservability
+    || persistedLegacy !== null
+    || consent.reliability.enabled !== null
+    || consent.growth.enabled !== null
+  if (
+    consentOverride === null
+    && consent.reliability.enabled === null
+    && consent.growth.enabled === null
+  ) return privacyConfigTomlLines(credential)
+  return desktopPrivacyTomlLines(
+    credential.disableNetworkObservability,
+    consent,
+    includeLegacy,
+  )
+}
+
+function configuredDesktopStateDirectory(
+  profile: DesktopProfilePaths,
+  configRaw: string | null,
+): string {
+  if (configRaw !== null) {
+    for (const rawLine of configRaw.split(/\r?\n/)) {
+      if (/^\s*\[/.test(rawLine)) break
+      const match = rawLine.match(/^\s*state_dir\s*=\s*(["'])(.*?)\1\s*(?:#.*)?$/)
+      if (!match) continue
+      let configured = match[2] ?? ''
+      if (match[1] === '"') {
+        try {
+          const parsed: unknown = JSON.parse(`${match[1]}${configured}${match[1]}`)
+          if (typeof parsed === 'string') configured = parsed
+        } catch {
+          return join(profile.home, 'state')
+        }
+      }
+      if (configured === '~') configured = homedir()
+      else if (configured.startsWith('~/') || configured.startsWith('~\\')) {
+        configured = join(homedir(), configured.slice(2))
+      }
+      return resolve(profile.home, configured)
+    }
+  }
+  return join(profile.home, 'state')
+}
+
+function desktopTelemetryDirectory(profile: DesktopProfilePaths, configRaw: string | null): string {
+  return join(configuredDesktopStateDirectory(profile, configRaw), 'telemetry')
+}
+
+function desktopConsentMirrorPath(profile: DesktopProfilePaths, configRaw: string | null): string {
+  return join(desktopTelemetryDirectory(profile, configRaw), 'desktop-consent-mirror.json')
+}
+
+function desktopEarlyTelemetrySpoolPath(profile: DesktopProfilePaths, configRaw: string | null): string {
+  return join(desktopTelemetryDirectory(profile, configRaw), 'desktop-early-spool')
+}
+
+function mirroredScopeConsent(
+  scope: DesktopTelemetryConsent['reliability'],
+  forcedOff: boolean,
+): ConsentMirror['reliability'] {
+  const timestampIsUtc = scope.consentedAtUtc === null || (typeof scope.consentedAtUtc === 'string'
+    && scope.consentedAtUtc.endsWith('Z')
+    && Number.isFinite(Date.parse(scope.consentedAtUtc)))
+  if (scope.enabled !== true || scope.noticeVersion === null || !timestampIsUtc) {
+    return {
+      enabled: scope.enabled === false ? false : null,
+      notice_version: null,
+      consented_at_utc: null,
+      forced_off: forcedOff,
+    }
+  }
+  return {
+    enabled: true,
+    notice_version: scope.noticeVersion,
+    consented_at_utc: scope.consentedAtUtc,
+    forced_off: forcedOff,
+  }
+}
+
+async function writeDesktopConsentMirror(
+  profile: DesktopProfilePaths,
+  configRaw: string | null,
+  failClosed = false,
+): Promise<void> {
+  if (failClosed) desktopTelemetryRuntimeGate.close()
+  const consent = failClosed || configRaw === null
+    ? emptyDesktopTelemetryConsent()
+    : resolveDesktopTelemetryConsent(configRaw)
+  const forcedOff = failClosed || configRaw === null
+  await writeConsentMirror(desktopConsentMirrorPath(profile, configRaw), {
+    schema_version: CONSENT_MIRROR_SCHEMA_VERSION,
+    reliability: mirroredScopeConsent(consent.reliability, forcedOff),
+    growth: mirroredScopeConsent(consent.growth, forcedOff),
+  })
+}
+
+async function syncDesktopConsentMirror(profile = activeDesktopProfile()): Promise<void> {
+  desktopTelemetryRuntimeGate.close()
+  const configRaw = await readOptionalDesktopText(join(profile.home, 'config.toml'))
+  await writeDesktopConsentMirror(profile, configRaw)
+  const credentialRaw = await readOptionalDesktopText(profile.credentialPath)
+  const credential = credentialRaw === null
+    ? null
+    : normalizeDesktopCredential(JSON.parse(credentialRaw) as Partial<DesktopConnection>)
+  desktopTelemetryRuntimeGate.openAfterConsentSync()
+  desktopReliabilityTelemetry.synchronize({
+    spoolRoot: desktopEarlyTelemetrySpoolPath(profile, configRaw),
+    consentMirrorPath: desktopConsentMirrorPath(profile, configRaw),
+  })
+  desktopGrowthTelemetry.synchronize({
+    profileKey: profile.home,
+    telemetryDirectory: desktopTelemetryDirectory(profile, configRaw),
+    spoolRoot: desktopEarlyTelemetrySpoolPath(profile, configRaw),
+    consentMirrorPath: desktopConsentMirrorPath(profile, configRaw),
+  }, credential?.configAuthority === 'generated' ? credential.growthOnboardingReceipt : null)
+  refreshDesktopReliabilityForegroundState()
+}
+
+async function runDesktopTelemetryConsentSideEffect(
+  phase: 'pre_commit' | 'post_commit',
+  sideEffect: () => Promise<void>,
+): Promise<void> {
+  await runTelemetrySideEffectFailOpen(sideEffect, () => {
+    desktopTelemetryRuntimeGate.close()
+    desktopLog('desktop_telemetry_consent_side_effect_failed', { phase })
+  })
 }
 
 function plainSecret(secret: string): { value: string; encryption: SecretEncryption } {
@@ -2352,7 +2500,8 @@ function isConnectionReady(record: DesktopConnection): boolean {
 function normalizeDesktopCredential(parsed: Partial<DesktopConnection>): DesktopConnection {
   const provider = normalizeProvider(parsed.provider)
   const defaults = providerDefaults(provider)
-  const legacyRouterMode = normalizeRouterMode(parsed.routerMode, provider)
+  const legacyRouterMode = parsed.routerMode === undefined
+    ? undefined : normalizeRouterMode(parsed.routerMode, provider)
   const modelRoutingMode = normalizeModelRoutingMode(parsed.modelRoutingMode, provider, legacyRouterMode)
   const routerMode = routerModeForModelRoutingMode(modelRoutingMode, provider)
   const routerDefaultTier = normalizeTextTier(parsed.routerDefaultTier)
@@ -2374,6 +2523,7 @@ function normalizeDesktopCredential(parsed: Partial<DesktopConnection>): Desktop
     throw new Error('Desktop credential config authority does not match its import transaction.')
   }
   const now = new Date().toISOString()
+  const onboardingReceipt = parseDesktopOnboardingReceipt(parsed.growthOnboardingReceipt)
   return {
     provider,
     model: parsed.model || routerDefaultModel(routerTiers, routerDefaultTier) || defaults.model,
@@ -2384,6 +2534,8 @@ function normalizeDesktopCredential(parsed: Partial<DesktopConnection>): Desktop
     routerMode,
     routerDefaultTier,
     routerTiers,
+    ...(normalizeRouterPresetBinding(parsed.routerPresetBinding)
+      ? { routerPresetBinding: normalizeRouterPresetBinding(parsed.routerPresetBinding) } : {}),
     searchProvider,
     searchApiKeyEnv: parsed.searchApiKeyEnv || searchDefaults.envKey,
     encryptedSearchApiKey: parsed.encryptedSearchApiKey || '',
@@ -2393,6 +2545,7 @@ function normalizeDesktopCredential(parsed: Partial<DesktopConnection>): Desktop
     importTransactionId,
     createdAt: parsed.createdAt || now,
     updatedAt: parsed.updatedAt || now,
+    ...(onboardingReceipt ? { growthOnboardingReceipt: onboardingReceipt } : {}),
   }
 }
 
@@ -2406,6 +2559,7 @@ const DESKTOP_CREDENTIAL_CONFIGURATION_FIELDS = [
   'routerMode',
   'routerDefaultTier',
   'routerTiers',
+  'routerPresetBinding',
   'searchProvider',
   'searchApiKeyEnv',
   'encryptedSearchApiKey',
@@ -2608,6 +2762,7 @@ async function loadDesktopCredential(): Promise<DesktopConnection | null> {
     return normalizeDesktopCredential(JSON.parse(raw) as Partial<DesktopConnection>)
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code === 'ENOENT') return null
+    if (error instanceof DesktopRoutingConfigurationError) throw error
     throw new Error('Saved Desktop credential is invalid or unreadable.', { cause: error })
   }
 }
@@ -2615,9 +2770,11 @@ async function loadDesktopCredential(): Promise<DesktopConnection | null> {
 async function saveDesktopCredential(
   payload: OnboardingPayload,
   writerReserved = false,
+  completingOnboarding = false,
 ): Promise<DesktopConnection> {
   const targetProfile = activeDesktopProfile()
   const expectedCredential = await readOptionalDesktopText(targetProfile.credentialPath)
+  const existingConfigRaw = await readOptionalDesktopText(join(targetProfile.home, 'config.toml'))
   const existing = await loadDesktopCredential()
   if (existing?.configAuthority === 'profile') {
     throw new Error(
@@ -2626,31 +2783,62 @@ async function saveDesktopCredential(
   }
   const provider = normalizeProvider(payload.provider ?? existing?.provider)
   const defaults = providerDefaults(provider)
-  const legacyRouterMode = normalizeRouterMode(payload.routerMode ?? existing?.routerMode, provider)
   const hasModelRoutingMode = Object.prototype.hasOwnProperty.call(payload, 'modelRoutingMode')
   const hasRouterMode = Object.prototype.hasOwnProperty.call(payload, 'routerMode')
+  // An explicit new selection replaces the previous provider's mode. Validate
+  // both aliases only when the caller actually supplies both of them.
+  const rawRouterMode = hasRouterMode ? payload.routerMode
+    : hasModelRoutingMode ? undefined : existing?.routerMode
+  const legacyRouterMode = rawRouterMode === undefined
+    ? undefined : normalizeRouterMode(rawRouterMode, provider)
   const rawModelRoutingMode = hasModelRoutingMode
     ? payload.modelRoutingMode
     : hasRouterMode
       ? undefined
       : existing?.modelRoutingMode
-  const modelRoutingMode = normalizeModelRoutingMode(rawModelRoutingMode, provider, legacyRouterMode)
-  const routerMode = routerModeForModelRoutingMode(modelRoutingMode, provider)
-  const routerDefaultTier = normalizeTextTier(payload.routerDefaultTier ?? existing?.routerDefaultTier)
-  const defaultTiers = defaultRouterTiers(provider, routerMode)
-  const existingTiers = existing && existing.provider === provider && existing.routerMode === routerMode
-    ? existing.routerTiers
-    : defaultTiers
-  const routerTiers = normalizeRouterTiers(payload.routerTiers ?? existingTiers, defaultTiers)
+  let modelRoutingMode = normalizeModelRoutingMode(rawModelRoutingMode, provider, legacyRouterMode)
+  let routerMode = routerModeForModelRoutingMode(modelRoutingMode, provider)
+  let routerUpdate = resolveDesktopRouterUpdate({
+    payload,
+    existing,
+    routerMode,
+    routerDefaultTier: normalizeTextTier(payload.routerDefaultTier ?? existing?.routerDefaultTier),
+    // A disabled Router retains its ladder for re-enabling. Defaults used for
+    // genuine fresh creation/reset are generated only in this trusted process.
+    defaultTiers: defaultRouterTiers(provider, normalizeRouterMode(undefined, provider)),
+    freshConfig: completingOnboarding && existing === null && (
+      existingConfigRaw === null
+      || existingConfigRaw === renderUnconfiguredDesktopConfig(desktopLocale, process.platform)
+    ),
+    providerChangedWithoutConfig: existingConfigRaw === null && existing !== null && existing.provider !== provider,
+  })
+  let primaryChange: DesktopPrimaryProviderChange | null = null
+  if (payload.provider !== undefined && existingConfigRaw !== null) {
+    const { prepareDesktopPrimaryProviderChange } = await import('./desktop-primary-provider-change.js')
+    primaryChange = prepareDesktopPrimaryProviderChange({
+      existingRaw: existingConfigRaw,
+      provider,
+      defaultTiers: defaultRouterTiers(provider, normalizeRouterMode(undefined, provider)),
+      requestedRouter: routerUpdate,
+      ...(hasModelRoutingMode || hasRouterMode ? { requestedMode: modelRoutingMode } : {}),
+    })
+    if (primaryChange) {
+      routerUpdate = { ...primaryChange.router, writeIntent: 'preserve' }
+      modelRoutingMode = primaryChange.modelRoutingMode
+      routerMode = routerModeForModelRoutingMode(modelRoutingMode, provider)
+    }
+  }
+  const providerChanged = primaryChange !== null || (existing !== null && existing.provider !== provider)
+  const { routerDefaultTier, routerTiers, routerPresetBinding } = routerUpdate
   const searchProvider = normalizeSearchProvider(payload.searchProvider ?? existing?.searchProvider)
   const searchDefaults = searchProviderDefaults(searchProvider)
   const apiKey = String(payload.apiKey || '').trim()
   const routerModel = routerDefaultModel(routerTiers, routerDefaultTier)
-  const directModel = String(payload.model || existing?.model || defaults.model).trim()
-  const model = routerMode === 'disabled'
+  const directModel = String(payload.model || (!providerChanged && existing?.model) || defaults.model).trim()
+  const model = routerMode === 'disabled' || (primaryChange && routerPresetBinding !== 'follow_primary')
     ? directModel
     : routerModel || directModel
-  const baseUrl = String(payload.baseUrl || existing?.baseUrl || defaults.baseUrl).trim() || defaults.baseUrl
+  const baseUrl = String(payload.baseUrl || (!providerChanged && existing?.baseUrl) || defaults.baseUrl).trim() || defaults.baseUrl
   const searchApiKey = String(payload.searchApiKey || '').trim()
   const resolvedApiKey = apiKey || (existing && provider === existing.provider ? decryptApiKey(existing) : '')
   const resolvedSearchApiKey = searchDefaults.requiresApiKey
@@ -2666,9 +2854,21 @@ async function saveDesktopCredential(
     ? normalizeBooleanSetting(payload.disableNetworkObservability, existing?.disableNetworkObservability ?? false)
     : configDisableNetworkObservability ?? existing?.disableNetworkObservability ?? false
   const configLocale = desktopLocaleChoice(payload.locale) ?? desktopLocale
+  const hasConsentPayload = Object.prototype.hasOwnProperty.call(payload, 'reliabilityDiagnosticsEnabled')
+    || Object.prototype.hasOwnProperty.call(payload, 'productAnalyticsEnabled')
+  const consentOverride = hasConsentPayload
+    ? applyDesktopTelemetryConsentPayload(
+        parseDesktopTelemetryConsent(existingConfigRaw),
+        payload,
+        new Date().toISOString(),
+      )
+    : Object.prototype.hasOwnProperty.call(payload, 'disableNetworkObservability')
+      ? emptyDesktopTelemetryConsent()
+      : null
 
   if (defaults.requiresApiKey && !encryptedApiKey) throw new Error('API key is required.')
-  if (modelRoutingMode === 'llm_ensemble' && !modelRoutingModeAllowed(modelRoutingMode, provider)) {
+  if (modelRoutingMode === 'llm_ensemble' && !modelRoutingModeAllowed(modelRoutingMode, provider)
+    && !(primaryChange && !hasModelRoutingMode && !hasRouterMode)) {
     throw new Error('LLM Ensemble requires OpenRouter or TokenRhythm in desktop onboarding.')
   }
   if (!routerModel && routerMode !== 'disabled') throw new Error('Router tiers require a default model.')
@@ -2678,6 +2878,16 @@ async function saveDesktopCredential(
   }
 
   const now = new Date().toISOString()
+  // Publish the receipt with the same recoverable settings transaction. It is
+  // valid only for actual onboarding completion in a verified fresh profile.
+  const effectiveTelemetryConsent = resolveDesktopTelemetryConsent(
+    existingConfigRaw, disableNetworkObservability,
+    consentOverride ?? parseDesktopTelemetryConsent(existingConfigRaw),
+  )
+  const onboardingReceipt = completingOnboarding
+    ? desktopGrowthTelemetry.prepareOnboardingReceipt(targetProfile.home, effectiveTelemetryConsent.growth)
+    : null
+  const persistedOnboardingReceipt = onboardingReceipt ?? existing?.growthOnboardingReceipt
   const credential: DesktopConnection = {
     provider,
     model,
@@ -2688,6 +2898,7 @@ async function saveDesktopCredential(
     routerMode,
     routerDefaultTier,
     routerTiers,
+    ...(routerPresetBinding ? { routerPresetBinding } : {}),
     searchProvider,
     searchApiKeyEnv: searchDefaults.envKey,
     encryptedSearchApiKey,
@@ -2697,12 +2908,22 @@ async function saveDesktopCredential(
     importTransactionId: '',
     createdAt: existing?.createdAt || now,
     updatedAt: now,
+    ...(persistedOnboardingReceipt ? { growthOnboardingReceipt: persistedOnboardingReceipt } : {}),
   }
 
   const finishWriter = writerReserved
     ? () => {}
     : beginDesktopWriterOperation('save desktop settings')
   try {
+    // Invalidate a previously granted early-start snapshot before changing the
+    // authoritative config. If the settings transaction fails, collection stays
+    // off until the next successful startup reconciliation.
+    if (consentOverride !== null) {
+      await runDesktopTelemetryConsentSideEffect(
+        'pre_commit',
+        () => writeDesktopConsentMirror(targetProfile, existingConfigRaw, true),
+      )
+    }
     await applyDesktopSettingsPair(
       targetProfile,
       credential,
@@ -2710,6 +2931,13 @@ async function saveDesktopCredential(
       expectedCredential,
       writerReserved,
       configLocale,
+      consentOverride,
+      routerUpdate.writeIntent,
+      primaryChange,
+    )
+    await runDesktopTelemetryConsentSideEffect(
+      'post_commit',
+      () => syncDesktopConsentMirror(targetProfile),
     )
     rememberDecryptedCredentialSecrets(
       credential,
@@ -2757,6 +2985,7 @@ async function saveImportedDesktopCredential(
   importTransactionId: string,
   apiKeyOverride = '',
   writerReserved = false,
+  consentPayload: OnboardingPayload | null = null,
 ): Promise<DesktopConnection> {
   const profile = primaryDesktopProfile()
   const expectedCredential = await readOptionalDesktopText(profile.credentialPath)
@@ -2764,6 +2993,20 @@ async function saveImportedDesktopCredential(
   if (importedConfig === null) {
     throw new Error('The imported profile config.toml is missing; recover the profile before adoption.')
   }
+  const hasImportedConsentPayload = consentPayload !== null && (
+    Object.prototype.hasOwnProperty.call(consentPayload, 'reliabilityDiagnosticsEnabled')
+    || Object.prototype.hasOwnProperty.call(consentPayload, 'productAnalyticsEnabled')
+  )
+  const importedConsent = !hasImportedConsentPayload
+    ? null
+    : applyDesktopTelemetryConsentPayload(
+        parseDesktopTelemetryConsent(importedConfig),
+        consentPayload,
+        new Date().toISOString(),
+      )
+  const candidateConfig = importedConsent === null
+    ? importedConfig
+    : replaceDesktopTelemetryConsentInPrivacy(importedConfig, importedConsent)
   if (gatewayState.url && await healthCheck(gatewayState.url)) {
     throw new Error('A gateway is still serving this profile; stop it before adopting credentials.')
   }
@@ -2773,6 +3016,12 @@ async function saveImportedDesktopCredential(
     ? () => {}
     : beginDesktopWriterOperation('adopt imported desktop credential')
   try {
+    if (importedConsent !== null) {
+      await runDesktopTelemetryConsentSideEffect(
+        'pre_commit',
+        () => writeDesktopConsentMirror(profile, importedConfig, true),
+      )
+    }
     const inspection = await preflightDesktopConfigWrite(profile)
     const result = await runRecoveryCli(
       profile,
@@ -2785,7 +3034,7 @@ async function saveImportedDesktopCredential(
       ],
       JSON.stringify({
         expected_config: importedConfig,
-        config: importedConfig,
+        config: candidateConfig,
         expected_credential: expectedCredential,
         credential: candidateCredential,
       }),
@@ -2809,14 +3058,19 @@ async function saveImportedDesktopCredential(
     ) {
       throw new Error('Imported credential readback did not match the verified transaction.')
     }
+    await runDesktopTelemetryConsentSideEffect(
+      'post_commit',
+      () => syncDesktopConsentMirror(profile),
+    )
     return readback
   } finally {
     finishWriter()
   }
 }
 
-// Sections the desktop config template owns and regenerates from the credential
-// on every write. Everything else in config.toml is treated as foreign
+// Sections the Desktop template emits. Router writes additionally require
+// explicit intent; otherwise its actual config subtree is preserved. Everything
+// else in config.toml is treated as foreign
 // (Control-UI/RPC-owned) and preserved verbatim across regenerations.
 const DESKTOP_OWNED_CONFIG_SECTIONS = ['llm', 'squilla_router', 'llm_ensemble', 'privacy', 'control_ui']
 // Top-level (pre-section) keys the desktop template emits itself. Any OTHER
@@ -2827,7 +3081,7 @@ const DESKTOP_OWNED_CONFIG_PREAMBLE_KEYS = ['search_provider', 'search_api_key_e
 
 function isDesktopOwnedConfigSection(header: string): boolean {
   const name = header.trim()
-  return DESKTOP_OWNED_CONFIG_SECTIONS.some((owned) => name === owned || name.startsWith(`${owned}.`))
+  return DESKTOP_OWNED_CONFIG_SECTIONS.some((owned) => name === owned || name.startsWith(`${owned}\u0000`))
 }
 
 // Return the lines of every top-level section that the desktop template does not
@@ -2836,11 +3090,12 @@ function isDesktopOwnedConfigSection(header: string): boolean {
 function foreignConfigSectionLines(raw: string): string[] {
   const out: string[] = []
   let keeping = false
-  for (const rawLine of raw.split(/\r?\n/)) {
-    const header = rawLine.trim().match(/^\[+\s*([^\]]+?)\s*\]+$/)
-    if (header) keeping = !isDesktopOwnedConfigSection(header[1] ?? '')
+  const sections = desktopTomlSectionNames(raw)
+  raw.split(/\r?\n/).forEach((rawLine, index) => {
+    const header = sections[index]
+    if (header !== null && header !== undefined) keeping = !isDesktopOwnedConfigSection(header)
     if (keeping) out.push(rawLine)
-  }
+  })
   while (out.length && out[out.length - 1].trim() === '') out.pop()
   return out
 }
@@ -2849,14 +3104,16 @@ function foreignConfigSectionLines(raw: string): string[] {
 // NOT emit itself, so RPC-written global scalars (llm_request_timeout_seconds,
 // log_level, workspace_dir, diagnostics_enabled, …) survive a regeneration. These
 // must be re-emitted in the preamble (before any [section]) to stay top-level.
-function foreignConfigPreambleLines(raw: string): string[] {
+function foreignConfigPreambleLines(raw: string, excludedKeys: readonly string[] = []): string[] {
   const out: string[] = []
-  for (const rawLine of raw.split(/\r?\n/)) {
+  const routerLines = desktopRouterPreambleLineIndexes(raw)
+  for (const [index, rawLine] of raw.split(/\r?\n/).entries()) {
+    if (routerLines.has(index)) continue
     if (/^\s*\[/.test(rawLine)) break // reached the first section header
     const key = rawLine.match(/^\s*(?:([A-Za-z0-9_-]+)|"([A-Za-z0-9_-]+)"|'([A-Za-z0-9_-]+)')\s*=/)
     if (!key) continue // blank line or comment
     const keyName = key[1] || key[2] || key[3] || ''
-    if (DESKTOP_OWNED_CONFIG_PREAMBLE_KEYS.includes(keyName)) continue
+    if (DESKTOP_OWNED_CONFIG_PREAMBLE_KEYS.includes(keyName) || excludedKeys.includes(keyName)) continue
     out.push(rawLine)
   }
   return out
@@ -2914,13 +3171,19 @@ function renderDesktopConfigAfterPreflight(
   inspection: RecoveryProtocolResult,
   existingRaw: string | null,
   defaultLocale: DesktopLocale,
+  consentOverride: DesktopTelemetryConsent | null = null,
+  routerWriteIntent: DesktopRouterWriteIntent = 'preserve',
+  primaryChange: DesktopPrimaryProviderChange | null = null,
 ): string {
+  // Retain the legacy privacy writer as the no-scoped-consent path. The
+  // scoped writer extends it only when an explicit v2 decision exists.
+  const basePrivacyLines = privacyConfigTomlLines(credential)
   let preservedForeignSections: string[] = []
   let preservedForeignPreamble: string[] = []
   const preservedControlUiLocale = persistedControlUiDefaultLocale(existingRaw)
   if (existingRaw !== null) {
     preservedForeignSections = foreignConfigSectionLines(existingRaw)
-    preservedForeignPreamble = foreignConfigPreambleLines(existingRaw)
+    preservedForeignPreamble = foreignConfigPreambleLines(existingRaw, primaryChange ? ['llm', 'llm_ensemble'] : [])
   }
   const hasPersistedState = preservedForeignPreamble.some((line) => (
     /^\s*(?:state_dir|"state_dir"|'state_dir')\s*=/.test(line)
@@ -2933,6 +3196,7 @@ function renderDesktopConfigAfterPreflight(
     `search_provider = ${tomlString(credential.searchProvider)}`,
     ...(credential.searchApiKeyEnv ? [`search_api_key_env = ${tomlString(credential.searchApiKeyEnv)}`] : []),
     ...preservedForeignPreamble,
+    ...(primaryChange?.routerPreamble ?? desktopRouterConfigPreambleLines(credential, existingRaw, routerWriteIntent)),
     '',
     '[llm]',
     `provider = ${tomlString(credential.provider)}`,
@@ -2940,9 +3204,13 @@ function renderDesktopConfigAfterPreflight(
     ...(credential.apiKeyEnv ? [`api_key_env = ${tomlString(credential.apiKeyEnv)}`] : []),
     `base_url = ${tomlString(credential.baseUrl)}`,
     '',
-    ...routerConfigTomlLines(credential),
-    ...ensembleConfigTomlLines(credential),
-    ...privacyConfigTomlLines(credential),
+    ...(primaryChange?.routerLines ?? desktopRouterConfigTomlLines(credential, existingRaw, routerWriteIntent)),
+    ...(primaryChange?.ensembleLines ?? ensembleConfigTomlLines(credential)),
+    ...(consentOverride === null
+      && parseDesktopTelemetryConsent(existingRaw).reliability.enabled === null
+      && parseDesktopTelemetryConsent(existingRaw).growth.enabled === null
+      ? basePrivacyLines
+      : scopedPrivacyConfigTomlLines(credential, existingRaw, consentOverride)),
     '',
     ...freshDesktopSandboxConfigLines(existingRaw, process.platform),
     '[control_ui]',
@@ -2961,6 +3229,9 @@ async function applyDesktopSettingsPair(
   expectedCredential: string | null,
   writerReserved = false,
   defaultLocale = desktopLocale,
+  consentOverride: DesktopTelemetryConsent | null = null,
+  routerWriteIntent: DesktopRouterWriteIntent = 'preserve',
+  primaryChange: DesktopPrimaryProviderChange | null = null,
 ): Promise<RecoveryProtocolResult> {
   const targetProfileKey = desktopProfileKey(profile)
   if (desktopProfileKey() !== targetProfileKey) {
@@ -2978,6 +3249,9 @@ async function applyDesktopSettingsPair(
     }
     const inspection = await preflightDesktopConfigWrite(profile)
     const expectedConfig = await readOptionalDesktopText(join(profile.home, 'config.toml'))
+    if (primaryChange && expectedConfig !== primaryChange.expectedConfig) {
+      throw new Error('Configuration changed while the provider switch was being prepared; retry.')
+    }
     const currentCredential = await readOptionalDesktopText(profile.credentialPath)
     if (currentCredential !== expectedCredential) {
       throw new Error('Desktop credential changed while settings were being prepared; retry.')
@@ -2988,6 +3262,9 @@ async function applyDesktopSettingsPair(
       inspection,
       expectedConfig,
       defaultLocale,
+      consentOverride,
+      routerWriteIntent,
+      primaryChange,
     )
     const result = await runRecoveryCli(
       profile,
@@ -3071,6 +3348,8 @@ function settingsSnapshot(connection: DesktopConnection | null): DesktopSettings
     routerMode,
     routerDefaultTier,
     routerTiers,
+    ...(normalizeRouterPresetBinding(connection?.routerPresetBinding)
+      ? { routerPresetBinding: normalizeRouterPresetBinding(connection?.routerPresetBinding) } : {}),
     searchProvider,
     searchApiKeyEnv: connection?.searchApiKeyEnv || searchDefaults.envKey,
     searchApiKeyConfigured: Boolean(connection?.encryptedSearchApiKey),
@@ -3105,6 +3384,7 @@ function clearReusableGatewayState(): void {
   gatewayState.owned = false
   gatewayState.status = 'stopped'
   gatewayState.error = undefined
+  gatewayState.sandboxUpgrade = null
   gatewayConnectionInstanceId = null
   gatewayProfileKey = null
   publishGatewayConnection()
@@ -3454,9 +3734,14 @@ const DESKTOP_MESSAGES: Record<DesktopLocale, Record<string, string>> = {
     'update.manifestInvalid': 'The update information is invalid. Please try again later.',
     'update.sourceUnavailable': 'The update service is temporarily unavailable. Please try again later.',
     'update.checksumUnavailable': 'The installer cannot be verified because the official checksum is unavailable. No installer was opened.',
-    'update.integrityFailed': 'The downloaded installer failed integrity verification and was deleted.',
+    'update.integrityFailed': 'The installer failed integrity verification. Download the update again.',
     'update.downloadFailed': 'The update could not be downloaded. Please try again.',
     'update.installFailed': 'The update installer could not be opened. Please try again.',
+    'update.quitAndInstall': 'Quit and install',
+    'update.signatureInvalid': 'The installer signature does not match OpenSquilla. Download it again from the official release.',
+    'update.signatureUnavailable': 'Windows could not verify the installer signature. Try again; no installer was started.',
+    'update.installationAmbiguous': 'The current installation could not be identified uniquely. Use Show installer to select it in the installation wizard.',
+    'update.writersBusy': 'OpenSquilla is still saving changes. Let it finish, then try installing again.',
     'update.moveToApplications': 'Move OpenSquilla to your Applications folder to enable automatic updates, then try again.',
     'update.gatewayShutdownTimeout': 'OpenSquilla could not stop the local runtime. Try relaunching to update again.',
     'update.mockInstallTitle': 'Mock update restart',
@@ -3522,12 +3807,11 @@ const DESKTOP_MESSAGES: Record<DesktopLocale, Record<string, string>> = {
     'onboarding.step1.continue': 'Continue',
     'onboarding.step2.badge': 'Required',
     'onboarding.step2.heading': 'Model service setup',
-    'onboarding.step2.subtitle': 'Enter an API key to get started.',
+    'onboarding.step2.subtitle': "Connect a model service, or finish later in Settings.",
     'onboarding.step2.tokenrhythmTitle': 'TokenRhythm limited-time offer',
     'onboarding.step2.tokenrhythmValue': 'TokenRhythm API calls are free for a limited time.',
-    'onboarding.step2.tokenrhythmRegistration': 'Register to claim ¥68 in free tokens.',
-    'onboarding.step2.tokenrhythmCta': 'Claim for free',
-    'onboarding.step2.tokenrhythmCtaExternalLabel': 'Claim for free (opens in external browser)',
+    'onboarding.step2.tokenrhythmCta': 'Limited-time offer',
+    'onboarding.step2.tokenrhythmCtaExternalLabel': 'Limited-time offer (opens in external browser)',
     'onboarding.step2.otherProviders': 'Other providers',
     'onboarding.step2.apiKey': 'API key',
     'onboarding.step2.endpointSummary': 'Endpoint and direct model',
@@ -3551,8 +3835,9 @@ const DESKTOP_MESSAGES: Record<DesktopLocale, Record<string, string>> = {
     'onboarding.step5.subtitle': 'Search is optional. Start without another key, or connect a runtime-supported search provider.',
     'onboarding.step5.searchKey': 'Search API key',
     'onboarding.step5.searchHintDefault': 'DuckDuckGo is enough to start.',
+    'onboarding.telemetry.notice': 'Operation results, errors, activation milestones, and actual feature usage help improve OpenSquilla. Uploads follow the network reporting setting in Security & Privacy. Prompts, replies, files, task parameters, and raw account IDs are excluded.',
     'onboarding.step5.back': 'Back',
-    'onboarding.step5.finish': 'Start OpenSquilla',
+    'onboarding.step5.finish': "Save and enter",
   },
   'zh-Hans': {
     'menu.edit': '编辑',
@@ -3586,9 +3871,14 @@ const DESKTOP_MESSAGES: Record<DesktopLocale, Record<string, string>> = {
     'update.manifestInvalid': '更新信息无效，请稍后重试。',
     'update.sourceUnavailable': '更新服务暂时不可用，请稍后重试。',
     'update.checksumUnavailable': '无法获取官方校验和，因此不能验证安装包；未打开任何安装包。',
-    'update.integrityFailed': '下载的安装包未通过完整性校验，已将其删除。',
+    'update.integrityFailed': '安装包未通过完整性校验。请重新下载更新。',
     'update.downloadFailed': '更新下载安装失败，请重试。',
     'update.installFailed': '无法打开更新安装包，请重试。',
+    'update.quitAndInstall': '退出并安装',
+    'update.signatureInvalid': '安装包签名与 OpenSquilla 不符，请从官方发布重新下载。',
+    'update.signatureUnavailable': 'Windows 暂时无法验证安装包签名，请重试；尚未启动安装程序。',
+    'update.installationAmbiguous': '无法唯一确定当前安装位置，请点击“显示安装包”并在安装向导中选择。',
+    'update.writersBusy': 'OpenSquilla 仍在保存更改，请等待完成后再次安装。',
     'update.moveToApplications': '请先将 OpenSquilla 移动到"应用程序"文件夹以启用自动更新，然后重试。',
     'update.gatewayShutdownTimeout': 'OpenSquilla 无法停止本地运行时。请再次尝试重启以更新。',
     'update.mockInstallTitle': '模拟重启更新',
@@ -3654,12 +3944,11 @@ const DESKTOP_MESSAGES: Record<DesktopLocale, Record<string, string>> = {
     'onboarding.step1.continue': '继续',
     'onboarding.step2.badge': '必填',
     'onboarding.step2.heading': '模型服务配置',
-    'onboarding.step2.subtitle': '输入 API 密钥即可开始使用',
+    'onboarding.step2.subtitle': "连接模型服务，或稍后在设置中完成。",
     'onboarding.step2.tokenrhythmTitle': 'TokenRhythm 限时福利',
     'onboarding.step2.tokenrhythmValue': 'TokenRhythm API 调用限时免费。',
-    'onboarding.step2.tokenrhythmRegistration': '注册即领价值 68 元 Token',
-    'onboarding.step2.tokenrhythmCta': '免费领取',
-    'onboarding.step2.tokenrhythmCtaExternalLabel': '免费领取价值 68 元 TokenRhythm Token（在外部浏览器中打开）',
+    'onboarding.step2.tokenrhythmCta': '限时福利',
+    'onboarding.step2.tokenrhythmCtaExternalLabel': '限时福利（在外部浏览器中打开）',
     'onboarding.step2.otherProviders': '其他提供商',
     'onboarding.step2.apiKey': 'API 密钥',
     'onboarding.step2.endpointSummary': '端点和直连模型',
@@ -3683,8 +3972,9 @@ const DESKTOP_MESSAGES: Record<DesktopLocale, Record<string, string>> = {
     'onboarding.step5.subtitle': '搜索为可选项。可以不添加其他密钥直接开始，或连接运行时支持的搜索提供商。',
     'onboarding.step5.searchKey': '搜索 API 密钥',
     'onboarding.step5.searchHintDefault': 'DuckDuckGo 足以开始使用。',
+    'onboarding.telemetry.notice': '操作结果、错误、激活流程和功能实际使用次数用于改进 OpenSquilla，统一遵循“安全与隐私”中的网络上报设置；不包含提示词、回复、文件、任务参数或原始账号 ID。',
     'onboarding.step5.back': '返回',
-    'onboarding.step5.finish': '启动 OpenSquilla',
+    'onboarding.step5.finish': "保存并进入",
   },
   ja: {
     'menu.edit': '編集',
@@ -3718,9 +4008,14 @@ const DESKTOP_MESSAGES: Record<DesktopLocale, Record<string, string>> = {
     'update.manifestInvalid': 'アップデート情報が無効です。しばらくしてから再試行してください。',
     'update.sourceUnavailable': 'アップデートサービスを一時的に利用できません。後でもう一度お試しください。',
     'update.checksumUnavailable': '正規のチェックサムを取得できないため、インストーラを検証できません。インストーラは開かれていません。',
-    'update.integrityFailed': 'ダウンロードしたインストーラは整合性検証に失敗したため削除されました。',
+    'update.integrityFailed': 'インストーラーの整合性を確認できませんでした。更新を再ダウンロードしてください。',
     'update.downloadFailed': 'アップデートをダウンロードできませんでした。もう一度お試しください。',
     'update.installFailed': 'アップデートインストーラを開けませんでした。もう一度お試しください。',
+    'update.quitAndInstall': '終了してインストール',
+    'update.signatureInvalid': 'インストーラの署名が OpenSquilla と一致しません。公式リリースから再ダウンロードしてください。',
+    'update.signatureUnavailable': 'Windows が署名を検証できませんでした。再試行してください。インストーラは起動していません。',
+    'update.installationAmbiguous': '現在のインストール先を特定できません。「インストーラを表示」からウィザードで選択してください。',
+    'update.writersBusy': '変更を保存中です。完了後にインストールを再試行してください。',
     'update.moveToApplications': '自動アップデートを有効にするには、OpenSquilla を「アプリケーション」フォルダに移動してから再試行してください。',
     'update.gatewayShutdownTimeout': 'ローカルランタイムを停止できませんでした。もう一度、再起動してアップデートをお試しください。',
     'uninstall.confirmTitle': 'ローカルの OpenSquilla デスクトップデータを削除しますか？',
@@ -3781,12 +4076,11 @@ const DESKTOP_MESSAGES: Record<DesktopLocale, Record<string, string>> = {
     'onboarding.step1.continue': '続行',
     'onboarding.step2.badge': '必須',
     'onboarding.step2.heading': 'モデルサービス設定',
-    'onboarding.step2.subtitle': 'API キーを入力して利用を開始します。',
+    'onboarding.step2.subtitle': "モデルサービスに接続するか、後で設定できます。",
     'onboarding.step2.tokenrhythmTitle': 'TokenRhythm 期間限定特典',
     'onboarding.step2.tokenrhythmValue': 'TokenRhythm API は期間限定で無料です。',
-    'onboarding.step2.tokenrhythmRegistration': '登録で68元相当のTokenを無料進呈',
-    'onboarding.step2.tokenrhythmCta': '無料で受け取る',
-    'onboarding.step2.tokenrhythmCtaExternalLabel': '無料で受け取る（外部ブラウザーで開きます）',
+    'onboarding.step2.tokenrhythmCta': '期間限定特典',
+    'onboarding.step2.tokenrhythmCtaExternalLabel': '期間限定特典（外部ブラウザーで開きます）',
     'onboarding.step2.otherProviders': 'その他のプロバイダー',
     'onboarding.step2.apiKey': 'API キー',
     'onboarding.step2.endpointSummary': 'エンドポイントと直接モデル',
@@ -3814,7 +4108,7 @@ const DESKTOP_MESSAGES: Record<DesktopLocale, Record<string, string>> = {
     'onboarding.step5.searchKey': '検索 API キー',
     'onboarding.step5.searchHintDefault': 'DuckDuckGo で始めるには十分です。',
     'onboarding.step5.back': '戻る',
-    'onboarding.step5.finish': 'OpenSquilla を起動',
+    'onboarding.step5.finish': "保存して続ける",
   },
   fr: {
     'menu.edit': 'Édition',
@@ -3848,9 +4142,14 @@ const DESKTOP_MESSAGES: Record<DesktopLocale, Record<string, string>> = {
     'update.manifestInvalid': 'Les informations de mise à jour sont invalides. Réessayez plus tard.',
     'update.sourceUnavailable': 'Le service de mise à jour est temporairement indisponible. Réessayez plus tard.',
     'update.checksumUnavailable': 'Le programme d’installation ne peut pas être vérifié car la somme de contrôle officielle est indisponible. Aucun programme n’a été ouvert.',
-    'update.integrityFailed': 'Le programme d’installation téléchargé a échoué au contrôle d’intégrité et a été supprimé.',
+    'update.integrityFailed': 'Le programme d’installation a échoué au contrôle d’intégrité. Téléchargez à nouveau la mise à jour.',
     'update.downloadFailed': 'Impossible de télécharger la mise à jour. Réessayez.',
     'update.installFailed': 'Impossible d’ouvrir le programme d’installation. Réessayez.',
+    'update.quitAndInstall': 'Quitter et installer',
+    'update.signatureInvalid': 'La signature ne correspond pas à OpenSquilla. Téléchargez de nouveau la version officielle.',
+    'update.signatureUnavailable': 'Windows ne peut pas vérifier la signature. Réessayez ; le programme d’installation n’a pas été lancé.',
+    'update.installationAmbiguous': 'L’installation actuelle ne peut pas être identifiée. Affichez le programme d’installation pour la sélectionner dans l’assistant.',
+    'update.writersBusy': 'OpenSquilla enregistre encore les modifications. Réessayez après leur enregistrement.',
     'update.moveToApplications': 'Déplacez OpenSquilla dans votre dossier Applications pour activer les mises à jour automatiques, puis réessayez.',
     'update.gatewayShutdownTimeout': 'OpenSquilla n\'a pas pu arrêter le runtime local. Réessayez de relancer la mise à jour.',
     'uninstall.confirmTitle': 'Supprimer les données locales du bureau OpenSquilla ?',
@@ -3911,12 +4210,11 @@ const DESKTOP_MESSAGES: Record<DesktopLocale, Record<string, string>> = {
     'onboarding.step1.continue': 'Continuer',
     'onboarding.step2.badge': 'Requis',
     'onboarding.step2.heading': 'Configuration du service de modèles',
-    'onboarding.step2.subtitle': 'Saisissez une clé API pour commencer.',
+    'onboarding.step2.subtitle': "Connectez un service de modèles ou configurez-le plus tard.",
     'onboarding.step2.tokenrhythmTitle': 'Offre limitée TokenRhythm',
     'onboarding.step2.tokenrhythmValue': 'Les appels à l’API TokenRhythm sont gratuits pendant une durée limitée.',
-    'onboarding.step2.tokenrhythmRegistration': 'Inscrivez-vous pour recevoir 68 ¥ de tokens gratuits.',
-    'onboarding.step2.tokenrhythmCta': 'Obtenir gratuitement',
-    'onboarding.step2.tokenrhythmCtaExternalLabel': 'Obtenir gratuitement (s’ouvre dans le navigateur externe)',
+    'onboarding.step2.tokenrhythmCta': 'Offre limitée',
+    'onboarding.step2.tokenrhythmCtaExternalLabel': 'Offre limitée (s’ouvre dans le navigateur externe)',
     'onboarding.step2.otherProviders': 'Autres fournisseurs',
     'onboarding.step2.apiKey': 'Clé API',
     'onboarding.step2.endpointSummary': 'Point de terminaison et modèle direct',
@@ -3944,7 +4242,7 @@ const DESKTOP_MESSAGES: Record<DesktopLocale, Record<string, string>> = {
     'onboarding.step5.searchKey': 'Clé API de recherche',
     'onboarding.step5.searchHintDefault': 'DuckDuckGo suffit pour démarrer.',
     'onboarding.step5.back': 'Retour',
-    'onboarding.step5.finish': 'Démarrer OpenSquilla',
+    'onboarding.step5.finish': "Enregistrer et continuer",
   },
   de: {
     'menu.edit': 'Bearbeiten',
@@ -3978,9 +4276,14 @@ const DESKTOP_MESSAGES: Record<DesktopLocale, Record<string, string>> = {
     'update.manifestInvalid': 'Die Update-Informationen sind ungültig. Versuchen Sie es später erneut.',
     'update.sourceUnavailable': 'Der Update-Dienst ist vorübergehend nicht verfügbar. Versuchen Sie es später erneut.',
     'update.checksumUnavailable': 'Das Installationsprogramm kann nicht geprüft werden, weil die offizielle Prüfsumme nicht verfügbar ist. Es wurde nichts geöffnet.',
-    'update.integrityFailed': 'Das heruntergeladene Installationsprogramm hat die Integritätsprüfung nicht bestanden und wurde gelöscht.',
+    'update.integrityFailed': 'Das Installationsprogramm hat die Integritätsprüfung nicht bestanden. Lade das Update erneut herunter.',
     'update.downloadFailed': 'Das Update konnte nicht heruntergeladen werden. Versuchen Sie es erneut.',
     'update.installFailed': 'Das Update-Installationsprogramm konnte nicht geöffnet werden. Versuchen Sie es erneut.',
+    'update.quitAndInstall': 'Beenden und installieren',
+    'update.signatureInvalid': 'Die Signatur stimmt nicht mit OpenSquilla überein. Laden Sie die offizielle Version erneut herunter.',
+    'update.signatureUnavailable': 'Windows konnte die Signatur nicht prüfen. Versuchen Sie es erneut; die Installation wurde nicht gestartet.',
+    'update.installationAmbiguous': 'Die aktuelle Installation ist nicht eindeutig. Öffnen Sie das Installationsprogramm und wählen Sie sie im Assistenten aus.',
+    'update.writersBusy': 'OpenSquilla speichert noch Änderungen. Versuchen Sie die Installation danach erneut.',
     'update.moveToApplications': 'Verschieben Sie OpenSquilla in Ihren Programme-Ordner, um automatische Updates zu aktivieren, und versuchen Sie es erneut.',
     'update.gatewayShutdownTimeout': 'OpenSquilla konnte die lokale Laufzeitumgebung nicht stoppen. Versuchen Sie erneut, zum Aktualisieren neu zu starten.',
     'uninstall.confirmTitle': 'Lokale OpenSquilla-Desktop-Daten löschen?',
@@ -4041,12 +4344,11 @@ const DESKTOP_MESSAGES: Record<DesktopLocale, Record<string, string>> = {
     'onboarding.step1.continue': 'Weiter',
     'onboarding.step2.badge': 'Erforderlich',
     'onboarding.step2.heading': 'Modellservice konfigurieren',
-    'onboarding.step2.subtitle': 'Geben Sie einen API-Schlüssel ein, um zu beginnen.',
+    'onboarding.step2.subtitle': "Verbinde einen Modelldienst oder richte ihn später ein.",
     'onboarding.step2.tokenrhythmTitle': 'TokenRhythm-Aktion',
     'onboarding.step2.tokenrhythmValue': 'TokenRhythm-API-Aufrufe sind für kurze Zeit kostenlos.',
-    'onboarding.step2.tokenrhythmRegistration': 'Registrieren und 68 ¥ Gratis-Token erhalten.',
-    'onboarding.step2.tokenrhythmCta': 'Kostenlos erhalten',
-    'onboarding.step2.tokenrhythmCtaExternalLabel': 'Kostenlos erhalten (wird im externen Browser geöffnet)',
+    'onboarding.step2.tokenrhythmCta': 'Zeitlich begrenztes Angebot',
+    'onboarding.step2.tokenrhythmCtaExternalLabel': 'Zeitlich begrenztes Angebot (wird im externen Browser geöffnet)',
     'onboarding.step2.otherProviders': 'Weitere Anbieter',
     'onboarding.step2.apiKey': 'API-Schlüssel',
     'onboarding.step2.endpointSummary': 'Endpunkt und direktes Modell',
@@ -4074,7 +4376,7 @@ const DESKTOP_MESSAGES: Record<DesktopLocale, Record<string, string>> = {
     'onboarding.step5.searchKey': 'Such-API-Schlüssel',
     'onboarding.step5.searchHintDefault': 'DuckDuckGo reicht für den Start.',
     'onboarding.step5.back': 'Zurück',
-    'onboarding.step5.finish': 'OpenSquilla starten',
+    'onboarding.step5.finish': "Speichern und öffnen",
   },
   es: {
     'menu.edit': 'Edición',
@@ -4108,9 +4410,14 @@ const DESKTOP_MESSAGES: Record<DesktopLocale, Record<string, string>> = {
     'update.manifestInvalid': 'La información de actualización no es válida. Inténtalo más tarde.',
     'update.sourceUnavailable': 'El servicio de actualizaciones no está disponible temporalmente. Inténtalo más tarde.',
     'update.checksumUnavailable': 'No se puede verificar el instalador porque la suma de comprobación oficial no está disponible. No se abrió ningún instalador.',
-    'update.integrityFailed': 'El instalador descargado no superó la verificación de integridad y se eliminó.',
+    'update.integrityFailed': 'El instalador no superó la verificación de integridad. Descarga la actualización de nuevo.',
     'update.downloadFailed': 'No se pudo descargar la actualización. Inténtalo de nuevo.',
     'update.installFailed': 'No se pudo abrir el instalador de la actualización. Inténtalo de nuevo.',
+    'update.quitAndInstall': 'Salir e instalar',
+    'update.signatureInvalid': 'La firma no coincide con OpenSquilla. Descarga de nuevo la versión oficial.',
+    'update.signatureUnavailable': 'Windows no pudo verificar la firma. Inténtalo de nuevo; el instalador no se ha iniciado.',
+    'update.installationAmbiguous': 'No se pudo identificar la instalación actual. Muestra el instalador y selecciónala en el asistente.',
+    'update.writersBusy': 'OpenSquilla sigue guardando los cambios. Espera a que termine e intenta instalar de nuevo.',
     'update.moveToApplications': 'Mueve OpenSquilla a tu carpeta de Aplicaciones para habilitar las actualizaciones automáticas e inténtalo de nuevo.',
     'update.gatewayShutdownTimeout': 'OpenSquilla no pudo detener el runtime local. Intenta reiniciar para actualizar de nuevo.',
     'uninstall.confirmTitle': '¿Eliminar los datos locales de escritorio de OpenSquilla?',
@@ -4171,12 +4478,11 @@ const DESKTOP_MESSAGES: Record<DesktopLocale, Record<string, string>> = {
     'onboarding.step1.continue': 'Continuar',
     'onboarding.step2.badge': 'Obligatorio',
     'onboarding.step2.heading': 'Configuración del servicio de modelos',
-    'onboarding.step2.subtitle': 'Introduce una clave API para empezar.',
+    'onboarding.step2.subtitle': "Conecta un servicio de modelos o configúralo más tarde.",
     'onboarding.step2.tokenrhythmTitle': 'Oferta limitada de TokenRhythm',
     'onboarding.step2.tokenrhythmValue': 'Las llamadas a la API de TokenRhythm son gratis por tiempo limitado.',
-    'onboarding.step2.tokenrhythmRegistration': 'Regístrate y recibe 68 ¥ en tokens gratis.',
-    'onboarding.step2.tokenrhythmCta': 'Obtener gratis',
-    'onboarding.step2.tokenrhythmCtaExternalLabel': 'Obtener gratis (se abre en el navegador externo)',
+    'onboarding.step2.tokenrhythmCta': 'Oferta limitada',
+    'onboarding.step2.tokenrhythmCtaExternalLabel': 'Oferta limitada (se abre en el navegador externo)',
     'onboarding.step2.otherProviders': 'Otros proveedores',
     'onboarding.step2.apiKey': 'Clave API',
     'onboarding.step2.endpointSummary': 'Endpoint y modelo directo',
@@ -4204,7 +4510,7 @@ const DESKTOP_MESSAGES: Record<DesktopLocale, Record<string, string>> = {
     'onboarding.step5.searchKey': 'Clave API de búsqueda',
     'onboarding.step5.searchHintDefault': 'DuckDuckGo es suficiente para empezar.',
     'onboarding.step5.back': 'Atrás',
-    'onboarding.step5.finish': 'Iniciar OpenSquilla',
+    'onboarding.step5.finish': "Guardar y entrar",
   },
 }
 
@@ -4259,7 +4565,14 @@ const ONBOARDING_SCRIPT_MESSAGES: Record<DesktopLocale, Record<string, string>> 
     defaultTierRequiresModel: 'Default router tier requires a model.',
     searchApiKeyRequired: '{label} search API key is required.',
     savingSetup: 'Saving setup…',
-    setupTakingLonger: 'First-time setup usually takes 10–20 seconds. Please keep this window open.',
+    skipSetup: "Set up later",
+    testConnection: "Test connection (optional)",
+    notTested: "Not tested",
+    keyRejected: "The key was rejected. Check it and paste it again.",
+    connectionUnavailable: "Unable to connect right now. You can still save and enter.",
+    connectionFailed: "The model could not be used. Check the model and service settings. You can still save and enter.",
+    localSaveFailed: "Could not save locally. Please retry, or continue in the client and configure it later.",
+    setupTakingLonger: "Saving local settings is taking longer. You can continue in the client.",
     stepLabel: 'Step {n}',
   },
   'zh-Hans': {
@@ -4307,7 +4620,14 @@ const ONBOARDING_SCRIPT_MESSAGES: Record<DesktopLocale, Record<string, string>> 
     defaultTierRequiresModel: '默认路由层级需要一个模型。',
     searchApiKeyRequired: '需要 {label} 搜索 API 密钥。',
     savingSetup: '正在保存设置…',
-    setupTakingLonger: '首次设置通常需要 10–20 秒，请保持此窗口打开。',
+    skipSetup: "稍后配置",
+    testConnection: "测试连接（可选）",
+    notTested: "尚未测试",
+    keyRejected: "密钥被拒绝，请检查后重新粘贴。",
+    connectionUnavailable: "暂时无法连接。你仍可保存配置并进入。",
+    connectionFailed: "模型暂不可用，请检查模型和服务设置。你仍可保存并进入。",
+    localSaveFailed: "本地保存失败，请重试；也可先进入客户端，稍后配置。",
+    setupTakingLonger: "本地保存耗时较长。你可以先进入客户端。",
     stepLabel: '步骤 {n}',
   },
   ja: {
@@ -4355,7 +4675,14 @@ const ONBOARDING_SCRIPT_MESSAGES: Record<DesktopLocale, Record<string, string>> 
     defaultTierRequiresModel: 'デフォルトのルーターティアにはモデルが必要です。',
     searchApiKeyRequired: '{label} の検索 API キーが必要です。',
     savingSetup: '設定を保存しています…',
-    setupTakingLonger: '初回セットアップには通常10～20秒かかります。このウィンドウを開いたままお待ちください。',
+    skipSetup: "後で設定",
+    testConnection: "接続テスト（任意）",
+    notTested: "未テスト",
+    keyRejected: "キーが拒否されました。確認して再入力してください。",
+    connectionUnavailable: "現在接続できません。保存して続行できます。",
+    connectionFailed: "モデルを利用できません。設定を確認してください。保存して続行できます。",
+    localSaveFailed: "保存できませんでした。再試行するか、後で設定してください。",
+    setupTakingLonger: "保存に時間がかかっています。クライアントで続行できます。",
     stepLabel: 'ステップ {n}',
   },
   fr: {
@@ -4403,7 +4730,14 @@ const ONBOARDING_SCRIPT_MESSAGES: Record<DesktopLocale, Record<string, string>> 
     defaultTierRequiresModel: 'Le niveau de routeur par défaut nécessite un modèle.',
     searchApiKeyRequired: 'La clé API de recherche {label} est requise.',
     savingSetup: 'Enregistrement…',
-    setupTakingLonger: 'La configuration initiale prend généralement 10 à 20 secondes. Gardez cette fenêtre ouverte.',
+    skipSetup: "Configurer plus tard",
+    testConnection: "Tester la connexion (facultatif)",
+    notTested: "Non testé",
+    keyRejected: "Clé refusée. Vérifiez-la et collez-la à nouveau.",
+    connectionUnavailable: "Connexion indisponible. Vous pouvez enregistrer et continuer.",
+    connectionFailed: "Modèle indisponible. Vérifiez les paramètres. Vous pouvez enregistrer et continuer.",
+    localSaveFailed: "Échec de l’enregistrement local. Réessayez ou configurez plus tard.",
+    setupTakingLonger: "L’enregistrement prend du temps. Vous pouvez continuer dans le client.",
     stepLabel: 'Étape {n}',
   },
   de: {
@@ -4451,7 +4785,14 @@ const ONBOARDING_SCRIPT_MESSAGES: Record<DesktopLocale, Record<string, string>> 
     defaultTierRequiresModel: 'Die Standard-Routerstufe erfordert ein Modell.',
     searchApiKeyRequired: 'Der Such-API-Schlüssel für {label} ist erforderlich.',
     savingSetup: 'Einrichtung wird gespeichert…',
-    setupTakingLonger: 'Die Ersteinrichtung dauert normalerweise 10–20 Sekunden. Lassen Sie dieses Fenster geöffnet.',
+    skipSetup: "Später einrichten",
+    testConnection: "Verbindung testen (optional)",
+    notTested: "Nicht getestet",
+    keyRejected: "Der Schlüssel wurde abgelehnt. Prüfe ihn und füge ihn erneut ein.",
+    connectionUnavailable: "Verbindung derzeit nicht möglich. Speichern und Fortfahren ist möglich.",
+    connectionFailed: "Modell nicht verfügbar. Prüfe die Einstellungen. Du kannst trotzdem speichern.",
+    localSaveFailed: "Lokales Speichern fehlgeschlagen. Wiederhole es oder richte den Dienst später ein.",
+    setupTakingLonger: "Das Speichern dauert länger. Du kannst im Client fortfahren.",
     stepLabel: 'Schritt {n}',
   },
   es: {
@@ -4499,7 +4840,14 @@ const ONBOARDING_SCRIPT_MESSAGES: Record<DesktopLocale, Record<string, string>> 
     defaultTierRequiresModel: 'El nivel de enrutador predeterminado requiere un modelo.',
     searchApiKeyRequired: 'Se requiere la clave API de búsqueda de {label}.',
     savingSetup: 'Guardando la configuración…',
-    setupTakingLonger: 'La configuración inicial suele tardar entre 10 y 20 segundos. Mantén esta ventana abierta.',
+    skipSetup: "Configurar después",
+    testConnection: "Probar conexión (opcional)",
+    notTested: "Sin probar",
+    keyRejected: "Clave rechazada. Revísala y vuelve a pegarla.",
+    connectionUnavailable: "No se puede conectar ahora. Puedes guardar y continuar.",
+    connectionFailed: "Modelo no disponible. Revisa la configuración. Puedes guardar y continuar.",
+    localSaveFailed: "No se pudo guardar localmente. Reintenta o configura más tarde.",
+    setupTakingLonger: "El guardado está tardando. Puedes continuar en el cliente.",
     stepLabel: 'Paso {n}',
   },
 }
@@ -4516,10 +4864,11 @@ function createApplicationMenu(): void {
   const appSubmenu: Electron.MenuItemConstructorOptions[] = [{ role: 'about' }]
   if (desktopUpdateMenuEnabled()) {
     appSubmenu.push({ type: 'separator' })
-    if (downloadedUpdateVersion !== null) {
+    if (downloadedUpdateVersion !== null || (windowsInstallerActionsSupported() && verifiedManualInstallerPath !== null)) {
       appSubmenu.push(
         {
-          label: desktopT('menu.relaunchToUpdate'),
+          label: windowsInstallerActionsSupported() ? desktopT('update.quitAndInstall') : desktopT('menu.relaunchToUpdate'),
+          enabled: !updateApplying && !manualInstallerActionInProgress,
           click: () => {
             void applyDownloadedUpdate()
           },
@@ -4596,6 +4945,30 @@ function currentOnboardingWindow(): BrowserWindow | null {
   return onboardingWindow && !onboardingWindow.isDestroyed() ? onboardingWindow : null
 }
 
+function desktopReliabilityIsForeground(): boolean {
+  return [mainWindow, onboardingWindow].some((window) => (
+    window !== null
+    && !window.isDestroyed()
+    && window.isVisible()
+    && !window.isMinimized()
+    && window.isFocused()
+  ))
+}
+
+function refreshDesktopReliabilityForegroundState(): void {
+  desktopReliabilityTelemetry.setForeground(desktopReliabilityIsForeground())
+}
+
+function trackDesktopReliabilityWindow(window: BrowserWindow): void {
+  window.on('show', refreshDesktopReliabilityForegroundState)
+  window.on('hide', refreshDesktopReliabilityForegroundState)
+  window.on('focus', refreshDesktopReliabilityForegroundState)
+  window.on('blur', refreshDesktopReliabilityForegroundState)
+  window.on('minimize', refreshDesktopReliabilityForegroundState)
+  window.on('restore', refreshDesktopReliabilityForegroundState)
+  window.once('closed', refreshDesktopReliabilityForegroundState)
+}
+
 function focusOnboardingWindow(): boolean {
   const window = currentOnboardingWindow()
   if (!window) return false
@@ -4616,8 +4989,12 @@ function focusMainWindow(): boolean {
 
 function setAppExitPhase(next: DesktopExitPhase, reason: string): void {
   if (appExitPhase === next) return
+  const connectionWasSuspended = desktopGatewayConnectionSuspendedForExit()
   desktopLog('desktop_exit_phase', { from: appExitPhase, to: next, reason })
   appExitPhase = next
+  if (connectionWasSuspended !== desktopGatewayConnectionSuspendedForExit()) {
+    publishGatewayConnection()
+  }
   rebuildWindowsTrayMenu()
 }
 
@@ -4747,9 +5124,15 @@ function revealDesktopApp(): void {
   void activateMainWindow('desktop-reveal')
 }
 
+function sendPendingDesktopSessionTarget(): void {
+  const window = currentMainWindow()
+  if (!window || !isCurrentWindowAtDesktopRenderer(window) || !pendingDesktopSessionKey) return
+  window.webContents.send('desktop:deep-link-session', pendingDesktopSessionKey)
+}
+
 function handleDeepLink(rawUrl: unknown, source = 'unknown'): boolean {
-  const action = parseDesktopDeepLink(rawUrl)
-  if (action !== 'open') {
+  const target = parseDesktopDeepLinkTarget(rawUrl)
+  if (!target || target.action !== 'open') {
     // Never persist an untrusted URL: query strings may contain credentials or
     // other private browser state even though this parser rejects them.
     desktopLog('deep_link_ignored', { source })
@@ -4758,15 +5141,22 @@ function handleDeepLink(rawUrl: unknown, source = 'unknown'): boolean {
 
   desktopLog('deep_link_accepted', {
     source,
-    action,
+    action: target.action,
+    hasSessionTarget: Boolean(target.sessionKey),
     activationReady: desktopDeepLinkActivationReady,
   })
+  if (target.sessionKey) pendingDesktopSessionKey = target.sessionKey
   if (!desktopDeepLinkActivationReady) {
     pendingDesktopDeepLinkOpen = true
     return true
   }
 
-  void activateMainWindow(`deep-link:${source}`)
+  void activateMainWindow(`deep-link:${source}`).then(() => {
+    // The renderer consumes this through the preload bridge. Keep the value
+    // pending until it acknowledges it so startup links cannot be lost while
+    // Vue is still mounting.
+    sendPendingDesktopSessionTarget()
+  })
   return true
 }
 
@@ -4782,7 +5172,9 @@ function handleDeepLinksFromCommandLine(
 function activatePendingDesktopDeepLink(): boolean {
   if (!pendingDesktopDeepLinkOpen) return false
   pendingDesktopDeepLinkOpen = false
-  void activateMainWindow('deep-link:pending')
+  void activateMainWindow('deep-link:pending').then(() => {
+    sendPendingDesktopSessionTarget()
+  })
   return true
 }
 
@@ -5016,13 +5408,6 @@ function onboardingHtml(
       display: grid;
       place-items: center;
     }
-    .deck > .error {
-      position: absolute;
-      left: 32px;
-      right: 32px;
-      bottom: 20px;
-      z-index: 3;
-    }
     [hidden] {
       display: none !important;
     }
@@ -5104,12 +5489,6 @@ function onboardingHtml(
       font-size: 10.5px;
       font-weight: 560;
       line-height: 1.35;
-    }
-    .provider-promo-copy span {
-      color: var(--accent);
-      font-size: 10.5px;
-      font-weight: 420;
-      line-height: 1.4;
     }
     .provider-promo-cta {
       display: inline-flex;
@@ -5987,6 +6366,12 @@ function onboardingHtml(
 	      padding: 4px 4px 4px 20px;
 	    }
 	    .field-pair { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-top: 12px; }
+    .telemetry-notice {
+      margin-top: 16px;
+      padding-top: 14px;
+      border-top: 1px solid var(--line);
+    }
+    .telemetry-notice { color: var(--muted); font-size: 12px; line-height: 1.45; }
     .actions {
       display: flex;
       align-items: center;
@@ -6056,6 +6441,9 @@ function onboardingHtml(
     .error:empty {
       display: none;
     }
+    .probe-row { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }
+    .probe-row .secondary { padding-left: 0; }
+    .probe-status { color: var(--muted); font-size: 12px; flex: 1; min-width: 160px; }
     @media (max-width: 680px) {
       main {
         padding: 14px;
@@ -6137,7 +6525,6 @@ function onboardingHtml(
             </label>
             <div class="provider-promo-copy">
               <strong data-i18n="onboarding.step2.tokenrhythmTitle">${ot('onboarding.step2.tokenrhythmTitle')}</strong>
-              <span data-i18n="onboarding.step2.tokenrhythmRegistration">${ot('onboarding.step2.tokenrhythmRegistration')}</span>
             </div>
             <a class="provider-promo-cta" id="tokenrhythmRegister" href="${TOKENRHYTHM_REGISTER_URL}" target="_blank" rel="noopener noreferrer" data-i18n="onboarding.step2.tokenrhythmCta" data-i18n-aria="onboarding.step2.tokenrhythmCtaExternalLabel" aria-label="${ot('onboarding.step2.tokenrhythmCtaExternalLabel')}">${ot('onboarding.step2.tokenrhythmCta')}</a>
           </div>
@@ -6164,6 +6551,10 @@ function onboardingHtml(
             <span class="field-error" id="modelError" role="alert" aria-live="polite"></span>
           </div>
         </div>
+        <div class="probe-row">
+          <button class="secondary" type="button" id="probe"></button>
+          <span class="probe-status" id="probeStatus" role="status" aria-live="polite"></span>
+        </div>
         <section class="inline-search-section" aria-labelledby="inlineSearchHeading">
           <button class="inline-search-toggle" id="inlineSearchToggle" type="button" aria-expanded="false" aria-controls="inlineSearchPanel">
             <span class="inline-search-title" id="inlineSearchHeading" data-i18n="onboarding.step5.heading">${ot('onboarding.step5.heading')}</span>
@@ -6181,14 +6572,15 @@ function onboardingHtml(
             </div>
           </div>
         </section>
+        <div class="error" id="error" role="alert" aria-live="assertive" tabindex="-1"></div>
+        <p class="telemetry-notice" data-i18n="onboarding.telemetry.notice">${ot('onboarding.telemetry.notice')}</p>
         </div>
         <footer class="actions">
-          <button class="secondary" type="button" id="cancel" data-i18n="onboarding.step1.quit">${ot('onboarding.step1.quit')}</button>
+          <button class="secondary" type="button" id="skip"></button>
           <span class="submit-status" id="submitStatus" role="status" aria-live="polite" aria-atomic="true"></span>
           <button class="primary" type="button" id="finish" data-i18n="onboarding.step5.finish">${ot('onboarding.step5.finish')}</button>
         </footer>
       </section>
-      <div class="error" id="error" role="alert" aria-live="assertive" tabindex="-1"></div>
     </form>
   </main>
   <script>
@@ -6208,15 +6600,19 @@ function onboardingHtml(
       if (vars) for (const name of Object.keys(vars)) out = out.split('{' + name + '}').join(String(vars[name]));
       return out;
     }
-    const providers = ${inlineScriptJson(PROVIDER_CATALOG)};
+    const providers = ${inlineScriptJson(PROVIDER_CATALOG.map(entry => ({
+      ...entry,
+      onboardingModel: ['tokenrhythm', 'openrouter'].includes(entry.id) ? entry.model : '',
+    })))};
     const searchProviders = ${inlineScriptJson(SEARCH_PROVIDER_CATALOG)};
-    const routerProfiles = ${inlineScriptJson(ROUTER_PROFILES)};
     const initialProviderPrefill = ${inlineScriptJson(pendingProviderSetup)};
     let searchPaidOpen = false;
     let searchSectionOpen = false;
-    let routerTiers = clone(routerProfiles.openrouter);
     let modelEditorOpen = false;
     let submitting = false;
+    let probeRevision = 0;
+    let probing = false;
+    let leaving = false;
     const SUBMIT_SLOW_FEEDBACK_MS = 8_000;
     let submitSlowTimer = null;
     const setupForm = document.getElementById('setup-form');
@@ -6241,6 +6637,9 @@ function onboardingHtml(
     const searchApiKey = document.getElementById('searchApiKey');
     const searchApiKeyError = document.getElementById('searchApiKeyError');
     const finish = document.getElementById('finish');
+    const skip = document.getElementById('skip');
+    const probe = document.getElementById('probe');
+    const probeStatus = document.getElementById('probeStatus');
     const submitStatus = document.getElementById('submitStatus');
     const searchProvider = document.getElementById('searchProvider');
 	    const searchProviderGrid = document.getElementById('searchProviderGrid');
@@ -6255,9 +6654,6 @@ function onboardingHtml(
     const providerSelectedBadges = document.getElementById('providerSelectedBadges');
     const providerSelectPanel = document.getElementById('providerSelectPanel');
     const providerOptions = document.getElementById('providerOptions');
-    function clone(value) {
-      return JSON.parse(JSON.stringify(value || {}));
-    }
     function deepFreeze(value) {
       if (!value || typeof value !== 'object' || Object.isFrozen(value)) return value;
       Object.values(value).forEach((item) => deepFreeze(item));
@@ -6271,8 +6667,6 @@ function onboardingHtml(
         model: model.value,
         modelRoutingMode: modelRoutingMode.value,
         routerMode: routerMode.value,
-        routerDefaultTier: 'c1',
-        routerTiers: clone(routerTiers),
         searchProvider: searchProvider.value,
         searchApiKey: searchApiKey.value,
         locale: activeLocale,
@@ -6282,7 +6676,7 @@ function onboardingHtml(
       return providers.find((item) => item.id === provider.value) || providers[0];
     }
     function defaultModelRoutingModeFor(selected) {
-      return selected.routerSupported ? 'squilla_router' : 'direct';
+      return selected.onboardingModel && selected.routerSupported ? 'squilla_router' : 'direct';
     }
     function syncRouterModeFromModelRouting() {
       routerMode.value = modelRoutingMode.value === 'direct' ? 'disabled' : 'recommended';
@@ -6300,9 +6694,6 @@ function onboardingHtml(
       modelEditDone.textContent = t.doneEditingModel;
       modelEditDone.disabled = !value;
     }
-	    function profileKeyForMode() {
-	      return provider.value;
-	    }
 	    function syncProviderDefaults(resetRouter) {
 	      const selected = currentProvider();
 	      apiKeyRequiredMarker.hidden = !selected.requiresApiKey;
@@ -6311,16 +6702,14 @@ function onboardingHtml(
 	      apiKey.placeholder = selected.requiresApiKey ? 'sk-...' : t.noKeyRequired;
 	      if (resetRouter) {
 	        baseUrl.value = selected.baseUrl || '';
-	        model.value = selected.model || '';
+	        model.value = selected.onboardingModel || '';
           modelEditorOpen = !model.value.trim();
 	      } else {
 	        if (!baseUrl.value && selected.baseUrl) baseUrl.value = selected.baseUrl;
-	        if (!model.value && selected.model) model.value = selected.model;
 	      }
 	      if (resetRouter) {
 	        modelRoutingMode.value = defaultModelRoutingModeFor(selected);
 	        syncRouterModeFromModelRouting();
-	        routerTiers = clone(routerProfiles[profileKeyForMode()]);
 	      }
 	      const modelRequired = modelRoutingMode.value === 'direct';
       modelRequiredMarker.hidden = !modelRequired;
@@ -6333,6 +6722,7 @@ function onboardingHtml(
       if (next === provider.value) return;
       provider.value = next;
       apiKey.value = '';
+      invalidateProbe();
       clearValidationErrors();
       syncProviderDefaults(true);
       renderProviderGrid();
@@ -6430,6 +6820,7 @@ function onboardingHtml(
       syncProviderDefaults(false);
       renderModelField();
       render();
+      invalidateProbe();
     }
     function currentSearchProvider() {
       return searchProviders.find((item) => item.providerId === searchProvider.value) || searchProviders[0];
@@ -6500,6 +6891,9 @@ function onboardingHtml(
     function render() {
       syncProviderDefaults(false);
       syncSearchProviderControls();
+      skip.textContent = t.skipSetup;
+      probe.textContent = probing ? t.verifyingConfiguration : t.testConnection;
+      if (!probeStatus.textContent) probeStatus.textContent = t.notTested;
     }
     function clearSubmitSlowTimer() {
       if (submitSlowTimer !== null) clearTimeout(submitSlowTimer);
@@ -6527,7 +6921,7 @@ function onboardingHtml(
         submitStatus.textContent = '';
       }
     }
-    window.addEventListener('pagehide', clearSubmitSlowTimer);
+    window.addEventListener('pagehide', () => { leaving = true; probeRevision++; clearSubmitSlowTimer(); });
 	    onboardingLocale.addEventListener('change', () => {
 	      applyLocale(onboardingLocale.value);
 	    });
@@ -6585,6 +6979,7 @@ function onboardingHtml(
     [[apiKey, apiKeyError], [model, modelError], [searchApiKey, searchApiKeyError]].forEach(([input, output]) => {
       input.addEventListener('input', () => {
         clearFieldError(input, output);
+        if (input !== searchApiKey) invalidateProbe();
         if (input === model) renderModelField();
       });
     });
@@ -6599,8 +6994,67 @@ function onboardingHtml(
       renderModelField();
       modelEditToggle.focus({ preventScroll: true });
     });
-    document.getElementById('cancel').addEventListener('click', () => {
-      window.opensquillaDesktop.cancelOnboarding();
+    function invalidateProbe() {
+      probeRevision++;
+      probing = false;
+      probe.disabled = false;
+      probe.textContent = t.testConnection;
+      probeStatus.textContent = t.notTested;
+    }
+    baseUrl.addEventListener('input', invalidateProbe);
+    probe.addEventListener('click', async () => {
+      if (probing || submitting || leaving) return;
+      clearValidationErrors();
+      const selected = currentProvider();
+      if (selected.requiresApiKey && !apiKey.value.trim()) {
+        presentValidationIssue({input:apiKey,output:apiKeyError,message:fmt('apiKeyRequired',{label:selected.label})});
+        return;
+      }
+      if (!model.value.trim()) {
+        presentValidationIssue({input:model,output:modelError,message:t.directModelRequiredDirect});
+        return;
+      }
+      const snapshot = onboardingPayloadSnapshot();
+      const revision = ++probeRevision;
+      probing = true;
+      probe.disabled = true;
+      probe.textContent = t.verifyingConfiguration;
+      probeStatus.textContent = t.verifyingConfiguration;
+      try {
+        const result = await window.opensquillaDesktop.probeOnboarding(snapshot);
+        if (leaving || submitting || revision !== probeRevision) return;
+        if (result && result.ok) {
+          probeStatus.textContent = fmt('configurationVerifiedWithLatency', {ms:result.latencyMs});
+        } else if (result && result.failureKind === 'auth_invalid') {
+          apiKeyError.textContent = t.keyRejected;
+          apiKey.setAttribute('aria-invalid', 'true');
+          probeStatus.textContent = t.keyRejected;
+        } else {
+          probeStatus.textContent = result && ['transport_transient','probe_timeout','network_error','timeout','unavailable'].includes(result.failureKind)
+            ? t.connectionUnavailable : t.connectionFailed;
+        }
+      } catch {
+        if (!leaving && !submitting && revision === probeRevision) probeStatus.textContent = t.connectionUnavailable;
+      } finally {
+        if (revision === probeRevision) {
+          probing = false;
+          probe.disabled = false;
+          probe.textContent = t.testConnection;
+        }
+      }
+    });
+    skip.addEventListener('click', async () => {
+      if (leaving) return;
+      leaving = true;
+      probeRevision++;
+      try {
+        const result = await window.opensquillaDesktop.skipOnboarding();
+        if (!result || !result.ok) throw new Error('skip failed');
+      } catch {
+        leaving = false;
+        invalidateProbe();
+        errorBox.textContent = t.localSaveFailed;
+      }
     });
     finish.addEventListener('click', async () => {
       if (submitting) return;
@@ -6611,6 +7065,7 @@ function onboardingHtml(
         return;
       }
       const payload = onboardingPayloadSnapshot();
+      invalidateProbe();
       setSubmitting(true);
       let succeeded = false;
       try {
@@ -6625,7 +7080,7 @@ function onboardingHtml(
         succeeded = true;
         clearSubmitSlowTimer();
       } catch (error) {
-        errorBox.textContent = error && error.message ? error.message : String(error);
+        errorBox.textContent = t.localSaveFailed;
       } finally {
         if (!succeeded) {
           setSubmitting(false);
@@ -6674,10 +7129,7 @@ function abandonOnboardingFlow(
   reject?.(error)
 }
 
-async function runOnboarding(): Promise<DesktopConnection> {
-  // A detached save retains coordinator ownership until it settles, preventing
-  // Retry from opening a replacement flow that the old completion could affect.
-  await onboardingFlows.waitForAbandonedSave()
+async function prepareDesktopStartupConnection(): Promise<DesktopConnection | null> {
   const pendingProviderSetup = await loadPendingMigrationProviderSetup()
   const existing = await loadDesktopCredential()
   // A saved credential encrypted with the OS keychain that this session cannot
@@ -6707,8 +7159,62 @@ async function runOnboarding(): Promise<DesktopConnection> {
     if (!(await pathExists(desktopConfigPath()))) {
       await writeDesktopConfig(existing)
     }
+    try {
+      await syncDesktopConsentMirror()
+    } catch (error) {
+      desktopLog('desktop_consent_mirror_sync_failed', {
+        error: error instanceof Error ? error.message : String(error),
+      })
+    }
     return existing
   }
+
+  // An explicit empty primary prevents provider defaults or inherited API keys
+  // from silently configuring a fresh profile. The config also records that the
+  // first-run invitation has been offered; later launches use Settings instead.
+  if (!(await pathExists(desktopConfigPath()))) {
+    const finishWriter = beginDesktopWriterOperation('initialize unconfigured desktop profile')
+    const profile = activeDesktopProfile()
+    try {
+      const inspection = await preflightDesktopConfigWrite(profile)
+      const initialized = await runRecoveryCli(profile, [
+        'initialize-unconfigured', '--home', profile.home,
+        '--transaction-id', inspection.transaction_id ?? '',
+        '--expected-revision', String(inspection.revision),
+        '--lock-timeout', String(RECOVERY_LOCK_TIMEOUT_SECONDS), '--json',
+      ], JSON.stringify({config: renderUnconfiguredDesktopConfig(desktopLocale, process.platform)}), true)
+      if (initialized.outcome === 'recovery_required' || !(await pathExists(desktopConfigPath()))) {
+        throw new Error(`Desktop profile could not be initialized (${initialized.stable_code}).`)
+      }
+      if (initialized.stable_code === 'unconfigured_profile_initialized') {
+        onboardingPromptProfileKey = desktopProfileKey(profile)
+      }
+    } finally {
+      finishWriter()
+    }
+  }
+  if (pendingProviderSetup || forceOnboardingOnNextStartup) {
+    onboardingPromptProfileKey = desktopProfileKey()
+  }
+  return null
+}
+
+function dismissOnboardingFlow(flow: OnboardingFlow): void {
+  const resolve = flow.resolve
+  flow.resolve = null
+  flow.reject = null
+  // Keep an admitted save owned by the coordinator until its atomic write has
+  // settled. Closing the invitation never cancels or duplicates that write.
+  onboardingFlows.abandon(flow)
+  const window = flow.window
+  if (window && !window.isDestroyed()) window.close()
+  resolve?.(null)
+  focusMainWindow()
+}
+
+async function runOnboarding(): Promise<DesktopConnection | null> {
+  await onboardingFlows.waitForAbandonedSave()
+  const pendingProviderSetup = await loadPendingMigrationProviderSetup()
 
   return new Promise((resolveCredential, rejectCredential) => {
     if (onboardingFlows.active) {
@@ -6726,7 +7232,7 @@ async function runOnboarding(): Promise<DesktopConnection> {
       icon: appIconPath(),
       resizable: true,
       parent: parentWindow ?? undefined,
-      modal: Boolean(parentWindow),
+      modal: false,
       show: false,
       // Match the onboarding page's base so the first frame is not white.
       backgroundColor: '#f5f2eb',
@@ -6752,6 +7258,7 @@ async function runOnboarding(): Promise<DesktopConnection> {
       return
     }
     onboardingWindow = window
+    trackDesktopReliabilityWindow(window)
     installEditingContextMenu(window)
 
     window.webContents.setWindowOpenHandler(({ url }) => {
@@ -6786,7 +7293,7 @@ async function runOnboarding(): Promise<DesktopConnection> {
       // Re-enable View → Reload now that the wizard is gone.
       createApplicationMenu()
       if (flow.state !== 'completed' && flow.state !== 'abandoned') {
-        abandonOnboardingFlow(flow, new Error('OpenSquilla setup was closed.'), false)
+        dismissOnboardingFlow(flow)
       }
     })
 
@@ -6819,6 +7326,14 @@ async function pathIsFile(path: string): Promise<boolean> {
   }
 }
 
+async function pathIsDirectory(path: string): Promise<boolean> {
+  try {
+    return (await stat(path)).isDirectory()
+  } catch {
+    return false
+  }
+}
+
 async function assertRepoRoot(): Promise<void> {
   const pyprojectPath = join(repoRoot, 'pyproject.toml')
   const webuiPath = join(repoRoot, 'src', 'opensquilla', 'gateway', 'static', 'dist', 'index.html')
@@ -6830,6 +7345,19 @@ async function assertRepoRoot(): Promise<void> {
       `Built Control UI not found at ${webuiPath}. Run "cd opensquilla-webui && npm run build" first.`
     )
   }
+}
+
+async function validateGatewayRuntime(runtime: RuntimeLaunch): Promise<RuntimeLaunch> {
+  if (typeof runtime.command !== 'string' || runtime.command.trim() === '') {
+    throw new Error('runtime_root_missing: Gateway command is empty')
+  }
+  if (!(await pathIsDirectory(runtime.cwd))) {
+    throw new Error(`runtime_root_missing: Gateway cwd does not exist: ${runtime.cwd}`)
+  }
+  if (runtime.mode === 'bundled' && !(await pathIsFile(runtime.command))) {
+    throw new Error(`runtime_root_missing: Gateway binary does not exist: ${runtime.command}`)
+  }
+  return runtime
 }
 
 function packagedRuntimeRoot(): string {
@@ -6883,22 +7411,30 @@ async function resolveGatewayRuntime(): Promise<RuntimeLaunch> {
   const onedirBinary = join(runtimeRoot, 'opensquilla-gateway', binaryName)
   const flatBinary = join(runtimeRoot, binaryName)
   const bundledBinary = (await pathIsFile(onedirBinary)) ? onedirBinary : flatBinary
-  if (await pathIsFile(bundledBinary)) {
-    return {
+  // Development must always use the selected checkout. A staged runtime under
+  // packageRoot can be removed by worktree cleanup while the Gateway is still
+  // alive; only packaged applications own that runtime for the child lifetime.
+  if (app.isPackaged && await pathIsFile(bundledBinary)) {
+    return await validateGatewayRuntime({
       command: bundledBinary,
       args: ['gateway', 'run'],
       cwd: dirname(bundledBinary),
       mode: 'bundled',
-    }
+    })
   }
 
-  await assertRepoRoot()
-  return {
+  try {
+    await assertRepoRoot()
+  } catch (error) {
+    const detail = error instanceof Error ? error.message : String(error)
+    throw new Error(`runtime_root_missing: ${detail}`)
+  }
+  return await validateGatewayRuntime({
     command: 'uv',
     args: ['run', 'opensquilla', 'gateway', 'run'],
     cwd: repoRoot,
     mode: 'dev',
-  }
+  })
 }
 
 const ONBOARDING_PROBE_STDOUT_LIMIT = 256 * 1024
@@ -7828,6 +8364,7 @@ async function adoptConsolidatedDesktopCredential(
           'encryptedApiKey',
           'modelRoutingMode',
           'routerMode',
+          'routerPresetBinding',
           'routerDefaultTier',
           'searchProvider',
           'searchApiKeyEnv',
@@ -8168,10 +8705,17 @@ async function findGatewayPort(): Promise<number> {
   throw new Error('No free OpenSquilla desktop gateway port found in 18791-18830.')
 }
 
+function desktopMonitoredFetch(...args: Parameters<typeof fetch>): ReturnType<typeof fetch> {
+  const startedAt = Date.now()
+  return fetch(...args).finally(() => {
+    desktopReliabilityTelemetry.recordMonitoredRequest(Math.max(0, Date.now() - startedAt))
+  })
+}
+
 async function healthCheck(url: string, timeoutMs = 1000): Promise<boolean> {
   try {
     const boundedTimeoutMs = Math.max(1, Math.min(1000, Math.floor(timeoutMs)))
-    const response = await fetch(`${url}/healthz`, {
+    const response = await desktopMonitoredFetch(`${url}/healthz`, {
       signal: AbortSignal.timeout(boundedTimeoutMs),
     })
     if (!response.ok) return false
@@ -8290,10 +8834,43 @@ function hasGatewayProcessExited(process: ChildProcessWithoutNullStreams | null)
 function trackStoppingGatewayProcess(child: ChildProcessWithoutNullStreams): void {
   if (hasGatewayProcessExited(child) || gatewayStoppingProcesses.has(child)) return
   gatewayStoppingProcesses.add(child)
-  child.once('exit', () => {
+  // The close handler classifies the child's final status. Keep the explicit
+  // stop marker until close because Node emits exit before close; clearing it
+  // on exit would make an intentional clean stop look like an unexpected
+  // ready-child disconnect and schedule a replacement.
+  child.once('close', () => {
     gatewayStoppingProcesses.delete(child)
     if (updateGatewayShutdownProcess === child) updateGatewayShutdownProcess = null
   })
+}
+
+function isCurrentGatewayShutdownRequest(url: string, method: string): boolean {
+  if (method !== 'POST' || !gatewayState.url) return false
+  try {
+    const request = new URL(url)
+    const gateway = new URL(gatewayState.url)
+    return request.origin === gateway.origin && request.pathname === '/api/system/shutdown'
+  } catch {
+    return false
+  }
+}
+
+function installGatewayShutdownRequestInterceptor(window: BrowserWindow): void {
+  if (gatewayShutdownRequestInterceptorInstalled) return
+  gatewayShutdownRequestInterceptorInstalled = true
+  window.webContents.session.webRequest.onBeforeRequest(
+    { urls: ['<all_urls>'] },
+    (details, callback) => {
+      if (isCurrentGatewayShutdownRequest(details.url, details.method)) {
+        const child = gatewayProcess
+        if (child && gatewayState.owned) {
+          trackStoppingGatewayProcess(child)
+          cancelGatewayUnexpectedExitRestart('Gateway shutdown endpoint requested')
+        }
+      }
+      callback({})
+    },
+  )
 }
 
 function liveLifecycleOwnedGatewayProcesses(): ChildProcessWithoutNullStreams[] {
@@ -8313,6 +8890,7 @@ async function reuseHealthyGatewayState(
   // resumeOwnedGatewayStartup; a healthy port alone is not ownership proof.
   if (gatewayProcess && gatewayState.owned) return null
 
+  beginGatewayStartTelemetry('reused', 'health')
   const ready = await readinessCheck(gatewayState.url)
   if (!isCurrent()) return null
   if (ready) {
@@ -8378,6 +8956,7 @@ async function resumeOwnedGatewayStartup(
     || hasGatewayProcessExited(child)
   ) return null
 
+  beginGatewayStartTelemetry('spawned', 'health')
   const url = gatewayState.url
   const childExitMessage = (): string | null => {
     if (gatewayProcess === child && !hasGatewayProcessExited(child)) return null
@@ -8386,6 +8965,7 @@ async function resumeOwnedGatewayStartup(
   gatewayState.status = 'starting'
   gatewayState.error = undefined
   sendBootStatus('gateway-health')
+  advanceGatewayStartTelemetry('health')
   await waitForGateway(url, childExitMessage)
   if (!isCurrent()) throw new Error('Desktop startup was superseded during health verification.')
 
@@ -8400,6 +8980,7 @@ async function resumeOwnedGatewayStartup(
   ) {
     throw new Error(childExitMessage() || 'Desktop gateway changed while startup resumed.')
   }
+  advanceGatewayStartTelemetry('ownership')
   if (!await verifyOwnedGatewayLaunch(child)) {
     if (!await discardUnverifiedOwnedGatewayChild(child)) {
       throw new Error('Desktop gateway changed during ownership verification.')
@@ -8574,6 +9155,7 @@ async function startGateway(): Promise<GatewayState> {
   const activeProfile = activeDesktopProfile()
   const overrideUrl = process.env.OPENSQUILLA_DESKTOP_GATEWAY_URL
   if (overrideUrl) {
+    beginGatewayStartTelemetry('external', 'health')
     if (!isCurrent()) throw new Error('Desktop startup was superseded before Gateway override validation.')
     sendBootStatus('gateway-health')
     gatewayState.url = overrideUrl.replace(/\/$/, '')
@@ -8588,6 +9170,7 @@ async function startGateway(): Promise<GatewayState> {
     if (!isCurrent()) throw new Error('Desktop startup was superseded during Gateway override validation.')
     gatewayState.status = overrideReady ? 'ready' : 'error'
     if (gatewayState.status !== 'ready') {
+      advanceGatewayStartTelemetry('health', 'health_timeout')
       gatewayState.error = `Configured gateway is not ready: ${gatewayState.url}`
       publishGatewayConnection()
       throw new Error(`Configured gateway is not healthy: ${gatewayState.url}`)
@@ -8601,35 +9184,51 @@ async function startGateway(): Promise<GatewayState> {
   if (!isCurrent()) throw new Error('Desktop startup was superseded during Gateway recovery.')
 
   sendBootStatus('profile')
-  const connection = await runOnboarding()
+  const connection = await prepareDesktopStartupConnection()
   if (!isCurrent()) throw new Error('Desktop startup was superseded during profile setup.')
   forceOnboardingOnNextStartup = false
-  const apiKey = decryptApiKey(connection)
+  const apiKey = connection ? decryptApiKey(connection) : ''
   // Keyless providers (e.g. Ollama) ship requiresApiKey=false and are accepted
   // by onboarding without a key, so only treat a missing key as fatal when the
   // provider actually needs one — otherwise every keyless credential wedges boot.
-  if (providerDefaults(connection.provider).requiresApiKey && !apiKey) {
+  if (connection && providerDefaults(connection.provider).requiresApiKey && !apiKey) {
     throw new Error('Saved desktop API key could not be read.')
   }
-  const searchApiKey = decryptSearchApiKey(connection)
+  const searchApiKey = connection ? decryptSearchApiKey(connection) : ''
   // Config is seeded (when missing) inside runOnboarding / the onboarding save,
   // and is otherwise the RPC-owned source of truth — so it is intentionally NOT
   // regenerated here on every boot.
 
   sendBootStatus('gateway-start')
-  const runtime = await resolveGatewayRuntime()
+  beginGatewayStartTelemetry('spawned', 'spawn')
+  let runtime: RuntimeLaunch
+  try {
+    runtime = await resolveGatewayRuntime()
+  } catch (error) {
+    advanceGatewayStartTelemetry('spawn', 'runtime_unavailable')
+    throw error
+  }
+  if (!(await pathIsDirectory(runtime.cwd))) {
+    advanceGatewayStartTelemetry('spawn', 'runtime_unavailable')
+    throw new Error(`runtime_root_missing: Gateway cwd does not exist: ${runtime.cwd}`)
+  }
+  desktopLog('gateway_runtime_resolved', {
+    mode: runtime.mode,
+    command: runtime.command,
+    cwd: runtime.cwd,
+  })
 
   // Start the main-process-only bridge before the final port-selection await.
   // Its random endpoint and 256-bit token are injected only into this owned
   // Gateway child below; they are never copied into the renderer environment.
-  let artifactBridgeEnvironment: NodeJS.ProcessEnv = {}
+  let browserEnvironment: NodeJS.ProcessEnv = {}
   try {
-    artifactBridgeEnvironment = await desktopArtifactBridgeLoopback.start()
+    browserEnvironment = await desktopBrowser.start()
   } catch {
     // The editor transport is additive. If loopback binding is unavailable,
     // keep the Gateway and download/source workflows usable with every native
     // capability disabled instead of weakening the transport boundary.
-    desktopLog('desktop_artifact_bridge_transport_unavailable')
+    desktopLog('desktop_browser_transport_unavailable')
   }
   const port = await findGatewayPort()
   // This is the final await before spawn. Update, quit, cleanup, and recovery
@@ -8683,16 +9282,17 @@ async function startGateway(): Promise<GatewayState> {
   const childEnv = desktopChildEnvironment(activeProfile, {
     PATH: childPath,
     ...(process.platform === 'win32' ? { Path: childPath } : {}),
-    ...(connection.apiKeyEnv && apiKey ? { [connection.apiKeyEnv]: apiKey } : {}),
-    ...(connection.searchApiKeyEnv && searchApiKey ? { [connection.searchApiKeyEnv]: searchApiKey } : {}),
+    ...(connection?.apiKeyEnv && apiKey ? { [connection.apiKeyEnv]: apiKey } : {}),
+    ...(connection?.searchApiKeyEnv && searchApiKey ? { [connection.searchApiKeyEnv]: searchApiKey } : {}),
     OPENSQUILLA_DESKTOP_GATEWAY_INSTANCE_NONCE: gatewayInstanceNonce,
+    OPENSQUILLA_DESKTOP_GATEWAY_INSTANCE_ID: gatewayConnectionInstanceId,
     OPENSQUILLA_DESKTOP_GATEWAY_OWNERSHIP_DIR: gatewayOwnershipDir,
-    ...artifactBridgeEnvironment,
+    ...browserEnvironment,
     OPENSQUILLA_CONTROL_UI_DIST: desktopRendererDistPath(),
     // desktopChildEnvironment pins OPENSQUILLA_STATE_DIR to H. RC4's Python
     // recovery engine has already validated/reconciled the historical nested
     // layout before this writer is admitted.
-    ...(connection.disableNetworkObservability ? { OPENSQUILLA_PRIVACY_DISABLE_NETWORK_OBSERVABILITY: '1' } : {}),
+    ...(connection?.disableNetworkObservability ? { OPENSQUILLA_PRIVACY_DISABLE_NETWORK_OBSERVABILITY: '1' } : {}),
     PYTHONUNBUFFERED: '1',
     PYTHONUTF8: '1',
     PYTHONIOENCODING: 'utf-8:replace',
@@ -8727,6 +9327,9 @@ async function startGateway(): Promise<GatewayState> {
     profileKind: activeProfile.kind,
     pid: child.pid,
     port,
+    runtimeMode: runtime.mode,
+    runtimeCommand: runtime.command,
+    runtimeCwd: runtime.cwd,
   })
   if (runtime.mode === 'dev') gatewayProcessTreeChildren.add(child)
 
@@ -8751,6 +9354,28 @@ async function startGateway(): Promise<GatewayState> {
     const isCurrentGateway = gatewayProcess === child
     const childReadyAuthority = gatewayReadyProcesses.get(child) ?? null
     const childWasReady = childReadyAuthority !== null
+    const unexpectedReadyExit = isCurrentGateway
+      && childWasReady
+      && !isQuitting
+      && !gatewayStoppingProcesses.has(child)
+    desktopLog('gateway_exited', {
+      pid: child.pid,
+      code,
+      signal,
+      abnormalExit,
+      current: isCurrentGateway,
+      ready: childWasReady,
+      quitting: isQuitting,
+      gatewayStopping: gatewayStoppingProcesses.has(child),
+    })
+    gatewayReadyProcesses.delete(child)
+    if (unexpectedReadyExit && abnormalExit) {
+      desktopReliabilityTelemetry.recordCrash({
+        component: 'gateway',
+        errorCode: 'gateway_unexpected_exit',
+        reason: 'abnormal_exit',
+      })
+    }
     if (isCurrentGateway) gatewayProcess = null
     writeLogLine(`\n[desktop] ${message}\n`)
     // Release the append fd; without this every (re)start leaks one open handle
@@ -8763,13 +9388,19 @@ async function startGateway(): Promise<GatewayState> {
       return
     }
     childExitMessage = classifiedMessage
+    advanceGatewayStartTelemetry('spawn', 'spawn_failed')
     if (!childWasReady && portConflictExit && !hasExplicitGatewayPort()) {
       gatewayState.status = 'stopped'
       gatewayState.error = undefined
       publishGatewayConnection()
       return
     }
-    if (abnormalExit) {
+    // A ready Gateway can receive SIGTERM and exit cleanly (code=0). That is
+    // still an unexpected disconnect while the Desktop app is alive. Treat it
+    // like an abnormal ready exit so the bounded recovery series can restore
+    // the child. The stopping set and lifecycle authority checks above/below
+    // keep explicit quit, update, and profile recovery drains excluded.
+    if (abnormalExit || unexpectedReadyExit) {
       if (scheduleGatewayUnexpectedExitRestart(
         classifiedMessage,
         childWasReady,
@@ -8805,11 +9436,13 @@ async function startGateway(): Promise<GatewayState> {
       publishGatewayConnection()
       return
     }
+    advanceGatewayStartTelemetry('spawn', 'spawn_failed')
     if (scheduleGatewayUnexpectedExitRestart(message, gatewayReadyProcesses.has(child))) return
     publishTerminalGatewayExitError(message)
   })
 
   sendBootStatus('gateway-health')
+  advanceGatewayStartTelemetry('health')
   await waitForGateway(url, () => childExitMessage)
   // Guard against adopting a foreign gateway that won the probe→bind race: if our
   // spawned child has already exited, it lost the exclusive bind and the healthy
@@ -8820,6 +9453,7 @@ async function startGateway(): Promise<GatewayState> {
     throw new Error(childExitMessage
       || 'OPENSQUILLA_GATEWAY_PORT_IN_USE: desktop gateway did not keep the port bind.')
   }
+  advanceGatewayStartTelemetry('ownership')
   if (!await verifyOwnedGatewayLaunch(child)) {
     // Never send a shutdown request to the unverified listener. Terminate only
     // the exact child handle we spawned, then let port recovery choose another
@@ -8842,6 +9476,8 @@ async function startGateway(): Promise<GatewayState> {
 }
 
 async function startGatewayWithPortRecovery(): Promise<GatewayState> {
+  const telemetryAttempt = createGatewayStartTelemetryAttempt()
+  gatewayStartTelemetryAttempt = telemetryAttempt
   // Begin each fresh recovery sequence at the first port so a previously-used
   // port that is now free is reused. The cursor still advances within this loop
   // to skip a port whose bind lost a post-probe race, but it must not persist
@@ -8850,17 +9486,26 @@ async function startGatewayWithPortRecovery(): Promise<GatewayState> {
   if (!hasExplicitGatewayPort()) gatewayPortCursor = GATEWAY_PORT_FIRST
   const maxAttempts = hasExplicitGatewayPort() ? 1 : GATEWAY_PORT_LAST - GATEWAY_PORT_FIRST + 1
   let lastError: unknown = null
-  for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
-    try {
-      return await startGateway()
-    } catch (err) {
-      lastError = err
-      const message = err instanceof Error ? err.message : String(err)
-      if (hasExplicitGatewayPort() || !gatewayExitLooksLikePortInUse(message)) throw err
-      desktopLog('gateway_port_retry', { attempt: attempt + 1 })
+  try {
+    for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
+      try {
+        const state = await startGateway()
+        finishGatewayStartTelemetry(telemetryAttempt, null)
+        return state
+      } catch (err) {
+        lastError = err
+        const message = err instanceof Error ? err.message : String(err)
+        if (hasExplicitGatewayPort() || !gatewayExitLooksLikePortInUse(message)) throw err
+        desktopLog('gateway_port_retry', { attempt: attempt + 1 })
+      }
     }
+    throw lastError instanceof Error ? lastError : new Error(String(lastError || 'Gateway port retry exhausted.'))
+  } catch (error) {
+    finishGatewayStartTelemetry(telemetryAttempt, error)
+    throw error
+  } finally {
+    if (gatewayStartTelemetryAttempt === telemetryAttempt) gatewayStartTelemetryAttempt = null
   }
-  throw lastError instanceof Error ? lastError : new Error(String(lastError || 'Gateway port retry exhausted.'))
 }
 
 // The normal application renderer has a stable, local origin. Gateway HTTP and
@@ -8894,9 +9539,15 @@ async function createMainWindow(): Promise<BrowserWindow> {
       contextIsolation: true,
       nodeIntegration: false,
       sandbox: true,
+      // Electron disables Chromium's built-in PDF plugin by default. The
+      // Workbench intentionally uses the native PDF viewer for PDF artifacts;
+      // keep the renderer sandboxed while enabling that viewer.
+      plugins: true,
     },
   })
   mainWindow = window
+  installGatewayShutdownRequestInterceptor(window)
+  trackDesktopReliabilityWindow(window)
   installDesktopZoomShortcuts(
     window.webContents,
     window.webContents,
@@ -8924,7 +9575,7 @@ async function createMainWindow(): Promise<BrowserWindow> {
   // folder without a reproduction. Only the trusted main frame is accepted: an
   // artifact or other child frame must not be able to write to the lifecycle log.
   window.webContents.on('console-message', (details) => {
-    if (details.frame !== window.webContents.mainFrame) return
+    if (!isLiveMainFrameConsoleMessage(window, details)) return
     const entry = buildRendererConsoleLogEntry({
       level: details.level,
       message: details.message,
@@ -8943,6 +9594,11 @@ async function createMainWindow(): Promise<BrowserWindow> {
   window.webContents.on('render-process-gone', (_event, details) => {
     flushRendererConsoleSuppression()
     releaseRendererOwnedArtifactPreviews()
+    if (rendererUnresponsiveAt !== null) {
+      rendererUnresponsiveAt = null
+      desktopReliabilityTelemetry.endStall()
+    }
+    recordRendererCrash(details.reason)
     const entry = buildRendererGoneLogEntry({
       reason: details.reason,
       exitCode: details.exitCode,
@@ -8954,6 +9610,7 @@ async function createMainWindow(): Promise<BrowserWindow> {
     flushRendererConsoleSuppression()
     if (rendererUnresponsiveAt !== null) return
     rendererUnresponsiveAt = Date.now()
+    desktopReliabilityTelemetry.beginStall()
     const entry = buildRendererStateLogEntry('unresponsive')
     desktopLog(entry.event, entry.detail)
   })
@@ -8962,6 +9619,7 @@ async function createMainWindow(): Promise<BrowserWindow> {
     if (rendererUnresponsiveAt === null) return
     const durationMs = Date.now() - rendererUnresponsiveAt
     rendererUnresponsiveAt = null
+    desktopReliabilityTelemetry.endStall()
     const entry = buildRendererStateLogEntry('responsive', durationMs)
     desktopLog(entry.event, entry.detail)
   })
@@ -9052,6 +9710,7 @@ async function createMainWindow(): Promise<BrowserWindow> {
       // or logout. Release the tray and exact owned child from this
       // BrowserWindow event, which is guaranteed for that lifecycle.
       isQuitting = true
+      desktopReliabilityTelemetry.finishSession()
       destroyWindowsTray()
       stopGateway()
     })
@@ -9259,6 +9918,12 @@ async function inspectActiveProfileBeforeStartup(): Promise<boolean> {
   }
   recoveryOperationError = null
   let inspection = await inspectDesktopProfile(active)
+  const growthInspection = {
+    profileKey: active.home,
+    stableCode: inspection.stable_code,
+    importedOrMigrated: consolidationFailure !== null
+      || pendingDesktopCredentialConsolidation !== null,
+  }
   // Findings below are warnings (`attention`), not startup blockers: the
   // repair action advertised by the inspector is run automatically and
   // startup continues. Only a failed automatic repair, a config authored by
@@ -9402,6 +10067,7 @@ async function inspectActiveProfileBeforeStartup(): Promise<boolean> {
 
   recoveryInspection = inspection
   primaryRecoveryInspection = inspection
+  desktopGrowthTelemetry.observeProfileInspection(growthInspection)
   publishRecoveryState()
   createApplicationMenu()
   if (inspection.outcome !== 'recovery_required') return true
@@ -9428,7 +10094,28 @@ async function openOrResumeDesktopApp(): Promise<void> {
       focusMainWindow()
 
       try {
-        if (await inspectActiveProfileBeforeStartup()) {
+        const profileReady = await inspectActiveProfileBeforeStartup()
+        // Only trust config.state_dir after profile inspection/recovery has
+        // bounded the active profile. Sync before publishing that inspection's
+        // terminal result so existing opt-in users retain profile-start facts;
+        // new/unset consent remains fail-closed.
+        if (profileReady) {
+          try {
+            await syncDesktopConsentMirror()
+          } catch (error) {
+            desktopTelemetryRuntimeGate.close()
+            desktopLog('desktop_telemetry_consent_preflight_failed', {
+              error: error instanceof Error ? error.message : 'unknown error',
+            })
+          }
+        }
+        if (!profileReady && operationIsCurrent()) {
+          finishAppStartFailure(new Error('profile recovery required'), {
+            stage: 'profile',
+            errorCode: 'profile_recovery_required',
+          })
+        }
+        if (profileReady) {
           if (revision === desktopOpenFlowRevision && requestedProfileKey === desktopProfileKey()) {
             // Recovery may temporarily replace the renderer with boot.html. Put
             // the local application back before any Gateway startup wait so the
@@ -9461,6 +10148,15 @@ async function openOrResumeDesktopApp(): Promise<void> {
             )
             if (operationIsCurrent()) {
               sendBootStatus('ready')
+              finishAppStartSuccess()
+              if (onboardingPromptProfileKey === desktopProfileKey() && !onboardingFlows.active) {
+                onboardingPromptProfileKey = null
+                // The client and Gateway are already ready. This optional,
+                // non-modal invitation must never participate in boot failure.
+                void runOnboarding().catch(() => {
+                  desktopLog('onboarding_invitation_unavailable')
+                })
+              }
             }
           }
         }
@@ -9478,7 +10174,13 @@ async function openOrResumeDesktopApp(): Promise<void> {
             gatewayStatus: gatewayState.status,
             error: error instanceof Error ? error.message : String(error),
           })
-          if (currentMainWindow()) sendBootError(error)
+          if (error instanceof DesktopRoutingConfigurationError) {
+            await restoreMainWindowToBootPage()
+          }
+          if (operationIsCurrent()) {
+            if (currentMainWindow()) sendBootError(error)
+            finishAppStartFailure(error)
+          }
         }
       }
       if (desktopOpenAuthorityIsCurrent(revision, requestedProfileKey)) return
@@ -9513,7 +10215,7 @@ const UPDATE_GATEWAY_EXIT_TIMEOUT_MS = GATEWAY_SHUTDOWN_KILL_AFTER_MS + GATEWAY_
 async function requestGatewayShutdown(url: string): Promise<boolean> {
   if (!url) return false
   try {
-    const response = await fetch(`${url}/api/system/shutdown`, {
+    const response = await desktopMonitoredFetch(`${url}/api/system/shutdown`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: '{}',
@@ -9567,7 +10269,7 @@ async function downloadDiagnostics(): Promise<void> {
     return
   }
   try {
-    const response = await fetch(`${url}/api/v1/diagnostics/bundle`, {
+    const response = await desktopMonitoredFetch(`${url}/api/v1/diagnostics/bundle`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: '{}',
@@ -9716,9 +10418,10 @@ function stopGateway(): void {
 // ── Desktop updates ──────────────────────────────────────────────────────────
 // macOS release builds are Developer-ID signed + notarized and ship the zip +
 // latest-mac.yml feed that Squirrel.Mac consumes, so in-place auto-update is
-// safe. Windows builds are currently unsigned, so the desktop shell discovers
-// the release but opens its exact versioned NSIS installer for an explicit
-// manual install. OPENSQUILLA_DESKTOP_ENABLE_WIN_UPDATE=1 opts in to native
+// safe. Windows hands off a verified full installer to the visible NSIS wizard.
+// OPENSQUILLA_DESKTOP_ENABLE_WIN_INSTALL=0 disables this handoff and retains the
+// manual Show installer action; signature and checksum checks still apply.
+// OPENSQUILLA_DESKTOP_ENABLE_WIN_UPDATE=1 opts in to native
 // Windows updating for local tests only; OPENSQUILLA_DESKTOP_DISABLE_AUTO_UPDATE
 // disables all shell-managed discovery.
 const { autoUpdater } = electronUpdater
@@ -9729,11 +10432,16 @@ let manualInstallerActionInProgress = false
 let updateApplying = false
 // A user/system quit that arrives while an update is still draining writers or
 // the gateway is deferred until that phase either fails safely or reaches the
-// updater-owned handoff. Only quitAndInstall may set handoff ready.
+// updater-owned handoff. A verified Windows installer spawn may also commit it.
 let updateInstallHandoffReady = false
 let quitRequestedDuringUpdateDrain = false
 let downloadedUpdateVersion: string | null = null
 let verifiedManualInstallerPath: string | null = null
+let windowsUpdateCacheDescriptor: WindowsUpdateCacheDescriptor | null = null
+let windowsUpdateCacheRestore: Promise<void> | null = null
+let windowsUpdateCacheRestoreAttempted = false
+const windowsUpdateCoordinator = new WindowsUpdateCoordinator()
+let windowsUpdateRecoveryGeneration = 0
 let updateGatewayShutdownProcess: ChildProcessWithoutNullStreams | null = null
 let mockDownloadedUpdate = false
 let mockUpdatePromptActive = false
@@ -9760,6 +10468,8 @@ type DesktopUpdateErrorCode =
   | 'integrity_failed'
   | 'download_failed'
   | 'install_failed'
+  | 'signature_invalid'
+  | 'signature_unavailable'
   | null
 
 interface DesktopUpdateState {
@@ -9773,6 +10483,7 @@ interface DesktopUpdateState {
   snoozedUntil: string | null
   canCheck: boolean
   canNativeInstall: boolean
+  canInstall?: boolean
   installMode: DesktopUpdateInstallMode
   releaseUrl: string | null
   source: DesktopUpdateSource | null
@@ -9932,6 +10643,89 @@ function desktopUpdateInstallMode(): DesktopUpdateInstallMode {
   return 'unsupported'
 }
 
+function windowsInstallerActionsSupported(): boolean {
+  // Keep the existing opt-in value compatible and allow an explicit emergency opt-out.
+  return process.platform === 'win32' && process.arch === 'x64'
+    && desktopUpdateManaged() && desktopUpdateInstallMode() === 'manual'
+    && process.env.OPENSQUILLA_DESKTOP_ENABLE_WIN_INSTALL !== '0'
+}
+
+function windowsUpdateDownloadDirectory(): string {
+  return join(app.getPath('userData'), 'update-downloads')
+}
+
+async function clearWindowsUpdateCache(): Promise<void> {
+  windowsUpdateCacheDescriptor = null
+  verifiedManualInstallerPath = null
+  createApplicationMenu()
+  await saveWindowsUpdateCache(windowsUpdateDownloadDirectory(), null)
+}
+
+function publishVerifiedWindowsInstaller(
+  verified: { path: string; descriptor: WindowsUpdateCacheDescriptor; candidate: DesktopUpdateCandidate },
+  source: DesktopUpdateSource,
+  fallbackUsed = false,
+): void {
+  windowsUpdateCacheDescriptor = verified.descriptor
+  verifiedManualInstallerPath = verified.path
+  desktopUpdateCandidate = verified.candidate
+  setDesktopUpdateState({
+    status: 'downloaded', latestVersion: verified.candidate.version, progress: 100,
+    releaseUrl: updateAssetUrl(verified.candidate, source), source, fallbackUsed,
+    error: null, errorCode: null,
+  })
+  createApplicationMenu()
+}
+
+async function restoreWindowsUpdateCache(forceRetry = false): Promise<void> {
+  if (windowsUpdateCacheRestore) return windowsUpdateCacheRestore
+  if (forceRetry && !verifiedManualInstallerPath) windowsUpdateCacheRestoreAttempted = false
+  if (windowsUpdateCacheRestoreAttempted || process.platform !== 'win32'
+    || !desktopUpdateManaged() || desktopUpdateInstallMode() !== 'manual'
+    || isQuitting || updateApplying || desktopWriters.closed) return
+  windowsUpdateCacheRestoreAttempted = true
+  windowsUpdateCacheRestore = (async () => {
+    try {
+      loadDesktopUpdatePersistence()
+      const descriptor = await loadWindowsUpdateCache(windowsUpdateDownloadDirectory())
+      if (!descriptor) return
+      windowsUpdateCacheDescriptor = descriptor
+      const verified = await verifyCachedInstaller(windowsUpdateDownloadDirectory(), descriptor, app.getVersion())
+      if (!verified) {
+        await clearWindowsUpdateCache()
+        return
+      }
+      // A concurrent Quit/migration owns its state; never reopen actions under it.
+      if (isQuitting || updateApplying || desktopWriters.closed) {
+        windowsUpdateCacheRestoreAttempted = false
+        return
+      }
+      publishVerifiedWindowsInstaller(verified, lastSuccessfulUpdateSource ?? 'oss')
+      desktopLog('update_windows_cache_restored', { version: verified.candidate.version })
+    } catch (error) {
+      if (error instanceof WindowsUpdateSecurityError && error.code === 'signature_invalid') {
+        await clearWindowsUpdateCache().catch(() => {})
+      }
+      desktopLog('update_windows_cache_unavailable', { error: String(error) })
+      // Retain a cache whose verification tool is temporarily unavailable.
+      // An explicit Download can retry the verification without fetching bytes.
+      if (forceRetry) throw error
+    }
+  })().finally(() => { windowsUpdateCacheRestore = null })
+  return windowsUpdateCacheRestore
+}
+
+async function revalidateReadyWindowsInstaller(): Promise<string> {
+  const verified = await verifyCachedInstaller(
+    windowsUpdateDownloadDirectory(), windowsUpdateCacheDescriptor, app.getVersion(),
+    { expectedCandidate: desktopUpdateCandidate ?? undefined },
+  )
+  if (!verified || verified.path !== verifiedManualInstallerPath) {
+    throw new UpdateChannelError('integrity_failed', 'The downloaded Windows installer is no longer valid.')
+  }
+  return verified.path
+}
+
 function desktopUpdateStatePath(): string {
   // Update availability is application-global and may be read before profile
   // inspection, so it must never resolve through an untrusted selected H.
@@ -10019,6 +10813,7 @@ function desktopUpdateSnapshot(): DesktopUpdateState {
     snoozedUntil: activeDesktopUpdateSnoozeFor(latestVersion),
     canCheck: desktopUpdateManaged() || mockUpdateVersion() !== null,
     canNativeInstall: installMode === 'native',
+    canInstall: installMode === 'native' || windowsInstallerActionsSupported(),
     installMode,
     releaseUrl: desktopUpdateReleaseUrl,
     source: desktopUpdateSource,
@@ -10113,6 +10908,8 @@ function showUpdateDialog(
 }
 
 function classifyDesktopUpdateError(err: unknown): Exclude<DesktopUpdateErrorCode, null> {
+  if (err instanceof WindowsUpdateSecurityError) return err.code
+  if (err instanceof WindowsUpdateHandoffError) return 'install_failed'
   if (err instanceof UpdateChannelError) {
     if (err.code === 'manifest_invalid' || err.code === 'current_version_invalid') return 'manifest_invalid'
     if (err.code === 'checksum_unavailable') return 'checksum_unavailable'
@@ -10124,7 +10921,16 @@ function classifyDesktopUpdateError(err: unknown): Exclude<DesktopUpdateErrorCod
   return updateDownloadInProgress ? 'download_failed' : 'source_unreachable'
 }
 
+function classifyDesktopUpdateTelemetryError(err: unknown): UpdateErrorCode {
+  const code = classifyDesktopUpdateError(err)
+  if (code === 'signature_invalid') return 'integrity_failed'
+  if (code === 'signature_unavailable') return 'internal_error'
+  return code
+}
+
 function desktopUpdateErrorMessage(code: Exclude<DesktopUpdateErrorCode, null>): string {
+  if (code === 'signature_invalid') return desktopT('update.signatureInvalid')
+  if (code === 'signature_unavailable') return desktopT('update.signatureUnavailable')
   if (code === 'manifest_invalid') return desktopT('update.manifestInvalid')
   if (code === 'checksum_unavailable') return desktopT('update.checksumUnavailable')
   if (code === 'integrity_failed') return desktopT('update.integrityFailed')
@@ -10203,21 +11009,36 @@ async function runMockUpdateFlow(version: string): Promise<void> {
 }
 
 async function downloadDesktopUpdate(): Promise<DesktopUpdateState> {
+  try {
+    await restoreWindowsUpdateCache(true)
+  } catch (error) {
+    const errorCode = classifyDesktopUpdateError(error)
+    return setDesktopUpdateState({ status: 'error', errorCode, error: desktopUpdateErrorMessage(errorCode) })
+  }
+  if (isQuitting || desktopWriters.closed || updateApplying || manualInstallerActionInProgress) return desktopUpdateSnapshot()
   if (
     desktopUpdateInstallMode() === 'manual'
     && desktopUpdateStatus === 'downloaded'
     && verifiedManualInstallerPath
   ) {
+    manualInstallerActionInProgress = true
     try {
+      await revalidateReadyWindowsInstaller()
       shell.showItemInFolder(verifiedManualInstallerPath)
     } catch (err) {
+      const errorCode = classifyDesktopUpdateError(err)
+      if (errorCode === 'integrity_failed' || errorCode === 'signature_invalid') {
+        await clearWindowsUpdateCache().catch(() => {})
+      }
       console.error('[updater] failed to reveal verified manual installer', err)
       return setDesktopUpdateState({
         status: 'error',
         progress: null,
-        error: desktopUpdateErrorMessage('install_failed'),
-        errorCode: 'install_failed',
+        error: desktopUpdateErrorMessage(errorCode),
+        errorCode,
       })
+    } finally {
+      manualInstallerActionInProgress = false
     }
     return desktopUpdateSnapshot()
   }
@@ -10233,6 +11054,7 @@ async function downloadDesktopUpdate(): Promise<DesktopUpdateState> {
   const mockVersion = mockUpdateVersion()
   if (mockVersion !== null) {
     const version = desktopUpdateLatestVersion || mockVersion
+    const telemetryStartedAt = Date.now()
     updateDownloadInProgress = true
     setDesktopUpdateState({
       status: 'downloading',
@@ -10247,6 +11069,15 @@ async function downloadDesktopUpdate(): Promise<DesktopUpdateState> {
     downloadedUpdateVersion = version
     mockDownloadedUpdate = true
     createApplicationMenu()
+    desktopReliabilityTelemetry.recordUpdateResult({
+      outcome: 'success',
+      durationMs: Math.max(0, Date.now() - telemetryStartedAt),
+      updateStage: 'download',
+      errorCode: null,
+      oldVersion: app.getVersion(),
+      newVersion: version,
+      result: null,
+    })
     return setDesktopUpdateState({
       status: 'downloaded',
       latestVersion: version,
@@ -10257,19 +11088,50 @@ async function downloadDesktopUpdate(): Promise<DesktopUpdateState> {
 
   if (desktopUpdateInstallMode() === 'manual') {
     manualInstallerActionInProgress = true
+    let finishTelemetry: ((outcome: 'success' | 'fail', errorCode: UpdateErrorCode | null) => void) | undefined
     try {
       if (desktopUpdateStatus === 'checking') await checkForUpdates(true)
       if (!desktopUpdateCandidate) await checkForUpdates(true)
       const candidate = desktopUpdateCandidate
-      if (!candidate || desktopUpdateStatus !== 'available') return desktopUpdateSnapshot()
+      if (!candidate || !['available', 'error'].includes(desktopUpdateStatus)) return desktopUpdateSnapshot()
+      const telemetryStartedAt = Date.now()
+      let telemetryFinished = false
+      finishTelemetry = (
+        outcome: 'success' | 'fail',
+        errorCode: UpdateErrorCode | null,
+      ) => {
+        if (telemetryFinished) return
+        telemetryFinished = true
+        desktopReliabilityTelemetry.recordUpdateResult({
+          outcome,
+          durationMs: Math.max(0, Date.now() - telemetryStartedAt),
+          updateStage: 'download',
+          errorCode,
+          oldVersion: app.getVersion(),
+          newVersion: candidate.version,
+          result: null,
+        })
+      }
       updateDownloadInProgress = true
       verifiedManualInstallerPath = null
+
+      // Recover a previously completed download before probing or fetching bytes.
+      const cached = await verifyCachedInstaller(
+        windowsUpdateDownloadDirectory(), windowsUpdateCacheDescriptor, app.getVersion(),
+        { expectedCandidate: candidate },
+      )
+      if (cached) {
+        publishVerifiedWindowsInstaller(cached, desktopUpdateSource ?? lastSuccessfulUpdateSource ?? 'oss')
+        finishTelemetry('success', null)
+        return desktopUpdateSnapshot()
+      }
 
       let chosen: { source: DesktopUpdateSource; fallbackUsed: boolean }
       try {
         chosen = await chooseDesktopUpdateSource(candidate, candidate.installer)
       } catch (err) {
         console.error('[updater] manual installer sources are unreachable', err)
+        finishTelemetry('fail', 'source_unreachable')
         return setDesktopUpdateState({
           status: 'error',
           progress: null,
@@ -10292,37 +11154,47 @@ async function downloadDesktopUpdate(): Promise<DesktopUpdateState> {
       })
       try {
         const expectedSha256 = await fetchCanonicalWindowsInstallerDigest(candidate)
-        const verified = await downloadVerifiedWindowsInstallerWithFallback(
+        const downloaded = await downloadVerifiedWindowsInstallerWithFallback(
           candidate,
           chosen,
           expectedSha256,
         )
-        verifiedManualInstallerPath = verified.path
-        rememberSuccessfulUpdateSource(verified.source)
-        setDesktopUpdateState({
-          status: 'downloaded',
-          latestVersion: candidate.version,
-          progress: 100,
-          checkedAt: new Date().toISOString(),
-          releaseUrl: updateAssetUrl(candidate, verified.source),
-          source: verified.source,
-          fallbackUsed: verified.fallbackUsed,
-          error: null,
-          errorCode: null,
-        })
-        try {
-          shell.showItemInFolder(verified.path)
-        } catch (err) {
-          throw new UpdateChannelError(
-            'install_failed',
-            `The verified installer could not be shown: ${String(err instanceof Error ? err.message : err)}`,
-          )
+        windowsUpdateCacheDescriptor = createWindowsUpdateCacheDescriptor(
+          candidate, expectedSha256, (await stat(downloaded.path)).size,
+        )
+        // The completed SHA-checked download can survive a temporarily
+        // unavailable OS verifier. Metadata alone never makes it installable.
+        await saveWindowsUpdateCache(windowsUpdateDownloadDirectory(), windowsUpdateCacheDescriptor)
+        const verified = await verifyCachedInstaller(
+          windowsUpdateDownloadDirectory(), windowsUpdateCacheDescriptor, app.getVersion(),
+          { expectedCandidate: candidate, expectedSha256 },
+        )
+        if (!verified) {
+          throw new UpdateChannelError('integrity_failed', 'The downloaded Windows installer is no longer valid.')
         }
+        // Use the same canonical path for first download, restart restoration,
+        // and install-time identity checks, including userData ancestor junctions.
+        rememberSuccessfulUpdateSource(downloaded.source)
+        setDesktopUpdateState({ checkedAt: new Date().toISOString() })
+        publishVerifiedWindowsInstaller(verified, downloaded.source, downloaded.fallbackUsed)
+        finishTelemetry('success', null)
       } catch (err) {
         console.error('[updater] failed to prepare verified manual installer', err)
+        const errorCode = classifyDesktopUpdateError(err)
+        finishTelemetry('fail', classifyDesktopUpdateTelemetryError(err))
+        if (errorCode === 'integrity_failed' || errorCode === 'signature_invalid') {
+          await clearWindowsUpdateCache().catch(() => {})
+        }
         showUpdateError(err)
         return desktopUpdateSnapshot()
       }
+      return desktopUpdateSnapshot()
+    } catch (err) {
+      finishTelemetry?.('fail', classifyDesktopUpdateTelemetryError(err))
+      if (err instanceof WindowsUpdateSecurityError && err.code === 'signature_invalid') {
+        await clearWindowsUpdateCache().catch(() => {})
+      }
+      showUpdateError(err)
       return desktopUpdateSnapshot()
     } finally {
       updateDownloadInProgress = false
@@ -10348,6 +11220,7 @@ async function downloadDesktopUpdate(): Promise<DesktopUpdateState> {
   }
   if (!candidate || !nativeUpdateReadyFor(candidate)) return desktopUpdateSnapshot()
 
+  const telemetryStartedAt = Date.now()
   updateDownloadInProgress = true
   setDesktopUpdateState({
     status: 'downloading',
@@ -10357,8 +11230,26 @@ async function downloadDesktopUpdate(): Promise<DesktopUpdateState> {
   })
   try {
     await downloadNativeDesktopUpdateWithFallback()
+    desktopReliabilityTelemetry.recordUpdateResult({
+      outcome: 'success',
+      durationMs: Math.max(0, Date.now() - telemetryStartedAt),
+      updateStage: 'download',
+      errorCode: null,
+      oldVersion: app.getVersion(),
+      newVersion: candidate.version,
+      result: null,
+    })
   } catch (err) {
     console.error('[updater] download failed', err)
+    desktopReliabilityTelemetry.recordUpdateResult({
+      outcome: 'fail',
+      durationMs: Math.max(0, Date.now() - telemetryStartedAt),
+      updateStage: 'download',
+      errorCode: classifyDesktopUpdateTelemetryError(err),
+      oldVersion: app.getVersion(),
+      newVersion: candidate.version,
+      result: null,
+    })
     showUpdateError(err)
   }
   return desktopUpdateSnapshot()
@@ -10460,7 +11351,7 @@ async function fetchDesktopUpdateChannelFromRoot(root?: string): Promise<unknown
   }
   let response: Response
   try {
-    response = await fetch(url, {
+    response = await desktopMonitoredFetch(url, {
       headers: { Accept: 'application/json', 'User-Agent': 'OpenSquilla-Desktop' },
       signal: AbortSignal.timeout(8000),
       cache: 'no-store',
@@ -10484,7 +11375,7 @@ async function fetchDesktopUpdateChannelFromRoot(root?: string): Promise<unknown
 async function fetchDesktopUpdateChannelFromGithubReleases(): Promise<unknown> {
   let response: Response
   try {
-    response = await fetch(UPDATE_GITHUB_RELEASES_API_URL, {
+    response = await desktopMonitoredFetch(UPDATE_GITHUB_RELEASES_API_URL, {
       headers: { Accept: 'application/vnd.github+json', 'User-Agent': 'OpenSquilla-Desktop' },
       signal: AbortSignal.timeout(8000),
       cache: 'no-store',
@@ -10556,7 +11447,7 @@ async function probeDesktopUpdateSource(
   const url = updateAssetUrl(candidate, source, asset)
   let response: Response
   try {
-    response = await fetch(url, {
+    response = await desktopMonitoredFetch(url, {
       headers: { Accept: 'application/octet-stream', Range: 'bytes=0-0', 'User-Agent': 'OpenSquilla-Desktop' },
       signal: AbortSignal.timeout(5000),
       cache: 'no-store',
@@ -10622,7 +11513,7 @@ async function fetchWindowsInstallerDigestFromSource(
   const checksumUrl = updateAssetUrl(candidate, source, 'SHA256SUMS')
   let response: Response
   try {
-    response = await fetch(checksumUrl, {
+    response = await desktopMonitoredFetch(checksumUrl, {
       headers: { Accept: 'text/plain', 'User-Agent': 'OpenSquilla-Desktop' },
       signal: AbortSignal.timeout(10_000),
       cache: 'no-store',
@@ -10707,7 +11598,7 @@ async function downloadVerifiedWindowsInstaller(
   const installerUrl = updateAssetUrl(candidate, source)
   let response: Response
   try {
-    response = await fetch(installerUrl, {
+    response = await desktopMonitoredFetch(installerUrl, {
       headers: { Accept: 'application/octet-stream', 'User-Agent': 'OpenSquilla-Desktop' },
       signal: AbortSignal.timeout(UPDATE_INSTALLER_DOWNLOAD_TIMEOUT_MS),
       cache: 'no-store',
@@ -10965,17 +11856,47 @@ async function downloadNativeDesktopUpdateWithFallback(): Promise<void> {
 }
 
 function desktopUpdateCheckAllowed(): boolean {
+  if (isQuitting || desktopWriters.closed) return false
   return isUpdateCheckAllowed({
-    downloading: updateDownloadInProgress || (manualInstallerActionInProgress && desktopUpdateCandidate !== null),
+    downloading: updateDownloadInProgress || windowsUpdateCacheRestore !== null || (manualInstallerActionInProgress && desktopUpdateCandidate !== null),
     applying: updateApplying,
-    downloaded: downloadedUpdateVersion !== null || desktopUpdateStatus === 'downloaded',
+    // A manual installer is a reusable cache, not a pending native update.
+    // Keep discovery available so a newer or withdrawn candidate can replace it.
+    downloaded: desktopUpdateInstallMode() !== 'manual'
+      && (downloadedUpdateVersion !== null || desktopUpdateStatus === 'downloaded'),
   })
 }
 
 async function runDesktopUpdateCheck(): Promise<void> {
+  try {
+    await restoreWindowsUpdateCache(desktopUpdateCheckScheduler.manualRequestPending)
+  } catch (error) {
+    showUpdateError(error)
+    return
+  }
   // Keep this defensive guard even though the scheduler checks the same state:
   // download/apply events can change it between admission and execution.
   if (!desktopUpdateCheckAllowed()) return
+  const telemetryStartedAt = Date.now()
+  let telemetryFinished = false
+  const finishTelemetry = (
+    outcome: 'success' | 'fail',
+    errorCode: UpdateErrorCode | null,
+    result: 'available' | 'not_available' | null,
+    newVersion: string | null,
+  ) => {
+    if (telemetryFinished) return
+    telemetryFinished = true
+    desktopReliabilityTelemetry.recordUpdateResult({
+      outcome,
+      durationMs: Math.max(0, Date.now() - telemetryStartedAt),
+      updateStage: 'check',
+      errorCode,
+      oldVersion: app.getVersion(),
+      newVersion,
+      result,
+    })
+  }
 
   const mockVersion = mockUpdateVersion()
   if (mockVersion !== null) {
@@ -10987,6 +11908,7 @@ async function runDesktopUpdateCheck(): Promise<void> {
       error: null,
     })
     await runMockUpdateFlow(mockVersion)
+    finishTelemetry('success', null, 'available', mockVersion)
     return
   }
 
@@ -11000,6 +11922,7 @@ async function runDesktopUpdateCheck(): Promise<void> {
         errorCode: 'source_unreachable',
       })
     }
+    finishTelemetry('fail', 'source_unreachable', null, null)
     return
   }
 
@@ -11012,10 +11935,12 @@ async function runDesktopUpdateCheck(): Promise<void> {
       error: desktopT('update.moveToApplications'),
       errorCode: null,
     })
+    finishTelemetry('fail', 'internal_error', null, null)
     return
   }
 
   if (nativeAutoUpdateEnabled()) initAutoUpdater()
+  const manualInstall = desktopUpdateInstallMode() === 'manual'
   const failureFallback: DesktopUpdateFailureFallback = {
     state: desktopUpdateSnapshot(),
     candidate: desktopUpdateCandidate,
@@ -11029,7 +11954,53 @@ async function runDesktopUpdateCheck(): Promise<void> {
     errorCode: null,
   })
   try {
-    const resolved = await resolveDesktopUpdate()
+    let resolved: ResolvedDesktopUpdate | null
+    try {
+      resolved = await resolveDesktopUpdate()
+    } catch (err) {
+      if (isQuitting || updateApplying || desktopWriters.closed) return
+      // Discovery failure must not discard an already downloaded installer.
+      // Verify it again before restoring actions, including on manual checks.
+      if (manualInstall && failureFallback.state.status === 'downloaded' && failureFallback.candidate) {
+        const cached = await verifyCachedInstaller(
+          windowsUpdateDownloadDirectory(), windowsUpdateCacheDescriptor, app.getVersion(),
+          { expectedCandidate: failureFallback.candidate },
+        )
+        if (isQuitting || updateApplying || desktopWriters.closed) return
+        if (cached) {
+          publishVerifiedWindowsInstaller(cached,
+            failureFallback.state.source ?? lastSuccessfulUpdateSource ?? 'oss',
+            failureFallback.state.fallbackUsed)
+          if (desktopUpdateCheckScheduler.consumeManualRequest()) {
+            const errorCode = classifyDesktopUpdateError(err)
+            setDesktopUpdateState({ errorCode, error: desktopUpdateErrorMessage(errorCode) })
+          }
+          finishTelemetry('fail', classifyDesktopUpdateTelemetryError(err), null, null)
+          return
+        }
+        await clearWindowsUpdateCache()
+        throw new UpdateChannelError('integrity_failed', 'The cached Windows installer is no longer valid.')
+      }
+      throw err
+    }
+    if (isQuitting || updateApplying || desktopWriters.closed) return
+    if (manualInstall) {
+      // Only the currently advertised candidate may regain downloaded status.
+      // A changed/withdrawn candidate also invalidates persisted metadata, so a
+      // subsequent restart cannot silently restore the superseded installer.
+      const cached = resolved ? await verifyCachedInstaller(
+        windowsUpdateDownloadDirectory(), windowsUpdateCacheDescriptor, app.getVersion(),
+        { expectedCandidate: resolved.candidate },
+      ) : null
+      if (isQuitting || updateApplying || desktopWriters.closed) return
+      if (cached && resolved) {
+        publishVerifiedWindowsInstaller(cached, resolved.source, resolved.fallbackUsed)
+        finishTelemetry('success', null, 'available', resolved.candidate.version)
+        return
+      }
+      await clearWindowsUpdateCache()
+      if (isQuitting || updateApplying || desktopWriters.closed) return
+    }
     if (!resolved) {
       desktopUpdateCandidate = null
       nativeUpdateReady = null
@@ -11045,9 +12016,9 @@ async function runDesktopUpdateCheck(): Promise<void> {
         source: null,
         fallbackUsed: false,
       })
+      finishTelemetry('success', null, 'not_available', null)
       return
     }
-    const manualInstall = desktopUpdateInstallMode() === 'manual'
     if (manualInstall) {
       verifiedManualInstallerPath = null
       desktopUpdateCandidate = resolved.candidate
@@ -11062,12 +12033,24 @@ async function runDesktopUpdateCheck(): Promise<void> {
         error: null,
         errorCode: null,
       })
+      finishTelemetry('success', null, 'available', resolved.candidate.version)
       return
     }
     await checkNativeDesktopUpdate(resolved)
+    finishTelemetry('success', null, 'available', resolved.candidate.version)
   } catch (err) {
+    if (isQuitting || updateApplying || desktopWriters.closed) return
     console.error('[updater] checkForUpdates failed', err)
-    showUpdateError(err, failureFallback)
+    finishTelemetry('fail', classifyDesktopUpdateTelemetryError(err), null, null)
+    if (manualInstall) {
+      verifiedManualInstallerPath = null
+      if (classifyDesktopUpdateError(err) === 'signature_invalid') {
+        await clearWindowsUpdateCache().catch(() => {})
+      }
+    }
+    if (isQuitting || updateApplying || desktopWriters.closed) return
+    // A failed cache verification must never restore the old ready state.
+    showUpdateError(err, manualInstall && failureFallback.state.status === 'downloaded' ? null : failureFallback)
   }
 }
 
@@ -11121,7 +12104,7 @@ function restoreDownloadedUpdateRetryState(
   writerAdmissionToken: symbol | null = null,
 ): boolean {
   if (writerAdmissionToken) desktopWriters.reopen(writerAdmissionToken)
-  downloadedUpdateVersion = pendingVersion
+  if (desktopUpdateInstallMode() !== 'manual') downloadedUpdateVersion = pendingVersion
   updateApplying = false
   updateInstallHandoffReady = false
   isQuitting = false
@@ -11139,11 +12122,149 @@ function restoreDownloadedUpdateRetryState(
   return true
 }
 
+async function stopOwnedGatewaysForUpdate(): Promise<boolean> {
+  return await stopAndJoinAllLifecycleOwnedGateways((child) => {
+    updateGatewayShutdownProcess = child
+    allowGracefulShutdownWhileQuitting = true
+    try {
+      stopGateway()
+    } finally {
+      allowGracefulShutdownWhileQuitting = false
+    }
+  })
+}
+
+async function applyWindowsInstaller(): Promise<void> {
+  await restoreWindowsUpdateCache()
+  const candidate = desktopUpdateCandidate
+  if (!candidate || desktopUpdateStatus !== 'downloaded' || !verifiedManualInstallerPath) return
+  let writerAdmissionToken: symbol | null = null
+  let installerPath = ''
+  const previouslyOwned = liveLifecycleOwnedGatewayProcesses().length > 0
+  const profileKey = desktopProfileKey()
+  let recoveryGeneration = 0
+  let telemetryStartedAt = 0
+  const assertCanHandoff = () => {
+    if (liveLifecycleOwnedGatewayProcesses().length > 0 || !writerAdmissionToken
+      || desktopWriters.hasOtherOwner(writerAdmissionToken) || desktopWriters.activeCount !== 0) {
+      throw new Error('The desktop is still busy; the Windows installer was not started.')
+    }
+  }
+  await windowsUpdateCoordinator.run({
+    canStart: () => windowsInstallerActionsSupported() && !isQuitting && appExitPhase === 'running'
+      && !updateApplying && !updateDownloadInProgress && !manualInstallerActionInProgress && !desktopWriters.closed,
+    started: () => {
+      recoveryGeneration = ++windowsUpdateRecoveryGeneration
+      telemetryStartedAt = Date.now()
+      updateApplying = true
+      setAppExitPhase('deferred', 'verifying Windows update before installation')
+      setDesktopUpdateState({ status: 'applying', error: null, errorCode: null })
+      createApplicationMenu()
+    },
+    verify: async () => {
+      installerPath = await revalidateReadyWindowsInstaller()
+      await assertUnambiguousWindowsInstallation(app.getPath('exe'))
+    },
+    closeWriters: () => {
+      if (desktopWriters.closed || isQuitting || desktopUpdateCandidate !== candidate) {
+        throw new Error('Another desktop operation superseded the Windows update.')
+      }
+      writerAdmissionToken = desktopWriters.close('apply signed Windows installer')
+    },
+    waitForWriters: async (signal) => desktopWriters.waitForAtMost(0, signal),
+    stopGateways: async () => {
+      isQuitting = true
+      setAppExitPhase('draining', 'stopping Gateway for Windows installer')
+      return await stopOwnedGatewaysForUpdate()
+    },
+    assertCanHandoff,
+    launchInstaller: async () => {
+      // Draining can take time. Recheck the actual bytes immediately before
+      // execution as well, so a replaced download never reaches NSIS.
+      if (await revalidateReadyWindowsInstaller() !== installerPath) {
+        throw new UpdateChannelError('integrity_failed', 'The installer changed while preparing the update.')
+      }
+      assertCanHandoff()
+      // Telemetry is best-effort and must never block a signed installer handoff.
+      desktopReliabilityTelemetry.markUpdateHandoff(candidate.version)
+      await launchWindowsInstaller(installerPath)
+    },
+    committed: () => {
+      updateGatewayShutdownProcess = null
+      updateInstallHandoffReady = true
+      setAppExitPhase('committed', 'Windows installer process started')
+      desktopLog('update_windows_installer_handoff', { version: candidate.version, tag: candidate.tag })
+      app.quit()
+    },
+    recover: async (error, gatewayStopStarted) => {
+      const errorCode = error instanceof WindowsUpdatePreparationError
+        ? 'install_failed'
+        : error instanceof WindowsUpdateSecurityError || error instanceof UpdateChannelError
+          ? classifyDesktopUpdateError(error) : 'install_failed'
+      const telemetryErrorCode = error instanceof WindowsUpdatePreparationError
+        ? (error.reason === 'gateway_busy' ? 'gateway_shutdown_timeout' : 'install_failed')
+        : classifyDesktopUpdateTelemetryError(error)
+      desktopReliabilityTelemetry.clearUpdateHandoff()
+      desktopReliabilityTelemetry.recordUpdateResult({
+        outcome: error instanceof WindowsUpdatePreparationError ? 'timeout' : 'fail',
+        durationMs: Math.max(0, Date.now() - telemetryStartedAt),
+        updateStage: 'install',
+        errorCode: telemetryErrorCode,
+        oldVersion: app.getVersion(),
+        newVersion: candidate.version,
+        result: null,
+      })
+      if (errorCode === 'integrity_failed' || errorCode === 'signature_invalid') {
+        await clearWindowsUpdateCache().catch(() => {})
+      }
+      updateGatewayShutdownProcess = null
+      const foreignLifecycleOwnsExit = writerAdmissionToken
+        ? desktopWriters.hasOtherOwner(writerAdmissionToken) : desktopWriters.closed
+      if (foreignLifecycleOwnsExit) {
+        // Verification yields before we acquire writer admission. A concurrent
+        // recovery/cleanup may win; its exit and ownership state must survive.
+        if (writerAdmissionToken) desktopWriters.reopen(writerAdmissionToken)
+        updateApplying = false
+        setDesktopUpdateState({ status: verifiedManualInstallerPath ? 'downloaded' : 'error',
+          errorCode, error: desktopUpdateErrorMessage(errorCode) })
+        desktopLog('update_windows_superseded', { version: candidate.version })
+        return
+      }
+      const quitResumed = restoreDownloadedUpdateRetryState(candidate.version, writerAdmissionToken)
+      setDesktopUpdateState({
+        status: verifiedManualInstallerPath ? 'downloaded' : 'error',
+        errorCode,
+        error: error instanceof WindowsUpdateHandoffError && error.code === 'installation_ambiguous'
+          ? desktopT('update.installationAmbiguous')
+          : error instanceof WindowsUpdatePreparationError
+            ? desktopT(error.reason === 'writers_busy' ? 'update.writersBusy' : 'update.gatewayShutdownTimeout')
+            : desktopUpdateErrorMessage(errorCode),
+      })
+      desktopLog('update_windows_installer_failed', { version: candidate.version, errorCode, error: String(error) })
+      if (quitResumed || !gatewayStopStarted || !previouslyOwned) return
+      // If termination timed out, wait for these exact children. Never start a
+      // second Gateway or resurrect a profile after another lifecycle action.
+      const resume = () => {
+        if (recoveryGeneration !== windowsUpdateRecoveryGeneration || isQuitting || updateApplying
+          || desktopWriters.closed || appExitPhase !== 'running' || desktopProfileKey() !== profileKey
+          || liveLifecycleOwnedGatewayProcesses().length > 0) return
+        void openOrResumeDesktopApp().catch((resumeError) => {
+          desktopLog('update_windows_gateway_resume_failed', { error: String(resumeError) })
+        })
+      }
+      const stopping = liveLifecycleOwnedGatewayProcesses()
+      if (stopping.length === 0) resume()
+      else for (const child of stopping) child.once('exit', () => setImmediate(resume))
+    },
+  })
+}
+
 // Stop the owned gateway child and WAIT for it to exit before handing control to
 // the installer. The gateway holds the listen port + a PID lock and (on Windows)
 // open file handles under resources/runtime that the installer must overwrite —
 // orphaning it breaks the next launch. Mirrors the uninstall quiesce path.
 async function applyDownloadedUpdate(): Promise<void> {
+  if (windowsInstallerActionsSupported()) return await applyWindowsInstaller()
   if (updateApplying) return
   if (isQuitting || desktopWriters.closed) return
   if (!mockDownloadedUpdate && !downloadedUpdateVersion) return
@@ -11183,6 +12304,8 @@ async function applyDownloadedUpdate(): Promise<void> {
     return
   }
   const pendingVersion = downloadedUpdateVersion
+  if (pendingVersion === null) return
+  const telemetryStartedAt = Date.now()
   updateApplying = true
   setAppExitPhase('deferred', 'preparing downloaded update')
   // Never interrupt a reconcile/workspace/settings transaction after it has
@@ -11200,21 +12323,20 @@ async function applyDownloadedUpdate(): Promise<void> {
   })
   isQuitting = true
   setAppExitPhase('draining', 'stopping Gateway for downloaded update')
-  const exited = await stopAndJoinAllLifecycleOwnedGateways((child) => {
-    updateGatewayShutdownProcess = child
-    // We stay alive and await the exit below, so let the gateway take its
-    // Windows HTTP graceful drain instead of an immediate TerminateProcess.
-    allowGracefulShutdownWhileQuitting = true
-    try {
-      stopGateway()
-    } finally {
-      allowGracefulShutdownWhileQuitting = false
-    }
-  })
+  const exited = await stopOwnedGatewaysForUpdate()
   // Re-read the shared ownership set immediately before handoff. There is no
   // await between this check and quitAndInstall, so a child already stopping
   // for Retry/recovery cannot be skipped by the installer lifecycle.
   if (!exited || liveLifecycleOwnedGatewayProcesses().length > 0) {
+    desktopReliabilityTelemetry.recordUpdateResult({
+      outcome: 'timeout',
+      durationMs: Math.max(0, Date.now() - telemetryStartedAt),
+      updateStage: 'install',
+      errorCode: 'gateway_shutdown_timeout',
+      oldVersion: app.getVersion(),
+      newVersion: pendingVersion,
+      result: null,
+    })
     const quitResumed = restoreDownloadedUpdateRetryState(
       pendingVersion,
       updateWriterAdmission,
@@ -11234,10 +12356,21 @@ async function applyDownloadedUpdate(): Promise<void> {
   // isSilent=false (show the platform installer UI where applicable),
   // isForceRunAfter=true (relaunch after install).
   try {
+    desktopReliabilityTelemetry.markUpdateHandoff(pendingVersion)
     updateInstallHandoffReady = true
     setAppExitPhase('committed', 'handing off to desktop updater')
     autoUpdater.quitAndInstall(false, true)
   } catch (err) {
+    desktopReliabilityTelemetry.clearUpdateHandoff()
+    desktopReliabilityTelemetry.recordUpdateResult({
+      outcome: 'fail',
+      durationMs: Math.max(0, Date.now() - telemetryStartedAt),
+      updateStage: 'install',
+      errorCode: 'install_failed',
+      oldVersion: app.getVersion(),
+      newVersion: pendingVersion,
+      result: null,
+    })
     const quitResumed = restoreDownloadedUpdateRetryState(
       pendingVersion,
       updateWriterAdmission,
@@ -11261,22 +12394,32 @@ async function applyDownloadedUpdate(): Promise<void> {
 
 // Lets the gateway-served Control UI know whether this desktop owns update
 // discovery. Discovery ownership and native installation are deliberately separate:
-// unsigned Windows builds use the managed exact-installer flow, while macOS
+// Windows builds use the managed exact-installer flow, while macOS
 // can install the verified archive in place.
 ipcMain.handle('desktop:update:managed', () => desktopUpdateManaged() || mockUpdateVersion() !== null)
 ipcMain.handle('desktop:update:supported', () => nativeAutoUpdateEnabled())
-ipcMain.handle('desktop:update:state', () => desktopUpdateSnapshot())
+ipcMain.handle('desktop:update:state', async () => {
+  await restoreWindowsUpdateCache()
+  return desktopUpdateSnapshot()
+})
 ipcMain.handle('desktop:update:check', async () => {
   await checkForUpdates(true)
   return desktopUpdateSnapshot()
 })
 ipcMain.handle('desktop:update:download', async () => downloadDesktopUpdate())
-ipcMain.handle('desktop:update:relaunch', async () => {
+ipcMain.handle('desktop:update:relaunch', async (event) => {
+  if (windowsInstallerActionsSupported() && !trustedMainWindowControlIpc(event)) return desktopUpdateSnapshot()
   await applyDownloadedUpdate()
   return desktopUpdateSnapshot()
 })
 ipcMain.handle('desktop:update:dismiss', async () => dismissDesktopUpdate())
 ipcMain.handle('desktop:os-locale', () => desktopLocale)
+ipcMain.handle('desktop:deep-link-session:get', (event) => {
+  if (!trustedMainWindowControlIpc(event)) return null
+  const sessionKey = pendingDesktopSessionKey
+  pendingDesktopSessionKey = null
+  return sessionKey
+})
 ipcMain.handle('desktop:theme:set', (_event, payload: unknown) => (
   applyDesktopNativeTheme(normalizeDesktopNativeThemeSource(payload))
 ))
@@ -11285,7 +12428,11 @@ ipcMain.handle('gateway:connection', (event) => {
   if (!trustedMainWindowControlIpc(event)) {
     throw new Error('Untrusted Gateway connection request.')
   }
-  return desktopGatewayConnectionSnapshot()
+  const snapshot = desktopGatewayConnectionSnapshot()
+  if (snapshot.status === 'ready' && gatewayState.sandboxUpgrade === null) {
+    void refreshSandboxUpgradeReport()
+  }
+  return snapshot
 })
 ipcMain.handle('gateway:cli-invocation', async () => {
   const runtime = await resolveGatewayRuntime()
@@ -11329,6 +12476,96 @@ ipcMain.handle('desktop:preferences:save', async (event, payload: DesktopPrefere
   return await saveDesktopPreferences(payload)
 })
 ipcMain.handle('desktop:artifact:open', async (_event, payload: ArtifactOpenRequest) => openArtifactWithDefaultApp(payload))
+ipcMain.handle('desktop:artifact:save', async (event, payload: SaveArtifactRequest) => {
+  if (!trustedMainWindowControlIpc(event)) throw new Error('Untrusted file save request.')
+  return saveArtifactFile(payload, async name => {
+    const window = currentMainWindow()
+    if (!window) throw new Error('Main window unavailable')
+    const choice = await dialog.showSaveDialog(window, { defaultPath: name })
+    return choice.canceled ? null : choice.filePath || null
+  })
+})
+ipcMain.handle('desktop:source-file:action', async (event, payload: SourceFileActionRequest) => {
+  if (!trustedControlUiIpc(event)) throw new Error('Untrusted source file request.')
+  await performSourceFileAction(payload, {
+    connection: () => {
+      if (!trustedControlUiIpc(event) || !gatewayState.owned || gatewayState.status !== 'ready') return null
+      const snapshot = desktopGatewayConnectionSnapshot()
+      if (!snapshot.instanceId || !snapshot.httpUrl || !snapshot.authToken) return null
+      return { instanceId: snapshot.instanceId, profile: snapshot.profileFingerprint,
+        url: snapshot.httpUrl, authToken: snapshot.authToken }
+    },
+    openPath: path => shell.openPath(path), reveal: path => shell.showItemInFolder(path),
+  })
+})
+ipcMain.handle('desktop:workspace-file:action', async (event, payload: WorkspaceFileActionRequest) => {
+  if (!trustedControlUiIpc(event)) throw new Error('Untrusted workspace file request.')
+  return performWorkspaceFileAction(payload, {
+    connection: () => {
+      if (!trustedControlUiIpc(event) || !gatewayState.owned || gatewayState.status !== 'ready') return null
+      const snapshot = desktopGatewayConnectionSnapshot()
+      const nonce = gatewayProcess ? gatewayProcessOwnershipContexts.get(gatewayProcess)?.nonce : null
+      if (!snapshot.instanceId || !snapshot.httpUrl || !snapshot.authToken || !nonce) return null
+      return { instanceId: snapshot.instanceId, profile: snapshot.profileFingerprint,
+        url: snapshot.httpUrl, authToken: snapshot.authToken, nonce }
+    },
+    openPath: path => shell.openPath(path), reveal: path => shell.showItemInFolder(path),
+  }).catch(() => {
+    // Native filesystem errors can embed host paths. Only the main process
+    // receives controlled metadata; renderer errors remain path-free.
+    throw new Error('Workspace file action failed')
+  })
+})
+// File paths enter this broker only from the native picker or isolated preload's
+// webUtils.getPathForFile(File); renderer-facing calls never accept a path string.
+const nativeAttachmentWindows = new Map<number, {
+  event: Electron.IpcMainInvokeEvent
+  selections: NativeAttachmentSelections
+}>()
+function nativeAttachmentsFor(event: Electron.IpcMainInvokeEvent): NativeAttachmentSelections {
+  if (!trustedControlUiIpc(event)) throw new Error('Untrusted attachment request')
+  const senderId = event.sender.id
+  let entry = nativeAttachmentWindows.get(senderId)
+  if (!entry) {
+    const selections = new NativeAttachmentSelections({ connection: () => {
+      const current = nativeAttachmentWindows.get(senderId)
+      if (!current || !trustedControlUiIpc(current.event) || gatewayState.status !== 'ready' || !gatewayProcess) return null
+      const snapshot = desktopGatewayConnectionSnapshot()
+      const nonce = gatewayProcessOwnershipContexts.get(gatewayProcess)?.nonce
+      if (!snapshot.instanceId || !snapshot.httpUrl || !snapshot.authToken || !nonce) return null
+      return { instanceId: snapshot.instanceId, profile: snapshot.profileFingerprint,
+        url: snapshot.httpUrl, authToken: snapshot.authToken, nonce }
+    } })
+    entry = { event, selections }
+    nativeAttachmentWindows.set(senderId, entry)
+    event.sender.on('did-start-navigation', (_event, _url, inPlace, mainFrame) => {
+      if (mainFrame && !inPlace) selections.cancel(senderId)
+    })
+    event.sender.once('destroyed', () => {
+      selections.cancel(senderId)
+      nativeAttachmentWindows.delete(senderId)
+    })
+  }
+  entry.event = event
+  return entry.selections
+}
+ipcMain.handle('desktop:attachments:choose', (event, request: unknown) => (
+  nativeAttachmentsFor(event).choose(event.sender.id, request, async () => {
+    const choice = await dialog.showOpenDialog(currentMainWindow()!, {
+      properties: ['openFile', 'multiSelections'],
+    })
+    return choice.canceled ? [] : choice.filePaths
+  })
+))
+ipcMain.handle('desktop:attachments:select-file', (event, request: unknown, selectedPath: unknown) => (
+  nativeAttachmentsFor(event).select(event.sender.id, request, selectedPath)
+))
+ipcMain.handle('desktop:attachments:import', (event, request: unknown, token: unknown) => (
+  nativeAttachmentsFor(event).import(event.sender.id, request, token)
+))
+ipcMain.handle('desktop:attachments:cancel', event => {
+  nativeAttachmentsFor(event).cancel(event.sender.id)
+})
 ipcMain.handle('desktop:workspace:choose-directory', async (event, payload: unknown) => {
   if (!trustedControlUiIpc(event)) return null
   const choice = await dialog.showOpenDialog(
@@ -11343,10 +12580,6 @@ ipcMain.handle('desktop:workbench:capabilities', (event) => {
   return process.env.OPENSQUILLA_PREVIEW_FORCE_OFFLINE === '1'
     ? { ...NATIVE_WORKBENCH_CAPABILITIES, modes: ['offline'] as const }
     : NATIVE_WORKBENCH_CAPABILITIES
-})
-ipcMain.handle('desktop:workbench:artifact:capabilities', (event) => {
-  if (!trustedControlUiIpc(event)) throw new Error('Untrusted Desktop artifact request.')
-  return desktopArtifactBridge.getCapabilities()
 })
 ipcMain.handle('desktop:workbench:annotation:capabilities', async (event) => {
   if (!trustedControlUiIpc(event)) throw new Error('Untrusted artifact annotation request.')
@@ -11382,29 +12615,30 @@ ipcMain.handle('desktop:workbench:annotation:close-overlay', async (event, paylo
     return { ok: false, message: error instanceof Error ? error.message : String(error) }
   }
 })
-ipcMain.handle('desktop:workbench:artifact:capture-selection', async (event, payload: unknown) => {
-  if (!trustedControlUiIpc(event)) throw new Error('Untrusted Desktop artifact request.')
-  return await desktopArtifactBridge.captureSelection(payload)
+ipcMain.handle('desktop:workbench:browser:target', (event, payload: unknown) => {
+  if (!trustedControlUiIpc(event)) throw new Error('Untrusted browser request.')
+  const request = payload as { surfaceId?: unknown } | null
+  return nativeWorkbenchSurfaces.getBrowserTarget(parseNativeWorkbenchSurfaceId(request?.surfaceId))
 })
-ipcMain.handle('desktop:workbench:artifact:browser-inspect', async (event, payload: unknown) => {
-  if (!trustedControlUiIpc(event)) throw new Error('Untrusted Desktop artifact request.')
-  return await desktopArtifactBridge.browserInspect(payload)
+ipcMain.handle('desktop:workbench:annotation:focus', async (event, payload: unknown) => {
+  if (!trustedControlUiIpc(event)) throw new Error('Untrusted annotation request.')
+  const request = payload as { surfaceId?: unknown; targetRef?: unknown; locatorHint?: unknown; pagePath?: unknown } | null
+  if (typeof request?.targetRef !== 'string' || typeof request?.locatorHint !== 'string'
+    || request.targetRef.length > 128 || request.locatorHint.length > 4096) throw new Error('Invalid annotation focus request.')
+  if (request.pagePath !== undefined && (typeof request.pagePath !== 'string'
+    || !request.pagePath || request.pagePath.length > 4096)) throw new Error('Invalid annotation page path.')
+  return await nativeWorkbenchSurfaces.focusAnnotation(
+    parseNativeWorkbenchSurfaceId(request.surfaceId), request.targetRef, request.locatorHint,
+    request.pagePath as string | undefined,
+  )
 })
-ipcMain.handle('desktop:workbench:artifact:browser-act', async (event, payload: unknown) => {
-  if (!trustedControlUiIpc(event)) throw new Error('Untrusted Desktop artifact request.')
-  return await desktopArtifactBridge.browserAct(payload)
-})
-ipcMain.handle('desktop:workbench:artifact:screenshot', async (event, payload: unknown) => {
-  if (!trustedControlUiIpc(event)) throw new Error('Untrusted Desktop artifact request.')
-  return await desktopArtifactBridge.screenshot(payload)
-})
-ipcMain.handle('desktop:workbench:artifact:office-flush', async (event, payload: unknown) => {
-  if (!trustedControlUiIpc(event)) throw new Error('Untrusted Desktop artifact request.')
-  return await desktopArtifactBridge.officeFlush(payload)
-})
-ipcMain.handle('desktop:workbench:artifact:reload-surface', async (event, payload: unknown) => {
-  if (!trustedControlUiIpc(event)) throw new Error('Untrusted Desktop artifact request.')
-  return await desktopArtifactBridge.reloadSurface(payload)
+ipcMain.handle('desktop:workbench:browser:screenshot', async (event, payload: unknown) => {
+  if (!trustedControlUiIpc(event)) throw new Error('Untrusted browser request.')
+  const request = payload as { surfaceId?: unknown; targetRef?: unknown } | null
+  const target = nativeWorkbenchSurfaces.getBrowserTarget(parseNativeWorkbenchSurfaceId(request?.surfaceId))
+  if (target.targetRef !== request?.targetRef) throw new Error('The screenshot page was replaced.')
+  return await nativeWorkbenchSurfaces.executeBrowser({ sessionKey: target.sessionKey,
+    operation: 'screenshot', targetRef: target.targetRef }, new AbortController().signal)
 })
 ipcMain.handle('desktop:workbench:preview-lease:create', async (event, payload: unknown) => {
   if (!trustedControlUiIpc(event)) throw new Error('Untrusted native Workbench request.')
@@ -11441,19 +12675,15 @@ ipcMain.handle('desktop:workbench:surface:create', async (event, payload: unknow
   }
   try {
     const request = parseNativeWorkbenchCreateRequest(payload)
-    let activePreviewArtifactId: string | null = null
     if (request.kind === 'artifact-preview') {
-      activePreviewArtifactId = artifactPreviewLeaseBroker.resolveSurfaceArtifactId(
-        request.payload,
-      )
-      if (!activePreviewArtifactId) {
+      if (!artifactPreviewLeaseBroker.authorizesSurface(request.payload)) {
         return {
           ok: false,
           message: 'The artifact preview lease is not authorized by this Desktop Gateway.',
         }
       }
     }
-    return await nativeWorkbenchSurfaces.createSurface(request, activePreviewArtifactId)
+    return await nativeWorkbenchSurfaces.createSurface(request)
   } catch (error) {
     return { ok: false, message: error instanceof Error ? error.message : String(error) }
   }
@@ -11789,6 +13019,7 @@ async function applyApprovedDesktopCleanup(
     return { ok: false, detail: 'OpenSquilla is finishing another profile operation. Try again.' }
   }
   desktopCleanupBusy = true
+  if (onboardingFlows.active) dismissOnboardingFlow(onboardingFlows.active)
   let shouldQuit = false
   try {
     await waitForDesktopWriterOperations(1)
@@ -11888,6 +13119,7 @@ async function applyApprovedDesktopCleanup(
       // Do not call setAppExitPhase here: its durable lifecycle log would
       // recreate userData/logs after an approved delete operation removed it.
       appExitPhase = 'committed'
+      desktopReliabilityTelemetry.abandonSession()
       destroyWindowsTray()
       app.exit(0)
     } else {
@@ -12994,6 +14226,9 @@ ipcMain.handle('desktop:migration:run', async (
       detail: 'Another profile operation, update, or quit is already in progress.',
     }
   }
+  // A non-modal invitation may still contain a draft for the old profile.
+  // Once import owns admission, discard that UI before adopting new credentials.
+  if (onboardingFlows.active) dismissOnboardingFlow(onboardingFlows.active)
   let report: Record<string, unknown> | null = null
   let migrationVerified = false
   let migrationApplied = false
@@ -13313,7 +14548,12 @@ async function performOnboardingSave(
     app.isPackaged,
     (event, detail) => desktopLog(event, detail),
   )
+  const savedProfileKey = desktopProfileKey()
+  const restartGatewayAfterSave = Boolean(gatewayProcess && gatewayState.owned)
   try {
+    // Settings transactions require exclusive ownership of the profile. The
+    // client stays open while its local Gateway drains and restarts afterwards.
+    if (restartGatewayAfterSave) await stopOwnedGatewayAndWait()
     // Keep the existing writer-admission boundary: lifecycle drains do not need
     // to wait for an inspect that has not begun a settings write.
     let recoveryRequired: boolean
@@ -13340,21 +14580,8 @@ async function performOnboardingSave(
       ))
     }
 
-    // Validate credential-backed providers before entering writer admission:
-    // a rejected draft must never reach credential/config persistence. Keep
-    // keyless providers such as Ollama on their existing local-first path.
-    const provider = PROVIDER_BY_ID.get(normalizeProvider(payload.provider))
-    if (provider?.requiresApiKey) {
-      try {
-        const probe = await probeOnboardingProvider(payload)
-        if (!probe.ok) {
-          throw new Error(probe.message || 'Configuration verification failed.')
-        }
-      } catch (error) {
-        if (flow.state === 'saving') flow.state = 'editing'
-        throw error
-      }
-    }
+    // Connection tests are an optional diagnostic. Saving validates local
+    // fields and persists them even while the provider or network is offline.
 
     let finishWriter: (() => void) | null = null
     try {
@@ -13388,15 +14615,20 @@ async function performOnboardingSave(
             pendingMigration.committedTransactionId,
             String(payload.apiKey || ''),
             true,
+            payload,
           )
         }
-        return await saveDesktopCredential(payload, true)
+        return await saveDesktopCredential(payload, true, true)
       })
       telemetry.markSettingsPersistedConfirmed()
       await telemetry.stage('local_finalize', async () => {
         applyDesktopLocaleChoice(payload.locale)
         await clearPendingMigrationProviderSetup()
       })
+      // Persist the growth milestone before the flow handoff can be
+      // interrupted by quit/update. The durable marker is replayed on the
+      // next launch if the spool write cannot finish here.
+      desktopGrowthTelemetry.recordOnboardingCompleted()
     } catch (error) {
       if (flow.state === 'saving') flow.state = 'editing'
       throw error
@@ -13432,8 +14664,19 @@ async function performOnboardingSave(
       }
       return telemetry.recordReturned({ ok: true })
     })
+  } catch (error) {
+    // Even failures before writer admission (for example a Gateway that cannot
+    // stop yet) must leave a visible invitation retryable.
+    if (flow.state === 'saving') flow.state = 'editing'
+    throw error
   } finally {
     telemetry.finish()
+    if (restartGatewayAfterSave && desktopProfileKey() === savedProfileKey
+      && !isQuitting && !desktopWriters.closed && appExitPhase === 'running') {
+      clearReusableGatewayState()
+      bootError = null
+      void openOrResumeDesktopApp()
+    }
   }
 }
 
@@ -13460,6 +14703,7 @@ async function withRecoveryOperation<T>(
     }
   }
   recoveryOperationBusy = true
+  if (onboardingFlows.active) dismissOnboardingFlow(onboardingFlows.active)
   recoveryOperationError = null
   publishRecoveryState()
   let outcome: { ok: true; value: T } | { ok: false; error: string }
@@ -13715,9 +14959,17 @@ async function resumeBootStartup(): Promise<{ ok: boolean; error?: string; code?
   invalidateSecretStorageBackendCache()
   const pendingStart = gatewayStartPromise
   const initialAuthority = pendingStart ? null : currentBootResumeAuthority()
+  const directTelemetryAttempt = initialAuthority ? createGatewayStartTelemetryAttempt() : null
+  if (directTelemetryAttempt) gatewayStartTelemetryAttempt = directTelemetryAttempt
+  const releaseDirectTelemetryAttempt = () => {
+    if (gatewayStartTelemetryAttempt === directTelemetryAttempt) gatewayStartTelemetryAttempt = null
+  }
   bootError = null
   await currentMainWindow()?.loadFile(bootPagePath()).catch(() => null)
-  if (initialAuthority && !bootResumeAuthorityIsCurrent(initialAuthority)) return { ok: true }
+  if (initialAuthority && !bootResumeAuthorityIsCurrent(initialAuthority)) {
+    releaseDirectTelemetryAttempt()
+    return { ok: true }
+  }
   try {
     const gateway = pendingStart
       ? await pendingStart
@@ -13727,18 +14979,30 @@ async function resumeBootStartup(): Promise<{ ok: boolean; error?: string; code?
         )
         : null
     if (!gateway) {
+      if (directTelemetryAttempt) {
+        finishGatewayStartTelemetry(
+          directTelemetryAttempt,
+          new Error('Gateway ownership verification did not complete.'),
+        )
+      }
+      releaseDirectTelemetryAttempt()
       // With no exact live child to resume, use the normal open flow so profile
       // inspection and recovery gates still run before any replacement spawn.
       void openOrResumeDesktopApp()
       return { ok: true }
     }
+    if (directTelemetryAttempt) finishGatewayStartTelemetry(directTelemetryAttempt, null)
+    releaseDirectTelemetryAttempt()
     const authority = pendingStart ? currentBootResumeAuthority() : initialAuthority
     if (!authority || !bootResumeAuthorityIsCurrent(authority)) return { ok: true }
     await loadDesktopRendererIntoCurrentWindow()
     if (!bootResumeAuthorityIsCurrent(authority)) return { ok: true }
     sendBootStatus('ready')
+    finishAppStartSuccess()
     return { ok: true }
   } catch (error) {
+    if (directTelemetryAttempt) finishGatewayStartTelemetry(directTelemetryAttempt, error)
+    releaseDirectTelemetryAttempt()
     const message = error instanceof Error ? error.message : String(error)
     // The original open flow owns errors from a pending initial start. For a
     // direct resume, an exit handler or a newer quit/reset/restart owns any
@@ -13871,6 +15135,14 @@ ipcMain.handle('desktop:onboarding:save', async (event, payload: OnboardingPaylo
   }
   return await request.promise
 })
+ipcMain.handle('desktop:onboarding:skip', (event) => {
+  const flow = onboardingFlows.active
+  if (!flow || !trustedOnboardingIpc(event, flow)) {
+    return onboardingSaveFailure('onboarding_inactive', 'No trusted onboarding is in progress.')
+  }
+  dismissOnboardingFlow(flow)
+  return { ok: true }
+})
 ipcMain.handle('desktop:onboarding:cancel', (event) => {
   const flow = onboardingFlows.active
   if (!flow || !trustedOnboardingIpc(event, flow)) {
@@ -13963,26 +15235,30 @@ app.on('before-quit', (event) => {
     setAppExitPhase('committed', 'Windows session ending')
     artifactPreviewLeaseBroker.clear()
     void nativeWorkbenchSurfaces.destroyAll()
+    desktopReliabilityTelemetry.finishSession()
     destroyWindowsTray()
-    void desktopArtifactBridgeLoopback.close()
+    void desktopBrowser.close()
     stopGateway()
     return
   }
   // An updater drain owns the lifecycle until every writer and gateway has
   // exited. A user Quit or repeated signal during this phase is remembered and
-  // resumed if the update cannot hand off. Only quitAndInstall's synchronous
-  // handoff is allowed through this guard.
+  // resumed if the update cannot hand off. Native updater handoff or a verified
+  // Windows installer spawn is allowed through this guard.
   if (updateApplying) {
     if (updateInstallHandoffReady) {
       setAppExitPhase('committed', 'desktop updater owns exit')
       artifactPreviewLeaseBroker.clear()
       void nativeWorkbenchSurfaces.destroyAll()
+      desktopReliabilityTelemetry.finishSession()
       destroyWindowsTray()
-      void desktopArtifactBridgeLoopback.close()
+      void desktopBrowser.close()
       return
     }
     event.preventDefault()
-    setAppExitPhase('deferred', 'waiting for desktop update handoff')
+    if (!desktopGatewayConnectionSuspendedForExit()) {
+      setAppExitPhase('deferred', 'waiting for desktop update handoff')
+    }
     quitRequestedDuringUpdateDrain = true
     desktopLog('quit_deferred_for_update_drain')
     return
@@ -14048,8 +15324,9 @@ app.on('before-quit', (event) => {
     void drain.then((exited) => {
       if (exited) {
         setAppExitPhase('committed', 'all lifecycle-owned Gateways exited')
+        desktopReliabilityTelemetry.finishSession()
         destroyWindowsTray()
-        void desktopArtifactBridgeLoopback.close()
+        void desktopBrowser.close()
         app.exit(0)
         return
       }
@@ -14076,8 +15353,9 @@ app.on('before-quit', (event) => {
   setAppExitPhase('committed', 'no lifecycle-owned Gateway remains')
   artifactPreviewLeaseBroker.clear()
   void nativeWorkbenchSurfaces.destroyAll()
+  desktopReliabilityTelemetry.finishSession()
   destroyWindowsTray()
-  void desktopArtifactBridgeLoopback.close()
+  void desktopBrowser.close()
   stopGateway()
 })
 
@@ -14103,13 +15381,14 @@ app.on('activate', () => {
 })
 
 app.on('will-quit', () => {
+  desktopReliabilityTelemetry.finishSession()
   destroyWindowsTray()
-  void desktopArtifactBridgeLoopback.close()
+  void desktopBrowser.close()
 })
 
 configureChromiumKeychainPolicy()
 
-const initialDesktopDeepLinkArguments = process.platform === 'win32'
+const initialDesktopDeepLinkArguments = process.platform === 'win32' || process.platform === 'linux'
   ? desktopDeepLinkArguments(process.argv)
   : []
 
@@ -14136,7 +15415,7 @@ function acquireSingleInstanceLockWithRetry(): boolean {
       })
       return true
     }
-    // A Windows protocol launch targets the current instance and does not need
+    // A Windows/Linux protocol launch targets the current instance and does not need
     // the normal close/relaunch race retry. The failed lock request has already
     // delivered its command line through second-instance; exit the forwarding
     // process immediately instead of sending the same deep link for five seconds.
@@ -14188,9 +15467,29 @@ if (!gotSingleInstanceLock) {
   }
   app.quit()
 } else {
-  if (process.platform === 'win32') {
-    handleDeepLinksFromCommandLine(process.argv, 'initial-argv')
-  }
+  process.on('uncaughtExceptionMonitor', (error) => {
+    desktopReliabilityTelemetry.recordCrash({
+      component: 'desktop_main',
+      errorCode: 'uncaught_exception',
+      reason: 'uncaught_exception',
+      signature: normalizedCrashFingerprintSignature(error),
+    })
+  })
+  app.on('child-process-gone', (_event, details) => {
+    if (isQuitting || appExitPhase === 'committed' || details.reason === 'clean-exit') return
+    const childType = String(details.type || '').toLowerCase()
+    const component = childType === 'gpu'
+      ? 'gpu'
+      : childType === 'utility'
+        ? 'utility'
+        : 'unknown'
+    desktopReliabilityTelemetry.recordCrash({
+      component,
+      errorCode: 'child_process_crashed',
+      reason: normalizedCrashFingerprintReason(details.reason),
+    })
+  })
+  handleDeepLinksFromCommandLine(initialDesktopDeepLinkArguments, 'initial-argv')
 
   app.on('second-instance', (_event, commandLine) => {
     const hadDeepLink = handleDeepLinksFromCommandLine(commandLine, 'second-instance')
@@ -14200,6 +15499,16 @@ if (!gotSingleInstanceLock) {
   })
 
   void app.whenReady().then(async () => {
+    // An OS wake is an observation, not permission to restart or reload.
+    const notifySystemResume = () => {
+      for (const window of BrowserWindow.getAllWindows()) {
+        if (!window.isDestroyed() && !window.webContents.isDestroyed()) {
+          window.webContents.send('desktop:system:resume', { source: 'desktop-resume' })
+        }
+      }
+    }
+    powerMonitor.on('resume', notifySystemResume)
+    app.once('will-quit', () => powerMonitor.removeListener('resume', notifySystemResume))
     app.name = 'OpenSquilla'
     installDesktopRendererProtocol()
     desktopLocale = loadPersistedDesktopLocale() ?? resolveDesktopLocale()
@@ -14207,6 +15516,8 @@ if (!gotSingleInstanceLock) {
     createWindowsTray()
     registerDesktopDeepLinkProtocolClient()
     desktopDeepLinkActivationReady = true
+    powerMonitor.on('suspend', () => desktopReliabilityTelemetry.setForeground(false))
+    powerMonitor.on('resume', refreshDesktopReliabilityForegroundState)
     if (!activatePendingDesktopDeepLink()) void openOrResumeDesktopApp()
     initAutoUpdater()
     if (mockUpdateVersion() !== null) {

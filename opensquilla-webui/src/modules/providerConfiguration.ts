@@ -1,4 +1,5 @@
 import type { InjectionKey } from 'vue'
+import type { RouterProviderConflict } from './setupWorkflow'
 
 export interface ModelDescriptor {
   readonly id: string
@@ -104,6 +105,7 @@ export class ProviderConfigurationError extends Error {
     readonly code: ProviderConfigurationErrorCode,
     message: string,
     readonly cause?: unknown,
+    readonly details?: RouterProviderConflict,
   ) {
     super(message)
     this.name = 'ProviderConfigurationError'
@@ -128,7 +130,31 @@ export interface ProviderCatalog {
 }
 
 export interface ModelCatalog {
-  list(options?: { signal?: AbortSignal }): Promise<ModelCatalogResult>
+  list(options?: { scope?: 'active' | 'configured'; signal?: AbortSignal }): Promise<ModelCatalogResult>
+  readonly capacitySupported?: boolean
+  resolveCapacity?(models: readonly ModelCapacityTarget[]): Promise<{ models: ModelCapacity[] }>
+}
+
+export interface ModelCapacityFailure {
+  provider: string
+  model: string
+  contextWindow: number
+  source: ModelCapacitySource
+}
+export interface ModelCapacityTarget { provider: string; model: string }
+export type ModelCapacitySource = 'catalog' | 'default' | 'override' | 'config'
+export interface ModelCapacityLimit {
+  automatic: number
+  automaticSource: ModelCapacitySource
+  override: number | null
+  value: number
+  source: ModelCapacitySource
+  editable: boolean
+}
+export interface ModelCapacity extends ModelCapacityTarget {
+  contextWindow: ModelCapacityLimit
+  maxOutputTokens: ModelCapacityLimit
+  localRuntime: boolean
 }
 
 export interface ProviderStatus {
@@ -142,6 +168,8 @@ export interface ProviderStatusQuery {
 }
 
 export interface ModelRouting {
+  readonly resetRecommendedSupported?: boolean
+  resetRecommended?(command: { providerId: string; activateRouter?: boolean }, options?: { signal?: AbortSignal }): Promise<ModelRoutingSnapshot>
   get(options?: { signal?: AbortSignal }): Promise<ModelRoutingSnapshot>
   setRouting(mode: RoutingMode, options?: { signal?: AbortSignal }): Promise<ModelRoutingSnapshot>
   subscribeChanged(listener: (snapshot: ModelRoutingSnapshot) => void): { close(): void }

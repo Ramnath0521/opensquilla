@@ -8,24 +8,22 @@ import uuid
 from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Protocol, cast
 
 import structlog
 
 from opensquilla.agent_ids import normalize_agent_id
+from opensquilla.agents.scope import resolve_agent_workspace_dir
 from opensquilla.application.session_maintenance import (
     CompactSession,
     SessionCompactionDeadlineError,
     SessionCompactionEvent,
     SessionCompactionExecutionResult,
     SessionCompactionExecutorPort,
-    SessionCompactionFlushSafetyError,
     SessionCompactionLifecyclePort,
     SessionCompactionLock,
     SessionCompactionLockPort,
-    SessionCompactionMemoryAssessment,
-    SessionCompactionMemoryPort,
-    SessionCompactionMemoryResult,
     SessionCompactionMilestone,
     SessionCompactionNotFoundError,
     SessionCompactionOwnershipPort,
@@ -39,6 +37,10 @@ from opensquilla.application.session_maintenance import (
     SessionCompactionUsagePort,
     SessionMaintenance,
 )
+from opensquilla.attachment_workspace import (
+    AttachmentWorkspaceMaterializer,
+    workspace_attachment_budget_from_config,
+)
 from opensquilla.engine.cache_break_monitor import (
     compaction_terminal_status,
     notify_compaction,
@@ -47,29 +49,28 @@ from opensquilla.engine.cache_break_monitor import (
 from opensquilla.engine.usage_accounting import bind_usage_accounting_scope
 from opensquilla.gateway.compaction_target import (
     GatewayConsumerBudget,
-    build_gateway_consumer_admission,
+    build_gateway_compaction_budget,
     effective_session_model,
     limit_gateway_consumer_budget,
     resolve_gateway_compaction_target,
     resolve_gateway_consumer_budget,
 )
+from opensquilla.gateway.project_workspace_runtime import resolve_session_project_workspace
 from opensquilla.gateway.rpc.registry import RpcContext, RpcHandlerError
 from opensquilla.gateway.session_event_publisher import (
     buffer_session_event,
     prepare_session_event_payload,
     send_prepared_to_subscribers,
 )
-from opensquilla.gateway.session_maintenance_runtime import (
-    durable_checkpoint_covers_transcript,
-)
 from opensquilla.gateway.session_services import get_session_lock, get_session_storage
 from opensquilla.gateway.usage_ledger_runtime import build_session_usage_scope
 from opensquilla.observability.network_policy import (
     provider_request_correlation_disabled,
 )
+from opensquilla.paths import media_root_from_config
+from opensquilla.project_workspaces import ProjectWorkspaceStateError
 from opensquilla.provider.types import (
     ProviderRequestCorrelation,
-    derive_provider_request_correlation,
 )
 from opensquilla.session.compaction import (
     CompactionConfig,
@@ -77,6 +78,7 @@ from opensquilla.session.compaction import (
     await_compaction_phase,
     build_compaction_config_from_provider,
     call_compact_with_optional_config,
+    effective_protected_recent_messages,
 )
 from opensquilla.session.compaction_lifecycle import (
     COMPACTION_CHUNK_SUMMARIZED_EVENT,
@@ -86,15 +88,11 @@ from opensquilla.session.compaction_lifecycle import (
     CompactionTimeoutError,
     compaction_effect_payload,
     compaction_lifecycle_payload,
-    compaction_memory_status,
-    flush_receipt_is_successful_flush,
-    flush_receipt_status_for_compaction,
-    flush_receipt_to_dict,
-    flush_trigger_enabled,
     new_compaction_id,
-    pre_compaction_flush_requires_safe_receipt,
 )
 from opensquilla.session.keys import canonicalize_session_key
+from opensquilla.session.models import SessionNode
+from opensquilla.tools.types import CallerKind, ToolContext
 
 log = structlog.get_logger(__name__)
 
@@ -120,7 +118,6 @@ class _GatewayCompactionPlan:
     budget: GatewayConsumerBudget
     config: CompactionConfig
     compaction_correlation: ProviderRequestCorrelation | None
-    flush_correlation: ProviderRequestCorrelation | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -148,7 +145,6 @@ def _accepts_keyword_arg(func: Callable[..., object], name: str) -> bool:
 class GatewaySessionMaintenancePorts(
     SessionCompactionPlanningPort,
     SessionCompactionLockPort,
-    SessionCompactionMemoryPort,
     SessionCompactionExecutorPort,
     SessionCompactionLifecyclePort,
     SessionCompactionOwnershipPort,
@@ -165,6 +161,7 @@ class GatewaySessionMaintenancePorts(
         self._context = context
         self._manager = context.session_manager
         self._storage = get_session_storage(self._manager)
+        self._attachment_workspace_dirs: dict[str, Path] = {}
 
     def timing(self) -> SessionCompactionTiming:
         settings = getattr(getattr(self._context, "config", None), "compaction", None)
@@ -183,20 +180,6 @@ class GatewaySessionMaintenancePorts(
             heartbeat_interval_seconds=max(0.1, heartbeat),
         )
 
-    def default_context_window_tokens(self) -> int:
-        raw = getattr(self._context.config, "context_budget_tokens", 100_000)
-        if isinstance(raw, bool):
-            raise ValueError("contextWindowTokens must be a positive integer")
-        try:
-            value = int(raw)
-        except (TypeError, ValueError) as exc:
-            raise ValueError(
-                "contextWindowTokens must be a positive integer"
-            ) from exc
-        if value <= 0:
-            raise ValueError("contextWindowTokens must be a positive integer")
-        return value
-
     async def load_session(self, session_key: str) -> SessionCompactionSession | None:
         if self._manager is None:
             raise SessionCompactionUnavailableError
@@ -210,6 +193,30 @@ class GatewaySessionMaintenancePorts(
         if session is None:
             return None
         session_id = getattr(session, "session_id", None)
+        gateway_config = self._context.config
+        if isinstance(session_id, str) and session_id:
+            self._attachment_workspace_dirs.pop(session_id, None)
+        if (
+            isinstance(session_id, str) and session_id and gateway_config is not None
+            and getattr(
+                getattr(gateway_config, "attachments", None), "persist_transcripts", True
+            ) is not False
+        ):
+            if getattr(session, "workspace_id", None):
+                if self._storage is not None:
+                    try:
+                        project = await resolve_session_project_workspace(
+                            self._storage, cast(SessionNode, session)
+                        )
+                    except ProjectWorkspaceStateError:
+                        project = None
+                    if project is not None:
+                        self._attachment_workspace_dirs[session_id] = Path(project.canonical_path)
+            else:
+                self._attachment_workspace_dirs[session_id] = resolve_agent_workspace_dir(
+                    normalize_agent_id(getattr(session, "agent_id", None) or "main"),
+                    gateway_config,
+                )
         return SessionCompactionSession(
             session_id=(session_id if isinstance(session_id, str) and session_id else None),
             agent_id=normalize_agent_id(getattr(session, "agent_id", None) or "main"),
@@ -229,25 +236,27 @@ class GatewaySessionMaintenancePorts(
     def _consumer_budget(
         self,
         session: SessionCompactionSession | None,
-        requested_tokens: int,
+        requested_tokens: int | None,
     ) -> GatewayConsumerBudget:
         raw_session = session.runtime_value if session is not None else None
-        return limit_gateway_consumer_budget(
-            resolve_gateway_consumer_budget(self._context, raw_session),
-            requested_tokens,
+        budget = resolve_gateway_consumer_budget(self._context, raw_session)
+        return (
+            limit_gateway_consumer_budget(budget, requested_tokens)
+            if requested_tokens is not None
+            else budget
         )
 
     def resolve_context_window_tokens(
         self,
         session: SessionCompactionSession | None,
-        requested_tokens: int,
+        requested_tokens: int | None,
     ) -> int:
         return self._consumer_budget(session, requested_tokens).context_window_tokens
 
     def build_plan(
         self,
         session: SessionCompactionSession | None,
-        requested_tokens: int,
+        requested_tokens: int | None,
         compaction_id: str,
         operation_deadline: float,
     ) -> SessionCompactionPlan:
@@ -264,9 +273,65 @@ class GatewaySessionMaintenancePorts(
             ),
             compaction_plan=target.plan,
         )
+        session_id = session.session_id if session is not None else None
+        workspace_dir = self._attachment_workspace_dirs.get(session_id or "")
+        prepare_envelope = getattr(
+            self._context.turn_runner, "prepare_manual_compaction_envelope", None,
+        )
+        consumer_agent = None
+        if callable(prepare_envelope) and raw_session is not None and budget.provider is not None:
+            consumer_agent = prepare_envelope(
+                raw_session,
+                provider=budget.provider,
+                context_window_tokens=(
+                    budget.physical_context_window_tokens or budget.context_window_tokens
+                ),
+                max_output_tokens=budget.max_output_tokens,
+                context_window_known=budget.context_window_known,
+                provider_request_max_chars=budget.provider_request_max_chars,
+                workspace_dir=str(workspace_dir) if workspace_dir else None,
+                caller_tool_context=ToolContext(
+                    is_owner=self._context.principal.is_owner,
+                    caller_kind=CallerKind.WEB,
+                    session_key=str(getattr(raw_session, "session_key", "")),
+                    agent_id=session.agent_id if session else "main",
+                    workspace_dir=str(workspace_dir) if workspace_dir else None,
+                    collaboration_mode=str(
+                        getattr(raw_session, "collaboration_mode", "default"),
+                    ),
+                    collaboration_revision=int(
+                        getattr(raw_session, "collaboration_revision", 0),
+                    ),
+                    active_plan_revision_id=getattr(
+                        raw_session, "active_plan_revision_id", None,
+                    ),
+                ),
+            )
+        config.budget = build_gateway_compaction_budget(
+            budget,
+            consumer_agent=consumer_agent,
+            trigger_ratio=float(getattr(self._context.config, "preflight_compact_ratio", 0.85)),
+            retained_tail_messages=effective_protected_recent_messages(config),
+            summary_output_tokens=(target.plan.primary.max_output_tokens if target.plan else 1024),
+        )
         config.deadline_at_monotonic = operation_deadline
         arm_compaction_deadline(config, operation_id=compaction_id)
-        session_id = session.session_id if session is not None else None
+        if (
+            workspace_dir is not None and session_id
+            and getattr(
+                getattr(self._context.config, "attachments", None), "persist_transcripts", True
+            ) is not False
+        ):
+            materializer = AttachmentWorkspaceMaterializer(
+                media_root=media_root_from_config(self._context.config),
+                workspace_dir=workspace_dir,
+                disk_budget_bytes=workspace_attachment_budget_from_config(self._context.config),
+            )
+            config.attachment_path_resolver = (
+                lambda attachment, _session_id: materializer.materialize_image_path(
+                    attachment, session_id
+                )
+            )
         compaction_correlation = (
             ProviderRequestCorrelation(
                 session_id=session_id,
@@ -278,19 +343,13 @@ class GatewaySessionMaintenancePorts(
             and not provider_request_correlation_disabled(config=self._context.config)
             else None
         )
-        flush_correlation = derive_provider_request_correlation(
-            compaction_correlation,
-            execution_id=uuid.uuid4().hex,
-            call_kind="auxiliary.session_flush",
-        )
         runtime = _GatewayCompactionPlan(
             budget=budget,
             config=config,
             compaction_correlation=compaction_correlation,
-            flush_correlation=flush_correlation,
         )
         return SessionCompactionPlan(
-            context_window_tokens=budget.context_window_tokens,
+            context_window_tokens=config.budget.history_capacity_tokens,
             runtime_value=runtime,
         )
 
@@ -300,130 +359,16 @@ class GatewaySessionMaintenancePorts(
             get_session_lock(self._context.turn_runner, session_key),
         )
 
-    @property
-    def flush_enabled(self) -> bool:
-        return flush_trigger_enabled(self._context.config, "manual")
-
-    @property
-    def flush_available(self) -> bool:
-        return self._context.flush_service is not None
-
-    async def transcript(self, session_key: str) -> tuple[object, ...] | None:
-        getter = getattr(self._manager, "get_transcript", None)
-        if not callable(getter):
-            return None
-        return tuple(await getter(session_key))
-
     @staticmethod
     def _runtime_plan(plan: SessionCompactionPlan) -> _GatewayCompactionPlan:
         if not isinstance(plan.runtime_value, _GatewayCompactionPlan):
             raise TypeError("invalid gateway compaction plan")
         return plan.runtime_value
 
-    async def flush(
-        self,
-        session: SessionCompactionSession,
-        transcript: tuple[object, ...],
-        plan: SessionCompactionPlan,
-        compaction_id: str,
-    ) -> object:
-        service = self._context.flush_service
-        if service is None:
-            raise RuntimeError("flush service unavailable")
-        runtime = self._runtime_plan(plan)
-        memory_cfg = getattr(getattr(self._context, "config", None), "memory", None)
-        raw_timeout = getattr(memory_cfg, "flush_background_timeout_seconds", 120.0)
-        try:
-            timeout = max(float(raw_timeout), 0.0)
-        except (TypeError, ValueError):
-            timeout = 120.0
-        kwargs: dict[str, Any] = {
-            "agent_id": session.agent_id,
-            "timeout": timeout,
-            "message_window": 0,
-            "segment_mode": "auto",
-            "raw_capture_policy": "required",
-            "turn_id": compaction_id,
-        }
-        if runtime.flush_correlation is not None and _accepts_keyword_arg(
-            service.execute,
-            "provider_request_correlation",
-        ):
-            kwargs["provider_request_correlation"] = runtime.flush_correlation
-        try:
-            return await await_compaction_phase(
-                service.execute(
-                    list(transcript),
-                    self._session_key(session),
-                    **kwargs,
-                ),
-                runtime.config,
-                phase="flushing",
-            )
-        except CompactionTimeoutError as exc:
-            raise SessionCompactionPhaseTimeoutError(exc.phase) from exc
-
-    @staticmethod
-    def _session_key(session: SessionCompactionSession) -> str:
-        return str(getattr(session.runtime_value, "session_key", "") or "")
-
-    def receipt_status(self, receipt: object | None) -> str:
-        return flush_receipt_status_for_compaction(receipt, self._context.config)
-
-    def receipt_is_successful(self, receipt: object) -> bool:
-        return flush_receipt_is_successful_flush(receipt)
-
-    @property
-    def requires_safe_receipt(self) -> bool:
-        return pre_compaction_flush_requires_safe_receipt(self._context.config)
-
-    async def checkpoint_covers(
-        self,
-        session: SessionCompactionSession,
-        transcript: tuple[object, ...],
-    ) -> bool:
-        if self._storage is None:
-            return False
-        return await durable_checkpoint_covers_transcript(
-            self._storage,
-            self._session_key(session),
-            session.session_id,
-            list(transcript),
-        )
-
-    def assess(
-        self,
-        receipt: object | None,
-        *,
-        checkpoint_safe: bool,
-        required: bool,
-    ) -> SessionCompactionMemoryAssessment:
-        status = compaction_memory_status(
-            receipt,
-            deterministic_receipt_safe=checkpoint_safe,
-            required=required,
-        )
-        return SessionCompactionMemoryAssessment(
-            allows_destructive_compaction=status.allows_destructive_compaction,
-            safety_status=status.safety_status,
-            semantic_status=status.semantic_status,
-        )
-
-    def record(self, outcome: str, **details: object) -> None:
-        safe_details = dict(details)
-        receipt = safe_details.get("receipt")
-        if receipt is not None:
-            safe_details["receipt"] = flush_receipt_to_dict(receipt)
-        if outcome in {"flush_failed", "flush_degraded", "flush_skipped"}:
-            log.warning(f"sessions.context_compact.{outcome}", **safe_details)
-        else:
-            log.info(f"sessions.context_compact.{outcome}", **safe_details)
-
     async def compact(
         self,
         command: CompactSession,
         plan: SessionCompactionPlan,
-        memory: SessionCompactionMemoryResult,
     ) -> SessionCompactionExecutionResult:
         manager = self._manager
         if manager is None:
@@ -435,16 +380,20 @@ class GatewaySessionMaintenancePorts(
             optional = {
                 "compaction_id": runtime.config.operation_id,
                 "trigger_reason": "manual",
-                "flush_receipt_status": memory.receipt_status,
                 "provider_request_correlation": runtime.compaction_correlation,
-                "context_window_chars": runtime.budget.provider_request_max_chars,
+                "context_window_chars": (
+                    runtime.config.budget.history_capacity_chars
+                    if runtime.config.budget else runtime.budget.provider_request_max_chars
+                ),
             }
             for name, value in optional.items():
                 if value is not None and _accepts_keyword_arg(compact_with_result, name):
                     kwargs[name] = value
-            consumer_admission, consumer_admission_fingerprint = (
-                build_gateway_consumer_admission(runtime.budget)
+            consumer_budget = runtime.config.budget or build_gateway_compaction_budget(
+                runtime.budget,
             )
+            consumer_admission = consumer_budget.consumer_admission
+            consumer_admission_fingerprint = consumer_budget.consumer_admission_fingerprint
             if _accepts_keyword_arg(compact_with_result, "consumer_admission"):
                 kwargs["consumer_admission"] = consumer_admission
             if _accepts_keyword_arg(
@@ -572,7 +521,6 @@ class GatewaySessionMaintenancePorts(
             "heartbeat_at": event.heartbeat_at,
             "elapsed_ms": event.elapsed_ms,
             "heartbeat_interval_seconds": event.heartbeat_interval_seconds,
-            "flush_receipt_status": event.flush_receipt_status,
             "observation_error": event.observation_error,
         }.items():
             if value is not None:
@@ -732,23 +680,6 @@ class GatewaySessionMaintenanceAdapter:
                     "phase": exc.phase,
                 },
             ) from exc
-        except SessionCompactionFlushSafetyError as exc:
-            raise RpcHandlerError(
-                code="CONTEXT_FLUSH_FAILED",
-                message=(
-                    "Manual compaction aborted: flush receipt is not sufficient "
-                    "for destructive compaction."
-                ),
-                details={
-                    "flush_receipt": flush_receipt_to_dict(exc.receipt),
-                    "key": exc.session_key,
-                    "session_id": exc.session_id,
-                    "reason": "destructive_manual_compact_requires_safe_flush",
-                    "flush_receipt_status": exc.receipt_status,
-                    "memory_safety_status": exc.assessment.safety_status,
-                    "semantic_memory_status": exc.assessment.semantic_status,
-                },
-            ) from exc
         except SessionCompactionUnavailableError as exc:
             raise KeyError("No session manager available") from exc
         except SessionCompactionNotFoundError as exc:
@@ -791,10 +722,6 @@ class GatewaySessionMaintenanceAdapter:
         if result.reason is not None:
             payload["reason"] = result.reason
             payload["skip_reason"] = result.reason
-        if result.flush_receipt is not None:
-            payload["flush_receipt"] = flush_receipt_to_dict(result.flush_receipt)
-        if result.flush_receipt_status is not None:
-            payload["flush_receipt_status"] = result.flush_receipt_status
         return payload
 
 
@@ -805,7 +732,6 @@ def build_gateway_session_maintenance_adapter(
     application = SessionMaintenance(
         planning=ports,
         locking=ports,
-        memory=ports,
         executor=ports,
         lifecycle=ports,
         ownership=ports,

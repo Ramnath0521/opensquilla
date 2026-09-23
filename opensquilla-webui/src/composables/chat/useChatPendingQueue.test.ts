@@ -5,6 +5,9 @@ import {
   useChatPendingQueue,
   type UseChatPendingQueueOptions,
 } from './useChatPendingQueue'
+import { useChatAttachments } from './useChatAttachments'
+import { useChatCompaction } from './useChatCompaction'
+import type { ArtifactContentAccess } from '@/modules/artifactWorkbench'
 import { createLegacyPendingInputQueue } from '@/adapters/gateway/pendingInputQueueV4'
 import type { PendingInputQueuePort } from '@/modules/pendingInputQueue'
 import type { Attachment, ChatPendingItem, HiddenControlDispatchResult } from '@/types/chat'
@@ -95,6 +98,33 @@ function pendingUiId(
   expect(id).toBeTruthy()
   return id!
 }
+
+describe('manual compaction with the real pending composer queue', () => {
+  it.each(['summary_replay_incomplete', 'summary_does_not_fit', 'cancelled', 'compaction_deadline_exceeded', 'gateway_restarted'])(
+    'returns queued drafts to the composer after %s without sending them', async reason => {
+      let compact: ReturnType<typeof useChatCompaction> | undefined
+      const h = makeQueue(undefined, () => compact?.isCompactInFlightForCurrentSession() ?? false)
+      compact = useChatCompaction({
+        sessionKey: h.sessionKey,
+        schedulePendingDrainAfterTerminal: h.queue.schedulePendingDrainAfterTerminal,
+        popAllPendingIntoComposer: h.queue.popAllPendingIntoComposer,
+      })
+      try {
+        compact.showCompactionToast({ source: 'manual', status: 'started', compaction_id: 'cmp-draft' })
+        h.inputText.value = 'Queued follow-up'
+        expect(await h.queue.enqueuePendingInput(h.inputText.value)).toBe(true)
+        h.inputText.value = 'Still editing'
+        expect(h.queue.pendingQueue.value).toHaveLength(1)
+        compact.showCompactionToast({ source: 'manual', status: 'failed', reason, compaction_id: 'cmp-draft' })
+        await nextTick()
+        expect(compact.isCompactInFlightForCurrentSession()).toBe(false)
+        await vi.waitFor(() => expect(h.queue.pendingQueue.value).toEqual([]))
+        expect(h.inputText.value).toBe('Still editing\nQueued follow-up')
+        expect(h.sendCurrentInput).not.toHaveBeenCalled()
+      } finally { compact.cleanup(); h.queue.cleanup() }
+    },
+  )
+})
 
 function memoryWal(initial: PendingInputWalRecord[] = []) {
   const records = new Map(initial.map(record => [record.pendingInputId, record]))
@@ -212,6 +242,406 @@ class TestBroadcastChannel {
 }
 
 describe('useChatPendingQueue delivery state', () => {
+  it('keeps first-turn creation intent out of durable follow-ups until acceptance consumes it', async () => {
+    const { wal, records } = memoryWal()
+    const { inputText, pendingSessionIntent, queue } = makeQueue(
+      undefined, () => false, undefined, undefined,
+      { pendingInputWal: wal, isStreaming: ref(true) },
+    )
+    pendingSessionIntent.value = 'new_chat'
+    inputText.value = 'follow-up while the first acknowledgement is pending'
+
+    await expect(queue.enqueuePendingInput(inputText.value)).resolves.toBe(true)
+
+    expect(inputText.value).toBe('')
+    expect(pendingSessionIntent.value).toBe('new_chat')
+    expect(queue.pendingQueue.value).toHaveLength(1)
+    expect(queue.pendingQueue.value[0]?.intent).toBeNull()
+    expect([...records.values()]).toHaveLength(1)
+    expect([...records.values()][0]?.intent).toBeNull()
+    queue.cleanup()
+  })
+
+
+  it('publishes an offline draft as locally saved only after the initial WAL commit', async () => {
+    const { wal, records } = memoryWal()
+    const persist = vi.mocked(wal.put).getMockImplementation()!
+    let commit!: () => void
+    vi.mocked(wal.put).mockImplementationOnce(record => new Promise<void>(resolve => {
+      commit = () => { void persist(record).then(resolve) }
+    }))
+    const { queue, inputText } = makeQueue(undefined, () => true, undefined, undefined, {
+      pendingInputWal: wal, connectionState: ref('disconnected'), deliveryIdentity: ref('synthetic-owner'),
+    })
+    try {
+      inputText.value = 'Close only after the save commits'
+      const queued = queue.enqueuePendingInput(inputText.value, undefined, { deliveryIdentity: 'synthetic-owner' })
+      expect(queue.pendingQueue.value[0]?.pendingPersistenceState).toBe('saving')
+      expect(records.size).toBe(0)
+      expect(inputText.value).toBe('Close only after the save commits')
+      commit()
+      await expect(queued).resolves.toBe(true)
+      expect(queue.pendingQueue.value[0]?.pendingPersistenceState).toBe('local_only')
+      expect([...records.values()][0]).toMatchObject({
+        text: 'Close only after the save commits', state: 'local_only',
+      })
+      expect(inputText.value).toBe('')
+    } finally { queue.cleanup() }
+  })
+
+  it('keeps an offline click local until the same identity reconnects, then drains once', async () => {
+    const { wal, records } = memoryWal()
+    const connectionState = ref('disconnected')
+    const deliveryIdentity = ref<string | null>('synthetic-gateway:owner')
+    const dispatch = vi.fn(async () => 'accepted' as const)
+    const rpc = { call: vi.fn(async (method: string) => (
+      method === 'sessions.pending_inputs.list'
+        ? { items: [] }
+        : { requestFingerprint: 'synthetic-fingerprint', revision: 1 }
+    )) as LegacyQueueRpc['call'] }
+    const { queue, inputText } = makeQueue(dispatch, () => false, undefined, undefined, {
+      rpc, hasRpcMethod: () => true, pendingInputWal: wal, connectionState, deliveryIdentity,
+    })
+    try {
+      inputText.value = 'Keep this offline message'
+      await expect(queue.enqueuePendingInput(inputText.value, undefined, {
+        deliveryIdentity: deliveryIdentity.value!,
+      })).resolves.toBe(true)
+      expect(inputText.value).toBe('')
+      expect([...records.values()][0]).toMatchObject({
+        text: 'Keep this offline message', state: 'local_only',
+        deliveryIdentity: 'synthetic-gateway:owner', mayHaveServerCopy: false,
+      })
+      expect(rpc.call).not.toHaveBeenCalled()
+      expect(dispatch).not.toHaveBeenCalled()
+
+      inputText.value = 'A newer draft'
+      connectionState.value = 'connected'
+      await vi.waitFor(() => expect(dispatch).toHaveBeenCalledOnce())
+      expect(inputText.value).toBe('A newer draft')
+      expect(queue.pendingQueue.value).toEqual([])
+      expect(vi.mocked(rpc.call).mock.calls.filter(([method]) => method === 'sessions.pending_inputs.enqueue')).toHaveLength(1)
+    } finally { queue.cleanup() }
+  })
+
+  it('retains offline messages across reload without sending under a different identity', async () => {
+    const { wal, records } = memoryWal()
+    const original = makeQueue(undefined, () => true, undefined, undefined, {
+      pendingInputWal: wal, connectionState: ref('disconnected'),
+      deliveryIdentity: ref('synthetic-gateway:owner'),
+    })
+    original.inputText.value = 'Private owner draft'
+    await original.queue.enqueuePendingInput(original.inputText.value, undefined, {
+      deliveryIdentity: 'synthetic-gateway:owner',
+    })
+    original.queue.cleanup()
+    const deliveryIdentity = ref<string | null>('synthetic-gateway:guest')
+    const dispatch = vi.fn(async () => 'accepted' as const)
+    const rpc = { call: vi.fn(async () => ({ items: [] })) as LegacyQueueRpc['call'] }
+    const { queue } = makeQueue(dispatch, () => false, undefined, undefined, {
+      pendingInputWal: wal, connectionState: ref('connected'), deliveryIdentity,
+      rpc, hasRpcMethod: () => true,
+    })
+    try {
+      await vi.waitFor(() => expect(queue.pendingQueue.value).toHaveLength(1))
+      const item = queue.pendingQueue.value[0]!
+      expect(item.pendingDeliveryIdentity).toBe('synthetic-gateway:owner')
+      expect(queue.beginPendingDelivery(item.pendingUiId)).toBeNull()
+      queue.schedulePendingDrainAfterTerminal()
+      await new Promise(resolve => setTimeout(resolve, 80))
+      expect(dispatch).not.toHaveBeenCalled()
+      expect(vi.mocked(rpc.call).mock.calls.some(([method]) => method === 'sessions.pending_inputs.enqueue')).toBe(false)
+      expect([...records.values()][0]?.text).toBe('Private owner draft')
+    } finally { queue.cleanup() }
+  })
+
+  it.each([true, false])(
+    'drains a delayed initial offline WAL hydration when the connection was already ready (server queue: %s)',
+    async supportsQueue => {
+      vi.useFakeTimers()
+      const { wal } = memoryWal([{
+        schemaVersion: 1, pendingInputId: 'restored-offline', sessionKey: 'agent:main:webchat:test',
+        clientRequestId: 'restored-request', clientMessageId: 'restored-message',
+        text: 'Saved before the previous tab closed', attachments: [], intent: null,
+        state: 'local_only', mayHaveServerCopy: false, deliveryIdentity: 'synthetic-owner',
+        createdAt: 1, updatedAt: 1,
+      }])
+      const list = vi.mocked(wal.list).getMockImplementation()!
+      let release!: () => void
+      vi.mocked(wal.list).mockImplementationOnce(key => new Promise(resolve => {
+        release = () => { void list(key).then(resolve) }
+      }))
+      const dispatch = vi.fn(async () => 'accepted' as const)
+      const call = vi.fn(async (method: string) => method === 'sessions.pending_inputs.list'
+        ? { items: [] } : { requestFingerprint: 'restored-fingerprint', revision: 1 })
+      const { queue } = makeQueue(dispatch, () => false, undefined, undefined, {
+        pendingInputWal: wal, connectionState: ref('connected'), deliveryIdentity: ref('synthetic-owner'),
+        rpc: { call: call as LegacyQueueRpc['call'] }, hasRpcMethod: () => supportsQueue,
+      })
+      try {
+        // Live and workspace readiness can precede the IndexedDB read. No
+        // connection/identity transition or external flush happens afterward.
+        queue.schedulePendingDrainAfterTerminal()
+        expect(queue.pendingQueue.value).toEqual([])
+        release()
+        await vi.advanceTimersByTimeAsync(0)
+        expect(queue.pendingQueue.value[0]?.pendingPersistenceState).toBe(supportsQueue ? 'staged' : 'local_only')
+        await vi.advanceTimersByTimeAsync(50)
+        expect(dispatch).toHaveBeenCalledOnce()
+        expect(queue.pendingQueue.value).toEqual([])
+        await vi.advanceTimersByTimeAsync(500)
+        expect(dispatch).toHaveBeenCalledOnce()
+        expect(call.mock.calls.filter(([method]) => method === 'sessions.pending_inputs.enqueue')).toHaveLength(supportsQueue ? 1 : 0)
+      } finally { queue.cleanup(); vi.useRealTimers() }
+    },
+  )
+
+  it('does not retry a definite offline enqueue denial on another reconnect', async () => {
+    const connectionState = ref('disconnected')
+    let supportsQueue = true
+    const call = vi.fn(async (method: string) => {
+      if (method === 'sessions.pending_inputs.enqueue') {
+        throw Object.assign(new Error('Synthetic permission denial'), { accepted: false, code: 'UNAUTHORIZED' })
+      }
+      return { items: [] }
+    })
+    const { queue, inputText } = makeQueue(undefined, () => false, undefined, undefined, {
+      rpc: { call: call as LegacyQueueRpc['call'] }, hasRpcMethod: () => supportsQueue,
+      connectionState, deliveryIdentity: ref('synthetic-owner'),
+    })
+    try {
+      inputText.value = 'Retain this rejected message'
+      await queue.enqueuePendingInput(inputText.value, undefined, { deliveryIdentity: 'synthetic-owner' })
+      connectionState.value = 'connected'
+      await vi.waitFor(() => expect(queue.pendingQueue.value[0]?.pendingPersistenceState).toBe('retryable'))
+      connectionState.value = 'disconnected'
+      await nextTick()
+      connectionState.value = 'connected'
+      await nextTick()
+      await queue.hydratePendingQueue()
+      await new Promise(resolve => setTimeout(resolve, 80))
+      expect(call.mock.calls.filter(([method]) => method === 'sessions.pending_inputs.enqueue')).toHaveLength(1)
+      expect(queue.pendingQueue.value[0]?.text).toBe('Retain this rejected message')
+      expect(queue.pendingQueue.value[0]?.pendingMayHaveServerCopy).toBe(false)
+      supportsQueue = false
+      await queue.hydratePendingQueue()
+      expect(queue.pendingQueue.value[0]?.pendingPersistenceState).toBe('retryable')
+      supportsQueue = true
+      inputText.value = 'A newer draft'
+      expect(queue.editPendingItem(queue.pendingQueue.value[0]!.pendingUiId)).toBe(true)
+      await vi.waitFor(() => expect(inputText.value).toBe('Retain this rejected message\nA newer draft'))
+      expect(call.mock.calls.some(([method]) => method === 'sessions.pending_inputs.cancel')).toBe(false)
+    } finally { queue.cleanup() }
+  })
+
+  it('does not clear a different session draft when an offline WAL write finishes', async () => {
+    const { wal } = memoryWal()
+    let complete!: () => void
+    vi.mocked(wal.put).mockImplementationOnce(() => new Promise<void>(resolve => { complete = resolve }))
+    const { queue, inputText, sessionKey } = makeQueue(undefined, () => true, undefined, undefined, {
+      pendingInputWal: wal, connectionState: ref('disconnected'), deliveryIdentity: ref('synthetic-owner'),
+    })
+    try {
+      inputText.value = 'Same words in different drafts'
+      const saved = queue.enqueuePendingInput(inputText.value, undefined, { deliveryIdentity: 'synthetic-owner' })
+      sessionKey.value = 'agent:main:webchat:other'
+      complete()
+      await saved
+      expect(inputText.value).toBe('Same words in different drafts')
+    } finally { queue.cleanup() }
+  })
+
+  it('keeps a never-transmitted offline draft locally removable if identity changes during staging WAL', async () => {
+    const { wal } = memoryWal()
+    const persist = vi.mocked(wal.put).getMockImplementation()!
+    const connectionState = ref('disconnected')
+    const deliveryIdentity = ref<string | null>('synthetic-owner')
+    let release: (() => void) | undefined
+    const call = vi.fn(async (_method: string) => ({ items: [] }))
+    const { queue, inputText } = makeQueue(undefined, () => true, undefined, undefined, {
+      pendingInputWal: wal, connectionState, deliveryIdentity,
+      rpc: { call: call as LegacyQueueRpc['call'] }, hasRpcMethod: () => true,
+    })
+    try {
+      inputText.value = 'Never transmitted'
+      await queue.enqueuePendingInput(inputText.value, undefined, { deliveryIdentity: 'synthetic-owner' })
+      vi.mocked(wal.put).mockImplementationOnce(record => new Promise<void>(resolve => {
+        release = () => { void persist(record).then(resolve) }
+      }))
+      connectionState.value = 'connected'
+      await vi.waitFor(() => expect(release).toBeDefined())
+      connectionState.value = 'disconnected'
+      deliveryIdentity.value = 'synthetic-guest'
+      release!()
+      await vi.waitFor(() => expect(queue.pendingQueue.value[0]).toMatchObject({
+        pendingMayHaveServerCopy: false, pendingPersistenceState: 'local_only',
+      }))
+      expect(call.mock.calls.some(([method]) => method === 'sessions.pending_inputs.enqueue')).toBe(false)
+      expect(await queue.cancelDurableItem(queue.pendingQueue.value[0]!)).toBe(true)
+      expect(call.mock.calls.some(([method]) => method === 'sessions.pending_inputs.cancel')).toBe(false)
+    } finally { release?.(); queue.cleanup() }
+  })
+
+  it.each(['identity', 'session'] as const)(
+    'stops later offline attachment uploads when the %s changes during the first refresh',
+    async change => {
+      const { wal, records } = memoryWal()
+      const connectionState = ref('disconnected')
+      const deliveryIdentity = ref<string | null>('synthetic-owner')
+      let release!: () => void
+      const firstUpload = new Promise<void>(resolve => { release = resolve })
+      const uploadAttachment = vi.fn(async (file: File) => {
+        if (file.name === 'first.pdf') await firstUpload
+        return { fileUuid: `refreshed-${file.name}`, expiresAt: Date.now() + 60_000 }
+      })
+      const unused = async (): Promise<never> => { throw new Error('Unexpected artifact access') }
+      const content: ArtifactContentAccess = {
+        fetchArtifact: unused, openArtifact: unused, openArtifactBlob: unused,
+        clearPreviewStorage: unused, fetchAttachment: unused, uploadAttachment,
+      }
+      const attachments = useChatAttachments(content)
+      const prepare = vi.fn(attachments.prepareAttachmentsForSend)
+      const onPendingPersistenceError = vi.fn()
+      const call = vi.fn(async (method: string) => method === 'sessions.pending_inputs.list'
+        ? { items: [] } : { requestFingerprint: 'unexpected-enqueue', revision: 1 })
+      const { queue, inputText, pendingAttachments, sessionKey } = makeQueue(undefined, () => true, undefined, undefined, {
+        pendingInputWal: wal, connectionState, deliveryIdentity,
+        prepareAttachmentsForSend: prepare, onPendingPersistenceError,
+        rpc: { call: call as LegacyQueueRpc['call'] }, hasRpcMethod: () => true,
+      })
+      try {
+        inputText.value = 'Keep both private attachment drafts'
+        pendingAttachments.value = ['first.pdf', 'second.pdf'].map((name, index) => ({
+          kind: 'staged', local_id: index + 1, name, mime: 'application/pdf',
+          file_uuid: `original-${name}`, expires_at: 0,
+          file: new File(['Synthetic PDF content'], name, { type: 'application/pdf' }),
+        }))
+        await queue.enqueuePendingInput(inputText.value, undefined, { deliveryIdentity: 'synthetic-owner' })
+        const originalWal = structuredClone([...records.values()][0]!)
+        connectionState.value = 'connected'
+        await vi.waitFor(() => expect(uploadAttachment).toHaveBeenCalledOnce())
+        if (change === 'identity') deliveryIdentity.value = 'synthetic-guest'
+        else sessionKey.value = 'agent:main:webchat:other'
+        release()
+        await prepare.mock.results[0]!.value
+        await nextTick()
+        expect(uploadAttachment).toHaveBeenCalledOnce()
+        await expect(prepare.mock.results[0]!.value).resolves.toBe(false)
+        expect(call.mock.calls.some(([method]) => method === 'sessions.pending_inputs.enqueue')).toBe(false)
+        expect(onPendingPersistenceError).not.toHaveBeenCalled()
+        expect([...records.values()]).toEqual([originalWal])
+        expect(queue.pendingQueue.value[0]).toMatchObject({
+          pendingPersistenceState: 'local_only', pendingMayHaveServerCopy: false,
+          attachments: [
+            { file_uuid: 'original-first.pdf' }, { file_uuid: 'original-second.pdf' },
+          ],
+        })
+      } finally { release(); queue.cleanup() }
+    },
+  )
+
+  it('stops server hydration after identity changes during a row write and retains the captured identity', async () => {
+    const { wal, records } = memoryWal()
+    const persist = vi.mocked(wal.put).getMockImplementation()!
+    const connectionState = ref('connected')
+    const deliveryIdentity = ref<string | null>('synthetic-owner')
+    let release: (() => void) | undefined
+    vi.mocked(wal.put).mockImplementationOnce(record => new Promise<void>(resolve => {
+      release = () => { void persist(record).then(resolve) }
+    }))
+    const call = vi.fn(async () => ({ items: ['first', 'second'].map(id => ({
+      pendingInputId: id, clientRequestId: `request-${id}`, clientMessageId: `message-${id}`,
+      message: `Private ${id}`, requestFingerprint: `fingerprint-${id}`, revision: 1,
+    })) }))
+    const { queue } = makeQueue(undefined, () => true, undefined, undefined, {
+      pendingInputWal: wal, connectionState, deliveryIdentity,
+      rpc: { call: call as LegacyQueueRpc['call'] }, hasRpcMethod: () => true,
+    })
+    try {
+      await vi.waitFor(() => expect(release).toBeDefined())
+      connectionState.value = 'disconnected'
+      deliveryIdentity.value = 'synthetic-guest'
+      release!()
+      await vi.waitFor(() => expect(records.has('first')).toBe(true))
+      await nextTick()
+      expect(queue.pendingQueue.value.map(item => item.pendingInputId)).toEqual(['first'])
+      expect(queue.pendingQueue.value[0]?.pendingDeliveryIdentity).toBe('synthetic-owner')
+      expect(records.get('first')?.deliveryIdentity).toBe('synthetic-owner')
+      expect(queue.beginPendingDelivery('first')).toBeNull()
+      expect(records.has('second')).toBe(false)
+    } finally { release?.(); queue.cleanup() }
+  })
+
+  it('waits for a proven delivery identity before importing server queue rows', async () => {
+    const deliveryIdentity = ref<string | null>(null)
+    const call = vi.fn(async (_method: string) => ({ items: [{
+      pendingInputId: 'server-row', clientRequestId: 'server-request', clientMessageId: 'server-message',
+      message: 'Server-owned draft', requestFingerprint: 'server-fingerprint', revision: 1,
+    }] }))
+    const { queue } = makeQueue(undefined, () => true, undefined, undefined, {
+      connectionState: ref('connected'), deliveryIdentity,
+      rpc: { call: call as LegacyQueueRpc['call'] }, hasRpcMethod: () => true,
+    })
+    try {
+      await queue.hydratePendingQueue()
+      expect(call).not.toHaveBeenCalled()
+      expect(queue.pendingQueue.value).toEqual([])
+      deliveryIdentity.value = 'synthetic-owner'
+      await vi.waitFor(() => expect(queue.pendingQueue.value[0]?.pendingPersistenceState).toBe('staged'))
+      expect(call).toHaveBeenCalledOnce()
+      expect(queue.pendingQueue.value[0]?.pendingDeliveryIdentity).toBe('synthetic-owner')
+    } finally { queue.cleanup() }
+  })
+
+  it.each([
+    { action: 'edit', change: 'session' },
+    { action: 'tail', change: 'identity' },
+    { action: 'all', change: 'draft' },
+    { action: 'edit', change: 'revision' },
+  ])(
+    'keeps the queued draft when $action cancellation outlives its composer $change',
+    async ({ action, change }) => {
+      const { wal, records } = memoryWal()
+      const persist = vi.mocked(wal.put).getMockImplementation()!
+      const deliveryIdentity = ref<string | null>('synthetic-owner')
+      const composerRevision = ref(0)
+      const connectionState = ref('disconnected')
+      let release: (() => void) | undefined
+      const { queue, inputText, sessionKey } = makeQueue(undefined, () => true, undefined, undefined, {
+        pendingInputWal: wal, connectionState, deliveryIdentity, composerRevision,
+      })
+      try {
+        inputText.value = 'Original private draft'
+        await queue.enqueuePendingInput(inputText.value, undefined, { deliveryIdentity: 'synthetic-owner' })
+        const item = queue.pendingQueue.value[0]!
+        inputText.value = 'Visible draft'
+        vi.mocked(wal.put).mockImplementationOnce(record => new Promise<void>(resolve => {
+          release = () => { void persist(record).then(resolve) }
+        }))
+        expect(action === 'edit' ? queue.editPendingItem(item.pendingUiId)
+          : action === 'tail' ? queue.popPendingTail() : queue.popAllPendingIntoComposer()).toBe(true)
+        await vi.waitFor(() => expect(release).toBeDefined())
+        if (change === 'session') sessionKey.value = 'agent:main:webchat:other'
+        else if (change === 'identity') deliveryIdentity.value = 'synthetic-guest'
+        else if (change === 'revision') composerRevision.value += 1
+        else inputText.value = 'A newer untouched draft'
+        const expectedDraft = inputText.value
+        release!()
+        await vi.waitFor(() => expect(records.get(item.pendingInputId!)?.state).not.toBe('cancelling'))
+        await nextTick()
+        expect(inputText.value).toBe(expectedDraft)
+        expect(records.get(item.pendingInputId!)).toMatchObject({
+          text: 'Original private draft', state: 'local_only', retainAfterCancel: true,
+        })
+        sessionKey.value = 'agent:main:webchat:test'
+        deliveryIdentity.value = 'synthetic-owner'
+        connectionState.value = 'connected'
+        await nextTick()
+        expect(queue.beginPendingDelivery(item.pendingUiId)).toBeNull()
+      } finally { release?.(); queue.cleanup() }
+    },
+  )
+
   it('fails closed when the IndexedDB global accessor itself throws', () => {
     const descriptor = Object.getOwnPropertyDescriptor(globalThis, 'indexedDB')
     Object.defineProperty(globalThis, 'indexedDB', {
@@ -329,6 +759,39 @@ describe('useChatPendingQueue delivery state', () => {
       expect(queue.pendingQueue.value[0]?.pendingPersistenceState).toBe('local_only')
     })
     queue.cleanup()
+  })
+
+  it('keeps a changed workspace file while durably queuing the original new-task follow-up', async () => {
+    const { wal } = memoryWal()
+    let releaseFirstPut!: () => void
+    vi.mocked(wal.put).mockImplementationOnce(() => new Promise<void>(resolve => {
+      releaseFirstPut = resolve
+    }))
+    const { inputText, pendingAttachments, pendingSessionIntent, queue } = makeQueue(
+      undefined, () => false, undefined, undefined,
+      { pendingInputWal: wal, hasRpcMethod: () => false },
+    )
+    inputText.value = 'edit the original project file'
+    pendingSessionIntent.value = 'new_chat'
+    pendingAttachments.value = [{
+      kind: 'workspace', local_id: 103, name: 'notes.md', mime: 'text/markdown',
+      workspaceFile: { workspaceId: 'project-a', relativePath: 'docs/notes.md', name: 'notes.md', mime: 'text/markdown' },
+    }]
+
+    try {
+      const queued = queue.enqueuePendingInput(inputText.value)
+      pendingAttachments.value[0]!.workspaceFile!.relativePath = 'drafts/notes.md'
+      releaseFirstPut()
+      await expect(queued).resolves.toBe(true)
+
+      expect(inputText.value).toBe('edit the original project file')
+      expect(pendingSessionIntent.value).toBe('new_chat')
+      expect(pendingAttachments.value[0]?.workspaceFile?.relativePath).toBe('drafts/notes.md')
+      expect(queue.pendingQueue.value[0]).toMatchObject({
+        intent: null,
+        attachments: [{ workspaceFile: { workspaceId: 'project-a', relativePath: 'docs/notes.md' } }],
+      })
+    } finally { queue.cleanup() }
   })
 
   it('keeps a newer draft entered while the WAL write is pending', async () => {
@@ -495,6 +958,70 @@ describe('useChatPendingQueue delivery state', () => {
     expect(queue.pendingQueue.value).toEqual([])
     expect(onPendingPersistenceError).toHaveBeenCalledWith('wal_failed')
     queue.cleanup()
+  })
+
+  it.each([false, true])('retains a native workspace reference through WAL and staging with selected skills: %s', async withSkills => {
+    const { wal, records } = memoryWal()
+    const skills = withSkills ? [{ name: 'tables', instanceId: 'skill:tables', digest: 'a'.repeat(64) }] : []
+    const selectedSkills = ref(skills)
+    const workspaceFile = { workspaceId: 'project-fixture', relativePath: 'docs/notes.md',
+      name: 'notes.md', mime: 'text/markdown', size: 14 }
+    const original = makeQueue(undefined, () => true, undefined, undefined, {
+      selectedSkills,
+      pendingInputWal: wal, connectionState: ref('disconnected'),
+      deliveryIdentity: ref('fixture-gateway:owner'),
+    })
+    original.pendingAttachments.value = [{ kind: 'workspace', local_id: 1,
+      name: workspaceFile.name, mime: workspaceFile.mime, workspaceFile }]
+    await expect(original.queue.enqueuePendingInput('edit project notes', undefined, {
+      deliveryIdentity: 'fixture-gateway:owner',
+    })).resolves.toBe(true)
+    expect([...records.values()][0]?.attachments).toMatchObject([{ kind: 'workspace', workspaceFile }])
+    expect(original.pendingAttachments.value).toEqual([])
+    expect(selectedSkills.value).toEqual([])
+    if (withSkills) expect([...records.values()][0]?.selectedSkills).toEqual(skills)
+    original.queue.cleanup()
+    const call = vi.fn(async (method: string) => method === 'sessions.pending_inputs.list'
+      ? { items: [] } : { requestFingerprint: 'fixture-fingerprint', revision: 1 })
+    const restored = makeQueue(undefined, () => true, undefined, undefined, {
+      pendingInputWal: wal, connectionState: ref('connected'),
+      deliveryIdentity: ref('fixture-gateway:owner'),
+      rpc: { call: call as LegacyQueueRpc['call'] }, hasRpcMethod: () => true,
+    })
+    try {
+      await vi.waitFor(() => expect(restored.queue.pendingQueue.value[0]?.pendingPersistenceState).toBe('staged'))
+      expect(call).toHaveBeenCalledWith('sessions.pending_inputs.enqueue', expect.objectContaining({
+        workspaceFiles: [workspaceFile], attachments: [],
+        ...(withSkills ? { selectedSkills: skills } : {}),
+      }))
+      expect(restored.queue.pendingQueue.value[0]?.attachments).toMatchObject([{ kind: 'workspace', workspaceFile }])
+      if (withSkills) expect(restored.queue.pendingQueue.value[0]?.selectedSkills).toEqual(skills)
+      expect([...records.values()][0]?.attachments).toMatchObject([{ kind: 'workspace', workspaceFile,
+        durable_material: true }])
+      expect(JSON.stringify([...records.values()])).not.toContain('file_uuid')
+      expect(JSON.stringify([...records.values()])).not.toContain('token')
+    } finally { restored.queue.cleanup() }
+  })
+
+  it('restores server workspace references without manufacturing upload tokens', async () => {
+    const workspaceFile = { workspaceId: 'project-fixture', relativePath: 'docs/notes.md',
+      name: 'notes.md', mime: 'text/markdown', size: 14 }
+    const call = vi.fn(async () => ({ items: [{
+      pendingInputId: 'fixture-pending', clientRequestId: 'fixture-request',
+      clientMessageId: 'fixture-message', message: 'edit project notes',
+      attachments: [], workspaceFiles: [workspaceFile], revision: 1,
+      requestFingerprint: 'fixture-fingerprint',
+    }] }))
+    const { queue } = makeQueue(undefined, () => true, undefined, undefined, {
+      rpc: { call: call as LegacyQueueRpc['call'] }, hasRpcMethod: () => true,
+    })
+    try {
+      await vi.waitFor(() => expect(queue.pendingQueue.value[0]?.attachments).toMatchObject([
+        { kind: 'workspace', workspaceFile, durable_material: true },
+      ]))
+      expect(queue.pendingQueue.value[0]?.attachments[0]).not.toHaveProperty('file_uuid')
+      expect(queue.pendingQueue.value[0]?.attachments[0]).not.toHaveProperty('file')
+    } finally { queue.cleanup() }
   })
 
   it('writes attachment WAL before clearing and sends only durable upload tokens', async () => {
@@ -1132,11 +1659,55 @@ describe('useChatPendingQueue delivery state', () => {
     queue.cleanup()
   })
 
+  it('retains an old annotation WAL for explicit recovery without staging or dispatching it', async () => {
+    const { wal } = memoryWal([{
+      schemaVersion: 1,
+      pendingInputId: 'pending-old-annotation',
+      sessionKey: 'agent:main:webchat:test',
+      clientRequestId: 'request-old-annotation',
+      clientMessageId: 'message-old-annotation',
+      text: 'Update this heading',
+      promptAnnotationIds: ['retired-draft'],
+      attachments: [],
+      intent: null,
+      state: 'local_only',
+      mayHaveServerCopy: false,
+      createdAt: 1,
+      updatedAt: 1,
+    }])
+    const dispatch = vi.fn(async () => 'accepted' as const)
+    const { queue, inputText } = makeQueue(dispatch, () => false, undefined, undefined, {
+      pendingInputWal: wal,
+    })
+    await vi.waitFor(() => expect(queue.pendingQueue.value).toHaveLength(1))
+    const item = queue.pendingQueue.value[0]!
+    expect(item.retiredAnnotationInput).toBe(true)
+    expect(queue.beginPendingDelivery(item.pendingUiId)).toBeNull()
+    expect(dispatch).not.toHaveBeenCalled()
+    expect(queue.editPendingItem(item.pendingUiId)).toBe(true)
+    await vi.waitFor(() => expect(inputText.value).toBe('Update this heading'))
+    queue.cleanup()
+  })
+
+  it('stages annotation-only input through the ordinary queue without changing the visible body', async () => {
+    const enqueue = vi.fn(async () => ({ requestFingerprint: 'fingerprint', revision: 1 }))
+    const { queue } = makeQueue(undefined, () => true, undefined, undefined, {
+      pendingInputQueue: { supportsQueue: () => true, supportsReorder: () => false, enqueue,
+        list: async () => [], cancel: async () => {}, reorder: async () => ({ items: [] }) },
+    })
+    const pageContext = { targetRef: 'target-1', annotations: [{ text: 'First change' }, { text: 'Second change' }] }
+    await queue.enqueuePendingPayload({ text: '', pageContext })
+    await vi.waitFor(() => expect(enqueue).toHaveBeenCalledWith(expect.objectContaining({
+      message: 'First change\nSecond change', displayText: '', pageContext,
+    })))
+    queue.cleanup()
+  })
+
   it('does not edit a queued annotation batch into plain text', async () => {
     const { inputText, queue } = makeQueue()
     await expect(queue.enqueuePendingPayload({
       text: 'apply the second selected edit',
-      promptAnnotationIds: ['annotation-2', 'annotation-1'],
+      pageContext: { targetRef: 'target-1', annotations: [{ text: 'Change this heading' }] },
     })).resolves.toBe(true)
     const itemId = pendingUiId(queue, 0)
     inputText.value = 'keep the current composer draft'
@@ -1145,7 +1716,7 @@ describe('useChatPendingQueue delivery state', () => {
     expect(queue.pendingQueue.value).toHaveLength(1)
     expect(queue.pendingQueue.value[0]).toMatchObject({
       text: 'apply the second selected edit',
-      promptAnnotationIds: ['annotation-2', 'annotation-1'],
+      pageContext: { targetRef: 'target-1', annotations: [{ text: 'Change this heading' }] },
     })
     expect(inputText.value).toBe('keep the current composer draft')
     queue.cleanup()
@@ -2436,4 +3007,70 @@ describe('useChatPendingQueue delivery state', () => {
       .map(record => record.text)).toEqual(['C', 'A', 'B'])
     first.queue.cleanup()
   })
+})
+
+describe('explicit skill pending input durability', () => {
+  const skill = { name: 'synthetic-table', instanceId: 'instance-one', digest: 'digest-one' }
+
+  it('persists selected identities before clearing and restores them after remount', async () => {
+    const { wal, records } = memoryWal()
+    const selectedSkills = ref([{ ...skill }])
+    const harness = makeQueue(undefined, () => false, undefined, undefined, { pendingInputWal: wal, selectedSkills })
+    harness.inputText.value = 'Make a table'
+    expect(await harness.queue.enqueuePendingInput('Make a table')).toBe(true)
+    expect(selectedSkills.value).toEqual([])
+    expect([...records.values()][0]?.selectedSkills).toEqual([skill])
+    const restored = makeQueue(undefined, () => false, undefined, undefined, { pendingInputWal: wal })
+    await restored.queue.hydratePendingQueue('agent:main:webchat:test')
+    expect(restored.queue.pendingQueue.value[0]?.selectedSkills).toEqual([skill])
+  })
+
+  it('keeps a newer selection while an older WAL write is pending', async () => {
+    const { wal } = memoryWal()
+    let finish!: () => void
+    wal.put = vi.fn(() => new Promise<void>(resolve => { finish = resolve }))
+    const selectedSkills = ref([{ ...skill }])
+    const harness = makeQueue(undefined, () => false, undefined, undefined, { pendingInputWal: wal, selectedSkills })
+    harness.inputText.value = 'Make a table'
+    const enqueue = harness.queue.enqueuePendingInput('Make a table')
+    const other = { ...skill, name: 'synthetic-paper', instanceId: 'instance-two' }
+    selectedSkills.value = [other]
+    finish()
+    expect(await enqueue).toBe(true)
+    expect(selectedSkills.value).toEqual([other])
+    expect(harness.inputText.value).toBe('Make a table')
+    expect(harness.queue.pendingQueue.value[0]?.selectedSkills).toEqual([skill])
+  })
+})
+
+it('does not replace a queued skill identity with a conflicting server projection', async () => {
+  const skill = { name: 'synthetic-table', instanceId: 'instance-one', digest: 'digest-one' }
+  const record: PendingInputWalRecord = {
+    schemaVersion: 1, pendingInputId: 'pending-skill', sessionKey: 'agent:main:webchat:test',
+    clientRequestId: 'request-skill', clientMessageId: 'message-skill', text: 'Make a table',
+    attachments: [], intent: null, state: 'staged', selectedSkills: [skill],
+    requestFingerprint: 'original-fingerprint', createdAt: 1, updatedAt: 1,
+  }
+  const { wal } = memoryWal([record])
+  const port: PendingInputQueuePort = {
+    supportsQueue: () => true, supportsReorder: () => false,
+    enqueue: vi.fn(async () => { throw new Error('Conflicting immutable request') }),
+    list: vi.fn(async () => [{
+      pendingInputId: record.pendingInputId, clientRequestId: record.clientRequestId,
+      clientMessageId: record.clientMessageId, message: record.text,
+      selectedSkills: [{ ...skill, instanceId: 'replacement-instance' }],
+      requestFingerprint: 'different-fingerprint', revision: 2,
+    }]),
+    cancel: vi.fn(async () => {}), reorder: vi.fn(async () => ({ items: [] })),
+  }
+  const result = makeQueue(undefined, () => true, undefined, undefined, {
+    pendingInputWal: wal, pendingInputQueue: port,
+  })
+  try {
+    await result.queue.hydratePendingQueue(record.sessionKey)
+    expect(result.queue.pendingQueue.value[0]).toMatchObject({
+      selectedSkills: [skill], pendingRequestFingerprint: 'original-fingerprint',
+      pendingPersistenceState: 'retryable',
+    })
+  } finally { result.queue.cleanup() }
 })

@@ -1,4 +1,4 @@
-import { ref } from 'vue'
+import { ref, type Ref } from 'vue'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 
 import type {
@@ -14,6 +14,8 @@ import {
   type SessionPhaseResult,
 } from './sessionBootstrapContract'
 import { useChatSessionBootstrap } from './useChatSessionBootstrap'
+import { createConversationEventTransport } from '@/adapters/gateway/conversationEventTransport'
+import type { TransportEventHandler } from '@/adapters/gateway/transportTypes'
 
 const LIVE_READY: SessionSubscriptionOutcome = {
   authoritative: true,
@@ -30,6 +32,10 @@ function createBootstrap(overrides: {
     context: SessionBootstrapPhaseContext,
   ) => Promise<SessionSubscriptionOutcome>
   criticalRequestsQueued?: () => Promise<void>
+  reconcileSession?: (context: SessionBootstrapPhaseContext) => Promise<SessionSubscriptionOutcome>
+  connectionState?: Ref<string>
+  metadataRecoveryError?: Ref<unknown>
+  retryMetadata?: () => Promise<unknown>
 } = {}) {
   const loadHistoryImplementation = overrides.loadHistory || (async () => ({ ok: true }))
   const loadHistory = vi.fn(async (
@@ -67,6 +73,10 @@ function createBootstrap(overrides: {
     sessionReadLifecycle,
     loadHistory,
     subscribeSession,
+    reconcileSession: overrides.reconcileSession,
+    connectionState: overrides.connectionState,
+    metadataRecoveryError: overrides.metadataRecoveryError,
+    retryMetadata: overrides.retryMetadata,
     cancelHistory,
     cancelSubscription,
   })
@@ -87,6 +97,156 @@ afterEach(() => {
 })
 
 describe('useChatSessionBootstrap', () => {
+  it('does not queue another snapshot when an ordinary heartbeat arrives during a slow live transfer', async () => {
+    vi.useFakeTimers()
+    let complete!: (result: SessionSubscriptionOutcome) => void
+    const pending = new Promise<SessionSubscriptionOutcome>(resolve => { complete = resolve })
+    const reconcileSession = vi.fn(async () => LIVE_READY)
+    const h = createBootstrap({
+      subscribeSession: () => pending, reconcileSession, connectionState: ref('connected'),
+    })
+    let wildcard!: TransportEventHandler
+    const transport = createConversationEventTransport({
+      subscribe(event, listener) {
+        if (event === '*') wildcard = listener
+        return { close() {} }
+      },
+    })
+    transport.subscribe({ onEvent: event => {
+      // The real Conversation consumer requests recovery on invalid frames.
+      if (event.kind === 'invalid') void h.api.retryLive()
+    } })
+    try {
+      const run = h.api.startSessionBootstrap()
+      await vi.advanceTimersByTimeAsync(30_000)
+      expect(h.api.livePhase.value).toBe('degraded')
+      wildcard('tick', { time_ms: Date.now() }, {})
+      await vi.advanceTimersByTimeAsync(15_000)
+      complete(LIVE_READY)
+      await run.live
+      await vi.advanceTimersByTimeAsync(0)
+      expect(h.api.livePhase.value).toBe('ready')
+      expect(reconcileSession).not.toHaveBeenCalled()
+      expect(h.openSessionRead).toHaveBeenCalledOnce()
+    } finally {
+      transport.unsubscribe()
+      h.api.cancelSessionBootstrap()
+    }
+  })
+
+  it('merges gaps during an initial live read into a fresh reconciliation on the same lease', async () => {
+    let release!: (value: SessionSubscriptionOutcome) => void
+    const initial = new Promise<SessionSubscriptionOutcome>(resolve => { release = resolve })
+    const reconcileSession = vi.fn(async () => LIVE_READY)
+    const { api, openSessionRead, closeLease } = createBootstrap({ subscribeSession: () => initial, reconcileSession })
+    const run = api.startSessionBootstrap()
+    const recovery = api.retryLive()
+    expect(api.retryLive()).toBe(recovery)
+    expect(reconcileSession).not.toHaveBeenCalled()
+    release(LIVE_READY)
+    await run.live
+    await recovery
+    expect(reconcileSession).toHaveBeenCalledOnce()
+    expect(openSessionRead).toHaveBeenCalledOnce()
+    expect(closeLease).not.toHaveBeenCalled()
+    api.cancelSessionBootstrap()
+  })
+
+  it('automatically retries a failed live read on the original lease without a retry click', async () => {
+    vi.useFakeTimers()
+    const reconcileSession = vi.fn(async () => LIVE_READY)
+    const { api, openSessionRead, closeLease } = createBootstrap({
+      connectionState: ref('connected'),
+      subscribeSession: async () => ({ ...LIVE_READY, authoritative: false,
+        error: new SessionReadFailure('timeout', 'held subscribe', true) }),
+      reconcileSession,
+    })
+    const run = api.startSessionBootstrap()
+    await Promise.all([run.history, run.live])
+    await vi.advanceTimersByTimeAsync(500)
+    expect(reconcileSession).toHaveBeenCalledOnce()
+    expect(openSessionRead).toHaveBeenCalledOnce()
+    expect(closeLease).not.toHaveBeenCalled()
+    expect(api.livePhase.value).toBe('ready')
+    api.cancelSessionBootstrap()
+  })
+
+  it('retries only deferred metadata while preserving an authoritative live subscription', async () => {
+    vi.useFakeTimers()
+    const metadataRecoveryError = ref<unknown>(null)
+    const retryMetadata = vi.fn(async () => {
+      metadataRecoveryError.value = null
+      return LIVE_READY
+    })
+    const { api, openSessionRead, closeLease } = createBootstrap({
+      connectionState: ref('connected'), metadataRecoveryError, retryMetadata,
+    })
+    const run = api.startSessionBootstrap()
+    await Promise.all([run.history, run.live])
+    expect(api.livePhase.value).toBe('ready')
+    metadataRecoveryError.value = new SessionReadFailure('busy', 'storage busy', true, 100)
+    await vi.advanceTimersByTimeAsync(500)
+    expect(retryMetadata).toHaveBeenCalledOnce()
+    expect(api.livePhase.value).toBe('ready')
+    expect(openSessionRead).toHaveBeenCalledOnce()
+    expect(closeLease).not.toHaveBeenCalled()
+    await vi.advanceTimersByTimeAsync(30_000)
+    expect(retryMetadata).toHaveBeenCalledOnce()
+    api.cancelSessionBootstrap()
+  })
+
+  it('rearms automatic live retry after repeated failure without leaving stable degradation', async () => {
+    vi.useFakeTimers()
+    const failure = { ...LIVE_READY, authoritative: false,
+      error: new SessionReadFailure('timeout', 'held subscribe', true) }
+    const reconcileSession = vi.fn().mockResolvedValueOnce(failure).mockResolvedValueOnce(LIVE_READY)
+    const h = createBootstrap({
+      connectionState: ref('connected'), subscribeSession: async () => failure, reconcileSession,
+    })
+    await h.api.startSessionBootstrap().live
+    h.api.dismissRecoveryNotice()
+    await vi.advanceTimersByTimeAsync(500)
+    expect(reconcileSession).toHaveBeenCalledTimes(1)
+    expect(h.api.livePhase.value).toBe('degraded')
+    expect(h.api.noticeDismissed.value).toBe(true)
+    await vi.advanceTimersByTimeAsync(1_000)
+    expect(reconcileSession).toHaveBeenCalledTimes(2)
+    expect(h.api.livePhase.value).toBe('ready')
+    expect(h.openSessionRead).toHaveBeenCalledTimes(1)
+    h.api.cancelSessionBootstrap()
+  })
+
+  it('publishes a history-only failure before notifying the automatic recovery watcher', async () => {
+    vi.useFakeTimers()
+    let available = false
+    const { api, loadHistory, subscribeSession, openSessionRead, closeLease } = createBootstrap({
+      connectionState: ref('connected'),
+      loadHistory: async () => available
+        ? { ok: true }
+        : { ok: false, error: new SessionReadFailure('unavailable', 'history offline', true) },
+    })
+    try {
+      const run = api.startSessionBootstrap()
+      await run.live
+      await vi.advanceTimersByTimeAsync(100)
+      await run.history
+      expect(api.historyPhase.value).toBe('error')
+      expect(api.livePhase.value).toBe('ready')
+      const failedAttempts = loadHistory.mock.calls.length
+
+      available = true
+      // No connection transition or unrelated live update wakes the watcher.
+      await vi.advanceTimersByTimeAsync(500)
+      expect(loadHistory).toHaveBeenCalledTimes(failedAttempts + 1)
+      expect(api.historyPhase.value).toBe('ready')
+      expect(subscribeSession).toHaveBeenCalledOnce()
+      expect(openSessionRead).toHaveBeenCalledOnce()
+      expect(closeLease).not.toHaveBeenCalled()
+    } finally {
+      api.cancelSessionBootstrap()
+    }
+  })
+
   it('releases optional traffic after the lease queues critical frames, not responses', async () => {
     let releaseHistory!: (result: SessionPhaseResult) => void
     let releaseLive!: (result: SessionSubscriptionOutcome) => void
@@ -456,5 +616,52 @@ describe('useChatSessionBootstrap', () => {
     expect(shouldRetrySessionPhase(
       new SessionReadFailure('unavailable', 'not authorized', false),
     )).toBe(false)
+  })
+})
+
+
+describe('incident presentation budget', () => {
+  it('degrades at 15 seconds while a 45 second progressing live transfer continues', async () => {
+    vi.useFakeTimers()
+    let complete!: (result: SessionSubscriptionOutcome) => void
+    const pending = new Promise<SessionSubscriptionOutcome>(resolve => { complete = resolve })
+    const h = createBootstrap({ subscribeSession: () => pending, connectionState: ref('connected') })
+    const run = h.api.startSessionBootstrap()
+    await vi.advanceTimersByTimeAsync(15_000)
+    expect(h.api.livePhase.value).toBe('degraded')
+    expect(h.closeLease).not.toHaveBeenCalled()
+    const manual = h.api.retryLive(true)
+    expect(h.api.retryBusy.value).toBe(true)
+    expect(h.openSessionRead).toHaveBeenCalledOnce()
+    h.api.dismissRecoveryNotice()
+    await vi.advanceTimersByTimeAsync(30_000)
+    expect(h.api.noticeDismissed.value).toBe(true)
+    expect(h.api.livePhase.value).toBe('degraded')
+    complete(LIVE_READY)
+    await Promise.all([run.live, manual])
+    expect(h.api.livePhase.value).toBe('ready')
+    expect(h.api.retryBusy.value).toBe(false)
+    h.api.cancelSessionBootstrap()
+    expect(vi.getTimerCount()).toBe(0)
+  })
+
+  it('keeps degradation and dismissal through automatic retries and socket replacement', async () => {
+    vi.useFakeTimers()
+    const failure = { ...LIVE_READY, authoritative: false, error: new SessionReadFailure('timeout', 'slow storage', true) }
+    const h = createBootstrap({
+      subscribeSession: async () => failure, reconcileSession: async () => failure,
+      connectionState: ref('connected'),
+    })
+    await h.api.startSessionBootstrap().live
+    h.api.dismissRecoveryNotice()
+    await vi.advanceTimersByTimeAsync(15_000)
+    const replacement = h.api.handleConnectionState('connected')
+    await replacement?.live
+    expect(h.api.livePhase.value).toBe('degraded')
+    expect(h.api.noticeDismissed.value).toBe(true)
+    await vi.advanceTimersByTimeAsync(60_000)
+    expect(h.api.livePhase.value).toBe('degraded')
+    expect(h.api.noticeDismissed.value).toBe(true)
+    h.api.cancelSessionBootstrap()
   })
 })

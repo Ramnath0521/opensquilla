@@ -2,9 +2,10 @@ import { beforeEach, describe, expect, it, vi } from 'vitest'
 
 import type { SessionInspection } from '@/modules/sessionInspection'
 import type { TurnCommands } from '@/modules/turnCommands'
-import type {
-  SessionReadHistoryPage,
-  SessionReadMessage,
+import {
+  SessionReadHistoryCursorError,
+  type SessionReadHistoryPage,
+  type SessionReadMessage,
 } from '@/modules/sessionReadLifecycle'
 import { abortInspectedSession, useSessionInspect } from './useSessionInspect'
 
@@ -61,6 +62,7 @@ const latest = vi.fn<SessionInspection['history']['latest']>()
 const before = vi.fn<SessionInspection['history']['before']>()
 const inspection: SessionInspection = {
   preview,
+  readExecutionLog: vi.fn(),
   history: { latest, before },
 }
 
@@ -111,6 +113,25 @@ describe('useSessionInspect canonical pagination', () => {
     expect(inspect.loadEarlierError.value).toBe(false)
     expect(inspect.messages.value.map(row => row.messageId)).toEqual(['m1', 'm2'])
     expect(before).toHaveBeenCalledTimes(2)
+  })
+
+  it('retries a rejected earlier cursor from latest', async () => {
+    latest
+      .mockResolvedValueOnce(page('m4', 'cursor-4', true))
+      .mockResolvedValueOnce(page('m9', 'cursor-9', false))
+    before.mockRejectedValueOnce(
+      new SessionReadHistoryCursorError('stale', 'cursor rejected'),
+    )
+    const inspect = useSessionInspect(inspection)
+
+    await inspect.load('agent:main:webchat:test')
+    await inspect.loadEarlier()
+    await inspect.retryHistory()
+
+    expect(before).toHaveBeenCalledTimes(1)
+    expect(latest).toHaveBeenCalledTimes(2)
+    expect(inspect.messages.value.map(message => message.messageId)).toEqual(['m9'])
+    expect(inspect.loadEarlierError.value).toBe(false)
   })
 
   it('does not advance an unavailable earlier page and retries the same cursor', async () => {
@@ -175,17 +196,15 @@ describe('useSessionInspect canonical pagination', () => {
     expect(inspect.oldestCursor.value).toBe('cursor-1')
   })
 
-  it('invokes the prepend hook immediately before applying the returned page', async () => {
+  it('preserves existing message identities when prepending a returned page', async () => {
     const inspect = useSessionInspect(inspection)
-    let visibleBeforeApply: string[] = []
 
     await inspect.load('agent:main:webchat:test')
-    await inspect.loadEarlier(() => {
-      visibleBeforeApply = inspect.messages.value.map(row => row.messageId ?? row.id)
-    })
+    const previousMessage = inspect.messages.value[0]
+    await inspect.loadEarlier()
 
-    expect(visibleBeforeApply).toEqual(['m2'])
     expect(inspect.messages.value.map(row => row.messageId)).toEqual(['m1', 'm2'])
+    expect(inspect.messages.value[1]).toBe(previousMessage)
   })
 
   it('fences a stale earlier page when switching sessions', async () => {

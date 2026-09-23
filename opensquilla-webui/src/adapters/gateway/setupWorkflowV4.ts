@@ -12,24 +12,35 @@ import type {
 } from '@/modules/setupWorkflow'
 import {
   SetupWorkflowError,
+  type RouterProviderConflict,
   type SetupWorkflowFailureReason,
 } from '@/modules/setupWorkflow'
 import { ONBOARDING_CATALOG_METHOD } from '@/contracts/generated/v4/onboardingCatalog'
 import { validateResult as validateOnboardingCatalogResult } from '@/contracts/generated/v4/onboardingCatalogValidators.mjs'
+import { validateOnboardingLlmProfileUpsertAndActivateParams } from '@/contracts/generated/v4/onboardingLlmProfileUpsertAndActivateValidators.mjs'
 import { setupContracts, type SetupContractDescriptor } from './platformSetupContracts'
 
 interface RpcTransport {
   request<T = unknown>(method: string, params?: Record<string, unknown>, options?: RpcCallOptions): Promise<T>
   ready?(options?: { timeoutMs?: number; signal?: AbortSignal }): Promise<void>
   supports?(method: string): boolean
+  readonly policy?: Readonly<Record<string, unknown>> | null
 }
 
-const options = (signal?: AbortSignal): RpcCallOptions => ({
-  timeoutMs: 20_000,
+const options = (
+  request?: SetupRequestOptions,
+  cancelOnAbort = false,
+): RpcCallOptions => ({
+  timeoutMs: request?.timeoutMs ?? 20_000,
   timeoutAction: 'reject',
   abortAction: 'reject',
-  ...(signal ? { signal } : {}),
+  ...(cancelOnAbort ? { cancelOnAbort: true } : {}),
+  ...(request?.signal ? { signal: request.signal } : {}),
 })
+
+const hasExplicitProbeMode = (command: { mode?: unknown }): boolean => (
+  command.mode === 'reachability' || command.mode === 'model'
+)
 
 const wireParams = (value: object): Record<string, unknown> => ({ ...value })
 
@@ -40,10 +51,23 @@ const object = (result: unknown, method: string): Record<string, unknown> => {
   return result as Record<string, unknown>
 }
 
-function mapSetupError(error: unknown): SetupWorkflowError {
+export function mapSetupError(error: unknown): SetupWorkflowError {
   if (error instanceof SetupWorkflowError) return error
   const failure = readTransportFailure(error)
   const wireCode = failure.code ?? ''
+  const routerConflict = wireCode === 'ROUTER_PROVIDER_CONFLICT'
+    || wireCode === 'onboarding.llmProfile.router_provider_conflict'
+  const details = failure.details && typeof failure.details === 'object' && !Array.isArray(failure.details)
+    ? failure.details as Record<string, unknown> : undefined
+  const routerDetails: RouterProviderConflict | undefined = routerConflict
+    && details?.reason === 'router_provider_conflict'
+    && typeof details.providerId === 'string'
+    && Array.isArray(details.conflictProviders)
+    && details.conflictProviders.every(value => typeof value === 'string')
+    && Array.isArray(details.allowedRouterActions)
+    && details.allowedRouterActions.every(value => typeof value === 'string')
+      ? details as unknown as RouterProviderConflict
+      : undefined
   const unsupported = wireCode === 'METHOD_NOT_FOUND'
     || /method.*not found|unknown method|not registered/i.test(failure.message)
   const code = unsupported
@@ -52,9 +76,9 @@ function mapSetupError(error: unknown): SetupWorkflowError {
       ? 'not-found'
       : wireCode === 'UNAUTHORIZED' || wireCode === 'FORBIDDEN'
         ? 'forbidden'
-        : wireCode.includes('CONFLICT')
+        : routerConflict || wireCode.includes('CONFLICT')
           ? 'conflict'
-          : wireCode.startsWith('INVALID_') || wireCode.endsWith('.invalid')
+          : wireCode === 'LLM_PROFILE_INVALID' || wireCode.startsWith('INVALID_') || wireCode.endsWith('.invalid')
             ? 'invalid'
             : 'unavailable'
   const reasons: Record<string, SetupWorkflowFailureReason> = {
@@ -63,7 +87,9 @@ function mapSetupError(error: unknown): SetupWorkflowError {
     'onboarding.search.invalid': 'search-invalid',
     'onboarding.imageGeneration.invalid': 'image-generation-invalid',
   }
-  return new SetupWorkflowError(code, failure.message, reasons[wireCode], error)
+  const reason = routerConflict ? 'router-provider-conflict'
+    : details?.reason === 'already_active' ? 'already-active' : reasons[wireCode]
+  return new SetupWorkflowError(code, failure.message, reason, error, routerDetails)
 }
 
 async function requestContract(
@@ -71,10 +97,11 @@ async function requestContract(
   contract: SetupContractDescriptor,
   params: Record<string, unknown> | undefined,
   request?: SetupRequestOptions,
+  cancelOnAbort = false,
 ): Promise<Record<string, unknown>> {
   let result: unknown
   try {
-    result = await rpc.request(contract.method, params, options(request?.signal))
+    result = await rpc.request(contract.method, params, options(request, cancelOnAbort))
   } catch (error) {
     throw mapSetupError(error)
   }
@@ -94,7 +121,13 @@ export function createV4SetupWorkflow(rpc: RpcTransport): SetupWorkflow {
       return requestContract(rpc, setupContracts.providerConfigure, wireParams(command), request)
     },
     probePrimary(command, request) {
-      return requestContract(rpc, setupContracts.providerProbe, wireParams(command), request)
+      return requestContract(
+        rpc,
+        setupContracts.providerProbe,
+        wireParams(command),
+        request,
+        hasExplicitProbeMode(command),
+      )
     },
     discoverPrimaryModels(command, request) {
       return requestContract(rpc, setupContracts.modelsDiscover, wireParams(command), request) as Promise<SetupDiscoveryResult>
@@ -111,14 +144,36 @@ export function createV4SetupWorkflow(rpc: RpcTransport): SetupWorkflow {
     upsertProfile(command, request) {
       return requestContract(rpc, setupContracts.profileUpsert, wireParams(command), request)
     },
+    upsertAndActivateProfile(command, request) {
+      if (rpc.supports?.(setupContracts.profileUpsertAndActivate.method) !== true) {
+        return Promise.reject(new SetupWorkflowError('unsupported', 'This Gateway does not support saving and activating a provider in one operation.'))
+      }
+      const params = wireParams(command)
+      if (!validateOnboardingLlmProfileUpsertAndActivateParams(params)) {
+        return Promise.reject(new SetupWorkflowError('invalid', 'Save-and-activate profile parameters violated Contract'))
+      }
+      return requestContract(rpc, setupContracts.profileUpsertAndActivate, params, request)
+    },
     activateProfile(command, request) {
       return requestContract(rpc, setupContracts.profileActivate, wireParams(command), request)
     },
     probeProfile(command, request) {
-      return requestContract(rpc, setupContracts.profileProbe, wireParams(command), request)
+      return requestContract(
+        rpc,
+        setupContracts.profileProbe,
+        wireParams(command),
+        request,
+        hasExplicitProbeMode(command),
+      )
     },
     probeDraftProfile(command, request) {
-      return requestContract(rpc, setupContracts.profileDraftProbe, wireParams(command), request) as Promise<SetupDiscoveryResult>
+      return requestContract(
+        rpc,
+        setupContracts.profileDraftProbe,
+        wireParams(command),
+        request,
+        hasExplicitProbeMode(command),
+      ) as Promise<SetupDiscoveryResult>
     },
     async discoverProfileModels(command, request) {
       try {
@@ -171,17 +226,27 @@ export function createV4SetupWorkflow(rpc: RpcTransport): SetupWorkflow {
       get profileLifecycle() {
         return rpc.supports?.(setupContracts.profileUpsert.method) !== false
       },
+      get profileUpsertAndActivate() {
+        return rpc.supports?.(setupContracts.profileUpsertAndActivate.method) === true
+      },
       get primaryProviderRemoval() {
         return rpc.supports?.(setupContracts.profileActiveRemove.method) !== false
       },
       get imageModelDiscovery() {
         return rpc.supports?.(setupContracts.imageModelsDiscover.method) !== false
       },
+      get providerProbeModes() {
+        const advertised = rpc.policy?.provider_probe_modes
+        return Array.isArray(advertised)
+          && advertised.every(value => typeof value === 'string')
+          && advertised.includes('reachability')
+          && advertised.includes('model')
+      },
     },
     async catalog(request) {
       let result: unknown
       try {
-        result = await rpc.request(ONBOARDING_CATALOG_METHOD, undefined, options(request?.signal))
+        result = await rpc.request(ONBOARDING_CATALOG_METHOD, undefined, options(request))
       } catch (error) {
         throw mapSetupError(error)
       }

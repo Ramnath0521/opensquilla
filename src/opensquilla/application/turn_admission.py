@@ -17,7 +17,6 @@ from opensquilla.application.turn_acceptance_ports import (
     AdmissionRoutingSnapshot,
 )
 from opensquilla.application.turn_input import (
-    DocumentTurnContext,
     IncomingTurnSource,
     MemoryCapturePolicy,
     PlanAdmissionContext,
@@ -25,7 +24,6 @@ from opensquilla.application.turn_input import (
 from opensquilla.session_key import canonicalize_session_key
 
 type TurnAdmissionSurface = Literal["webchat", "session"]
-type TurnSteerMode = Literal["durable", "legacy"]
 type InitialCollaborationMode = Literal["default", "plan"]
 type InitialRoutingMode = Literal["direct", "router", "ensemble"]
 
@@ -73,6 +71,7 @@ class AdmitTurnResult(TypedDict, total=False):
     surfaceId: str | None
     acceptedCollaboration: AcceptedCollaboration
     collaboration: AdmissionCollaborationSnapshot
+    acceptedModel: dict[str, str | None]
     acceptedRouting: AcceptedRouting
     routing: AdmissionRoutingSnapshot
 
@@ -149,16 +148,20 @@ class AdmitTurn:
     client_message_id: str | None = None
     surface_id: str | None = None
     attachments: tuple[dict[str, Any], ...] = ()
+    workspace_files: tuple[dict[str, Any], ...] = ()
+    selected_skills: tuple[dict[str, str], ...] = ()
     intent: str = "continue"
     intent_was_provided: bool = False
     fork_before_message_id: str | None = None
     workspace_id: str | None = None
-    prompt_annotation_ids: tuple[str, ...] = ()
-    document_context: DocumentTurnContext | None = None
+    page_context: dict[str, Any] | None = None
+    receipt_replay_only: bool = False
     display_text: str | None = None
     queue_mode: str | None = None
     initial_collaboration_mode: InitialCollaborationMode | None = None
     initial_routing_mode: InitialRoutingMode | None = None
+    initial_model: str | None = None
+    initial_provider: str | None = None
     pending_input: PendingInputGuard | None = None
 
     # Only internal Plan/background producers supply these controls. Gateway
@@ -181,7 +184,6 @@ class CancelTurn:
 class SteerTurn:
     session_key: str
     message: str
-    mode: TurnSteerMode
     expected_turn_id: str | None = None
     client_request_id: str | None = None
     client_message_id: str | None = None
@@ -289,5 +291,4 @@ __all__ = [
     "TurnIngressPort",
     "TurnAdmissionSurface",
     "TurnSteeringPort",
-    "TurnSteerMode",
 ]

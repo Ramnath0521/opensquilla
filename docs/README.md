@@ -23,6 +23,8 @@ root release README with task-oriented guides.
 ## Feature Guides
 
 - [`features.md`](features.md) - capability catalog.
+- [`plan-mode.md`](plan-mode.md) - investigation, versioned proposals, flexible
+  implementation, progress, cancellation and continuation.
 - [`features/squilla-router.md`](features/squilla-router.md) - model routing.
 - [`features/tui-frontend.md`](features/tui-frontend.md) - terminal backend
   architecture, plugin slots, Router HUD, and OpenTUI validation.
@@ -45,6 +47,7 @@ root release README with task-oriented guides.
 
 ## Surfaces and Operations
 
+- [`releases/0.5.5.md`](releases/0.5.5.md) - OpenSquilla 0.5.5 release notes.
 - [`releases/0.5.4.md`](releases/0.5.4.md) - OpenSquilla 0.5.4 release notes.
 - [`releases/0.5.3.md`](releases/0.5.3.md) - OpenSquilla 0.5.3 release notes.
 - [`releases/0.5.2.md`](releases/0.5.2.md) - OpenSquilla 0.5.2 release notes.
@@ -77,8 +80,6 @@ root release README with task-oriented guides.
   raw capture guidance, read-only turn replay, and developer replay benchmarks.
 - [`tui-real-terminal-harness.md`](tui-real-terminal-harness.md) - maintainer
   real-terminal TUI integration harness and evidence capture.
-- [`experiments.md`](experiments.md) - opt-in runtime toggle conventions and
-  the delivery-verification tooling in `scripts/experiments/`.
 - [`docker.md`](docker.md) - Docker/Compose deployment on home servers and
   NAS: prebuilt GHCR images, LAN exposure with token auth, and upgrades.
 - [`operations.md`](operations.md) - sessions, cron, usage, diagnostics,

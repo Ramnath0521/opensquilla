@@ -9,7 +9,7 @@ from pathlib import Path
 import pytest
 
 from opensquilla.session.models import SessionNode
-from opensquilla.session.storage import SCHEMA_VERSION, SessionStorage
+from opensquilla.session.storage import SCHEMA_VERSION, SessionStorage, StaleEpochError
 from opensquilla.session.usage_ledger import (
     UsageEventCompletion,
     UsageEventItem,
@@ -432,9 +432,12 @@ async def test_completed_range_query_uses_time_ordered_index_without_temp_sort(
         assert "USE TEMP B-TREE" not in details
 
         traced: list[str] = []
-        await storage.conn.set_trace_callback(traced.append)
-        await storage.query_usage_events(0, 1000, statuses=("finalized", "unknown"))
-        await storage.conn.set_trace_callback(None)
+        reader = storage._transcript_reader or storage.conn
+        await reader.set_trace_callback(traced.append)
+        try:
+            await storage.query_usage_events(0, 1000, statuses=("finalized", "unknown"))
+        finally:
+            await reader.set_trace_callback(None)
         select_sql = next(statement for statement in traced if "FROM usage_events" in statement)
         assert "INDEXED BY idx_usage_events_completed" in select_sql
     finally:
@@ -723,6 +726,41 @@ async def test_session_usage_ledger_reconciliation_is_absolute_and_idempotent(
             ("session-1", 0),
             ("session-1", 1),
         }
+    finally:
+        await storage.close()
+
+
+async def test_session_usage_reconciliation_rejects_same_epoch_replacement(
+    tmp_path: Path,
+) -> None:
+    storage = await SessionStorage.open(str(tmp_path / "sessions.db"))
+    key = "agent:main:webchat:reconcile-owner"
+    try:
+        await storage.upsert_session(
+            SessionNode(session_key=key, session_id="session-a", epoch=4)
+        )
+        await storage.upsert_session(
+            SessionNode(
+                session_key=key,
+                session_id="session-b",
+                epoch=4,
+                input_tokens=9,
+                output_tokens=3,
+                total_tokens=12,
+            )
+        )
+
+        with pytest.raises(StaleEpochError):
+            await storage.reconcile_session_usage_totals_from_ledger(
+                session_key=key,
+                expected_epoch=4,
+                expected_session_id="session-a",
+            )
+
+        current = await storage.get_session(key)
+        assert current is not None
+        assert current.session_id == "session-b"
+        assert (current.input_tokens, current.output_tokens, current.total_tokens) == (9, 3, 12)
     finally:
         await storage.close()
 

@@ -26,11 +26,9 @@ validate_candidate = MODULE["validate_candidate"]
 verify_queue = MODULE["verify_queue"]
 list_attestation_artifacts = MODULE["_list_attestation_artifacts"]
 plan_paths = MODULE["_plan_paths"]
-composition_is_safe = MODULE["_composition_is_safe"]
 changed_paths = MODULE["_changed_paths"]
 reconstructed_queue_tree = MODULE["_reconstructed_queue_tree"]
 verify_nightly_health = MODULE["verify_nightly_health"]
-wait_for_base_successful_ci = MODULE["_wait_for_base_successful_ci"]
 verify_queue_command = MODULE["_verify_queue_command"]
 
 
@@ -78,7 +76,7 @@ def test_artifact_redirect_rejects_non_https_target() -> None:
         _artifact_redirect("http://artifact-storage.example.invalid/attestation.zip")
 
 
-def test_verify_queue_details_default_combined_smoke_to_empty_json(
+def test_verify_queue_details_reject_invalid_context(
     tmp_path: Path,
 ) -> None:
     details: dict[str, object] = {}
@@ -96,7 +94,7 @@ def test_verify_queue_details_default_combined_smoke_to_empty_json(
     assert reusable is False
     assert reason == "not a merge_group event"
     assert source_run is None
-    assert details["combined_smoke_suites"] == "[]"
+    assert details["reason_code"] == "invalid_context"
 
 
 def test_verify_queue_command_emits_fail_closed_outputs(
@@ -110,7 +108,6 @@ def test_verify_queue_command_emits_fail_closed_outputs(
     def fake_verify_queue(**kwargs: Any) -> tuple[bool, str, int]:
         kwargs["details"].update(
             reason_code="reusable_exact",
-            combined_smoke_suites="[]",
             source_successful_suites='["workflow-lint"]',
             source_planner_digest="a" * 64,
             source_suite_execution_digests='{"workflow-lint":"b"}',
@@ -140,7 +137,7 @@ def test_verify_queue_command_emits_fail_closed_outputs(
     )
     assert outputs["reusable"] == "true"
     assert outputs["reason_code"] == "reusable_exact"
-    assert outputs["combined_smoke_suites"] == "[]"
+    assert "combined_smoke_suites" not in outputs
     assert "nightly_healthy" not in outputs
     assert "nightly_reason" not in outputs
 
@@ -610,6 +607,8 @@ def test_validate_candidate_rejects_non_green_or_mismatched_runs(tmp_path: Path)
         ("planner-digest", "planner digest"),
         ("execution-digest", "execution digest"),
         ("platform-matrix", "platform matrix"),
+        ("legacy-windows-matrix", "platform matrix"),
+        ("missing-contract-comparison", "platform matrix"),
     ),
 )
 def test_validate_candidate_rejects_independent_evidence_contract_mismatches(
@@ -645,6 +644,28 @@ def test_validate_candidate_rejects_independent_evidence_contract_mismatches(
     elif mismatch == "platform-matrix":
         assert tampered["platform_matrix"]
         tampered["platform_matrix"] = tampered["platform_matrix"][:-1]
+    elif mismatch == "legacy-windows-matrix":
+        cells = [
+            cell for cell in tampered["platform_matrix"]
+            if cell["suite"] != "windows-high-risk"
+        ]
+        cells.extend(
+            {"suite": "windows-high-risk", "os": "windows-latest", "shard": family}
+            for family in (
+                "core", "gateway-sqlite", "recovery-migration", "desktop-installer-contracts"
+            )
+        )
+        tampered["platform_matrix"] = sorted(
+            cells, key=lambda cell: (cell["suite"], cell["os"], cell["shard"])
+        )
+    elif mismatch == "missing-contract-comparison":
+        tampered["platform_matrix"] = [
+            cell for cell in tampered["platform_matrix"]
+            if not (
+                cell["suite"] == "frontend-validation"
+                and cell["shard"] == "contract-compare"
+            )
+        ]
     else:  # pragma: no cover - the parametrization is exhaustive
         raise AssertionError(f"unknown mismatch: {mismatch}")
 
@@ -700,6 +721,45 @@ def test_validate_candidate_rejects_self_reported_incomplete_suite_coverage(
             },
             repo=repo,
         )
+
+
+def test_exact_dependency_evidence_cannot_omit_native_acceptance_or_one_install_case(
+    tmp_path: Path,
+) -> None:
+    changed = "opensquilla-webui/package-lock.json"
+    repo, base_sha, head_sha, merge_sha = _merge_preview_repo(tmp_path, feature_path=changed)
+    event = _event(base_sha, head_sha, merge_sha)
+    evidence = create_attestation(
+        repo=repo, repository="opensquilla/opensquilla", event=event,
+        workflow_run_id=123, workflow_run_attempt=1,
+        workflow_ref="opensquilla/opensquilla/.github/workflows/ci.yml@refs/pull/42/merge",
+        optimization_mode="enforce", **_evidence_metadata(repo, [changed]),
+    )
+    suite = "windows-nsis-regression"
+    assert suite in evidence["successful_suites"]
+    assert len([c for c in evidence["platform_matrix"] if c["suite"] == suite]) == 17
+    arguments = {
+        "run": _run(evidence), "repository": "opensquilla/opensquilla",
+        "queue_tree_sha": str(evidence["tested_tree_sha"]), "queue_base_sha": base_sha,
+        "queue_policy_digest": str(evidence["trust_policy_digest"]),
+        "current_pull_request": {"number": 42, **event["pull_request"]}, "repo": repo,
+    }
+    validate_candidate(attestation=evidence, **arguments)
+    for mutation in ("omitted-suite", "omitted-fresh", "changed-execution"):
+        tampered = json.loads(json.dumps(evidence))
+        if mutation == "omitted-suite":
+            tampered["successful_suites"].remove(suite)
+            del tampered["suite_execution_digests"][suite]
+            tampered["platform_matrix"] = [c for c in tampered["platform_matrix"]
+                                            if c["suite"] != suite]
+        elif mutation == "omitted-fresh":
+            tampered["platform_matrix"] = [c for c in tampered["platform_matrix"]
+                                            if not (c["suite"] == suite
+                                                    and c["shard"] == "fresh-custom-fresh")]
+        else:
+            tampered["suite_execution_digests"][suite] = "f" * 64
+        with pytest.raises(AttestationError):
+            validate_candidate(attestation=tampered, **arguments)
 
 
 def test_validate_candidate_rejects_expired_root_evidence(tmp_path: Path) -> None:
@@ -914,139 +974,6 @@ def _composition_fixture(
     return repo, attestation, queue_base
 
 
-def test_base_advance_composition_has_no_overlap_trust_root() -> None:
-    assert MODULE["COMPOSITION_COMBINED_SMOKE_TRUST_ROOT"] == frozenset()
-
-
-def test_base_advance_composition_accepts_disjoint_risk_domains(tmp_path: Path) -> None:
-    repo, attestation, queue_base = _composition_fixture(
-        tmp_path, base_delta_path="docs/queue.md"
-    )
-
-    safe, reason, combined_smoke_suites = composition_is_safe(
-        repo=repo, attestation=attestation, queue_base_sha=queue_base
-    )
-
-    assert safe is True
-    assert "disjoint" in reason
-    assert combined_smoke_suites == ()
-
-
-def test_base_advance_composition_accepts_disjoint_source_code_domains(
-    tmp_path: Path,
-) -> None:
-    repo, attestation, queue_base = _composition_fixture(
-        tmp_path,
-        source_path="opensquilla-webui/src/components/example.ts",
-        base_delta_path="src/opensquilla/provider/base.py",
-    )
-
-    safe, reason, combined_smoke_suites = composition_is_safe(
-        repo=repo, attestation=attestation, queue_base_sha=queue_base
-    )
-
-    assert safe is True
-    assert "disjoint" in reason
-    assert combined_smoke_suites == ()
-
-
-def test_base_advance_composition_rejects_python_targeted_overlap(
-    tmp_path: Path,
-) -> None:
-    repo, attestation, queue_base = _composition_fixture(
-        tmp_path, base_delta_path="src/opensquilla/provider/base.py"
-    )
-
-    safe, reason, combined_smoke_suites = composition_is_safe(
-        repo=repo, attestation=attestation, queue_base_sha=queue_base
-    )
-
-    assert safe is False
-    assert reason == "base delta overlaps unsupported source suites: python-targeted"
-    assert combined_smoke_suites == ()
-
-
-@pytest.mark.parametrize(
-    ("source_path", "base_delta_path", "unsupported_suite"),
-    [
-        (
-            "src/opensquilla/engine/runtime.py",
-            "src/opensquilla/engine/agent.py",
-            "python-full",
-        ),
-        (
-            "src/opensquilla/sandbox/windows_backend.py",
-            "src/opensquilla/sandbox/windows_policy.py",
-            "windows-high-risk",
-        ),
-        (
-            "opensquilla-webui/src/components/FeaturePanel.vue",
-            "opensquilla-webui/src/components/BasePanel.vue",
-            "frontend",
-        ),
-        (
-            "desktop/electron/scripts/test-native-workbench-a.mjs",
-            "desktop/electron/scripts/test-native-workbench-b.mjs",
-            "desktop-recovery-e2e",
-        ),
-    ],
-)
-def test_base_advance_composition_rejects_unsupported_overlapping_risk_domains(
-    tmp_path: Path,
-    source_path: str,
-    base_delta_path: str,
-    unsupported_suite: str,
-) -> None:
-    repo, attestation, queue_base = _composition_fixture(
-        tmp_path,
-        source_path=source_path,
-        base_delta_path=base_delta_path,
-    )
-
-    safe, reason, combined_smoke_suites = composition_is_safe(
-        repo=repo, attestation=attestation, queue_base_sha=queue_base
-    )
-
-    assert safe is False
-    assert "unsupported" in reason
-    assert unsupported_suite in reason
-    assert combined_smoke_suites == ()
-
-
-def test_base_advance_composition_rejects_source_execution_input_drift(
-    tmp_path: Path,
-) -> None:
-    repo, attestation, queue_base = _composition_fixture(
-        tmp_path, base_delta_path="scripts/build_wheelhouse_zip.py"
-    )
-
-    safe, reason, combined_smoke_suites = composition_is_safe(
-        repo=repo, attestation=attestation, queue_base_sha=queue_base
-    )
-
-    assert safe is False
-    assert "execution inputs" in reason
-    assert combined_smoke_suites == ()
-
-
-def test_base_advance_composition_rejects_baseline_execution_input_drift(
-    tmp_path: Path,
-) -> None:
-    repo, attestation, queue_base = _composition_fixture(
-        tmp_path,
-        source_path="docs/feature.md",
-        base_delta_path="README.md",
-    )
-
-    safe, reason, combined_smoke_suites = composition_is_safe(
-        repo=repo, attestation=attestation, queue_base_sha=queue_base
-    )
-
-    assert safe is False
-    assert reason == "base delta changed source suite execution inputs: readme-locale"
-    assert combined_smoke_suites == ()
-
-
 def _verify_composed_fixture(
     *,
     repo: Path,
@@ -1080,17 +1007,6 @@ def _verify_composed_fixture(
             return current_pr
         if "actions/workflows/ci.yml/runs" in url:
             return {"workflow_runs": [run]}
-        if "/actions/runs?" in url:
-            return {
-                "workflow_runs": [
-                    {
-                        "path": ".github/workflows/ci.yml",
-                        "status": "completed",
-                        "conclusion": "success",
-                        "head_sha": queue_base,
-                    }
-                ]
-            }
         if url.endswith("/actions/runs/123"):
             return run
         raise AssertionError(f"unexpected API request: {url}")
@@ -1107,16 +1023,6 @@ def _verify_composed_fixture(
         lambda **_kwargs: pytest.fail(
             "queue verification must not inspect nightly health"
         ),
-    )
-    monkeypatch.setitem(
-        verify_queue.__globals__,
-        "_wait_for_base_successful_ci",
-        lambda **_kwargs: pytest.fail("queue verification must not compose base evidence"),
-    )
-    monkeypatch.setitem(
-        verify_queue.__globals__,
-        "_composition_is_safe",
-        lambda **_kwargs: pytest.fail("queue verification must not compose evidence"),
     )
     details: dict[str, object] = {}
     reusable, reason, source_run = verify_queue(
@@ -1149,7 +1055,6 @@ def test_verify_queue_rejects_composed_python_evidence(
     assert reusable is False
     assert "only exact-tree pull request evidence" in reason
     assert source_run is None
-    assert details["combined_smoke_suites"] == "[]"
 
 
 def test_verify_queue_rejects_disjoint_base_advance_composition(
@@ -1170,7 +1075,6 @@ def test_verify_queue_rejects_disjoint_base_advance_composition(
     assert reusable is False
     assert "only exact-tree pull request evidence" in reason
     assert source_run is None
-    assert details["combined_smoke_suites"] == "[]"
 
 
 def test_verify_queue_rejects_composed_full_python_evidence(
@@ -1193,7 +1097,6 @@ def test_verify_queue_rejects_composed_full_python_evidence(
     assert reusable is False
     assert "only exact-tree pull request evidence" in reason
     assert source_run is None
-    assert details["combined_smoke_suites"] == "[]"
 
 
 def test_squash_binding_reconstructs_the_tested_tree(tmp_path: Path) -> None:
@@ -1202,6 +1105,122 @@ def test_squash_binding_reconstructs_the_tested_tree(tmp_path: Path) -> None:
     assert reconstructed_queue_tree(
         repo, queue_base_sha=base_sha, head_sha=head_sha
     ) == _git(repo, "rev-parse", "HEAD^{tree}")
+
+
+def test_validate_candidate_rejects_retired_composed_mode(tmp_path: Path) -> None:
+    repo, attestation, queue_base = _composition_fixture(
+        tmp_path, base_delta_path="docs/queue.md"
+    )
+    queue_tree = _git(repo, "rev-parse", "HEAD^{tree}")
+
+    with pytest.raises(AttestationError, match="evidence match kind is invalid"):
+        validate_candidate(
+            attestation=attestation,
+            run=_run(attestation),
+            repository="opensquilla/opensquilla",
+            queue_tree_sha=queue_tree,
+            queue_base_sha=queue_base,
+            queue_policy_digest=str(attestation["trust_policy_digest"]),
+            match_kind="composed",
+            reconstructed_queue_tree=queue_tree,
+        )
+
+
+@pytest.mark.parametrize("source_path,suite", [
+    ("opensquilla-webui/src/components/example.ts", "frontend-validation"),
+    ("src/opensquilla/cli/tui/opentui/package/src/example.mjs", "tui"),
+])
+def test_queue_reuses_unchanged_suite_and_requires_remaining_full_matrix(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, source_path: str, suite: str,
+) -> None:
+    repo, evidence, queue_base = _composition_fixture(
+        tmp_path, source_path=source_path, base_delta_path="docs/queue.md",
+    )
+    exact, _, source_run, details = _verify_composed_fixture(
+        repo=repo, attestation=evidence, queue_base=queue_base, monkeypatch=monkeypatch,
+    )
+    assert exact is False  # Partial proof must NEVER enter the exact fast path.
+    assert source_run == 123
+    assert details["partial"] == "true"
+    plan = json.loads(str(details["partial_plan"]))
+    assert plan["reused_suites"] == [suite]
+    full = MODULE["_plan_paths"](repo, [".ci/run-all"])
+    assert set(plan["required_suites"]) | {suite} == set(full["required_suites"])
+    assert suite not in plan["required_suites"]
+    assert "frontend-artifact" in plan["required_suites"]
+    assert "windows-high-risk" in plan["required_suites"]
+    assert "windows-nsis-regression" in plan["required_suites"]
+    assert plan["python_matrix"] == full["python_matrix"]
+    assert plan["desktop_matrix"] == full["desktop_matrix"]
+    assert plan["platform_matrix"] == [c for c in full["platform_matrix"] if c["suite"] != suite]
+
+
+@pytest.mark.parametrize("delta", [
+    "opensquilla-webui/src/changed.ts", "opensquilla-webui/package-lock.json",
+    "src/opensquilla/contracts/adapters/example.py", "src/opensquilla/__init__.py",
+    "scripts/contracts/example.py", "tests/contracts/example.py",
+    "uv.lock", "pyproject.toml", "unknown-ci-input.dat",
+])
+def test_partial_frontend_reuse_rejects_changed_inputs_or_unknown_delta(
+    tmp_path: Path, delta: str,
+) -> None:
+    repo, evidence, base = _composition_fixture(
+        tmp_path, source_path="opensquilla-webui/src/components/example.ts",
+        base_delta_path=delta,
+    )
+    with pytest.raises(AttestationError):
+        MODULE["partial_queue_plan"](repo=repo, attestation=evidence, queue_base_sha=base)
+
+
+def test_partial_reuse_requires_all_platforms_and_rejects_stale_proof(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    repo, evidence, base = _composition_fixture(
+        tmp_path, source_path="opensquilla-webui/src/components/example.ts",
+        base_delta_path="docs/queue.md",
+    )
+    incomplete = dict(evidence)
+    incomplete["platform_matrix"] = [
+        c for c in evidence["platform_matrix"]
+        if not (c["suite"] == "frontend-validation" and c["os"] == "windows-latest")
+    ]
+    with pytest.raises(AttestationError):
+        MODULE["partial_queue_plan"](repo=repo, attestation=incomplete, queue_base_sha=base)
+    evidence["root_issued_at"] = "2000-01-01T00:00:00Z"
+    exact, _, source, details = _verify_composed_fixture(
+        repo=repo, attestation=evidence, queue_base=base, monkeypatch=monkeypatch,
+    )
+    assert not exact and source is None
+    assert details["partial"] == "false"
+    assert details["partial_plan"] == ""
+
+
+@pytest.mark.parametrize("delta,expected", [
+    ("docs/queue.md", ["frontend-validation", "tui"]),
+    ("opensquilla-webui/src/components/base.ts", ["tui"]),
+    ("src/opensquilla/cli/tui/opentui/package/src/base.mjs", ["frontend-validation"]),
+])
+def test_partial_queue_supplements_only_invalidated_allowlisted_suites(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, delta: str, expected: list[str],
+) -> None:
+    repo, evidence, base = _composition_fixture(
+        tmp_path, source_path=".ci/run-all", base_delta_path=delta,
+    )
+    exact, _, source, details = _verify_composed_fixture(
+        repo=repo, attestation=evidence, queue_base=base, monkeypatch=monkeypatch,
+    )
+    assert exact is False and source == 123
+    assert details["partial"] == "true"
+    plan = json.loads(str(details["partial_plan"]))
+    assert plan["reused_suites"] == expected
+    assert set(plan["required_suites"]) & set(expected) == set()
+    # Even complete successful native PR evidence must rerun on an advanced tree.
+    assert "windows-nsis-regression" in evidence["successful_suites"]
+    assert "windows-nsis-regression" not in plan["reused_suites"]
+    assert "windows-nsis-regression" in plan["required_suites"]
+    native_cells = [c for c in plan["platform_matrix"]
+                    if c["suite"] == "windows-nsis-regression"]
+    assert len(native_cells) == 17
 
 
 @pytest.mark.parametrize(
@@ -1292,7 +1311,6 @@ def test_verify_queue_reuses_only_exact_trusted_evidence_without_nightly(
     assert details["reason_code"] == "reusable_exact"
     assert details["candidate_count"] == 1
     assert details["artifact_name"].startswith("ci-evidence-v2-tree-")
-    assert details["combined_smoke_suites"] == "[]"
     assert json.loads(str(details["source_successful_suites"])) == attestation[
         "successful_suites"
     ]
@@ -1552,36 +1570,6 @@ def test_artifact_listing_fails_closed_at_candidate_limit(
             encoded_name="ci-attestation-tree",
             token="synthetic-token",
         )
-
-
-def test_base_evidence_wait_is_bounded_and_observes_predecessor(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    results = iter((False, False, True))
-    sleeps: list[int] = []
-    monkeypatch.setitem(
-        wait_for_base_successful_ci.__globals__,
-        "BASE_CI_VISIBILITY_DELAYS",
-        (0, 1, 3),
-    )
-    monkeypatch.setitem(
-        wait_for_base_successful_ci.__globals__,
-        "_base_has_successful_ci",
-        lambda **_kwargs: next(results),
-    )
-    monkeypatch.setitem(
-        wait_for_base_successful_ci.__globals__,
-        "time",
-        type("Clock", (), {"sleep": staticmethod(sleeps.append)}),
-    )
-
-    assert wait_for_base_successful_ci(
-        api_url="https://api.github.com",
-        repository="opensquilla/opensquilla",
-        token="synthetic-token",
-        queue_base_sha="a" * 40,
-    )
-    assert sleeps == [1, 2]
 
 
 def test_nightly_health_requires_fresh_authoritative_full_coverage(

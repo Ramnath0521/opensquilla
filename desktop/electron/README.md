@@ -33,9 +33,46 @@ packaging. Both directories are generated and ignored by Git. Local Desktop
 packaging consumes the source-owned artifact and verifies it before PyInstaller
 runs.
 
-On first run, the shell opens a setup window for provider, model, base URL, and
-API key. The key is encrypted with Electron `safeStorage` when available, and a
-desktop-specific gateway config is written under Electron `userData`.
+Desktop TypeScript uses Node 24 definitions to match Electron's embedded Node
+runtime. The Node.js version used to run build scripts is a separate requirement.
+Playwright stays on the 1.60 line while Electron 42 is supported: the hidden
+browser reload viewport check fails with Playwright 1.63 on Electron 42. Upgrade
+that pair only after the existing native viewport and rendering checks pass.
+
+On first run, the shell starts the client and Gateway with an explicitly
+unconfigured model profile, then offers a non-modal setup window. **Set up later**
+and the window close button leave the client running; later launches go straight
+to the client. The chat composer offers a shortcut to provider settings while
+the Gateway reports that the model is not configured.
+
+Saving setup validates local fields without requiring a network connection or
+a successful provider test. **Test connection (optional)** reports connectivity
+separately and does not prevent saving or leaving setup. Credentials use Electron
+`safeStorage` when available, and the profile lives under Electron `userData`.
+Only TokenRhythm and OpenRouter supply a first-run model preset; other providers
+require an explicit model choice. The local Gateway restarts after setup is saved
+to apply the new configuration.
+
+`npm run test:onboarding-flow` exercises the native invitation, optional probe
+failures, dismissal, and restart. `npm run test:onboarding-first-chat` exercises
+an empty first run through Settings to a real Gateway chat against a local model
+fixture. Both use isolated profiles and synthetic credentials. Set
+`OPENSQUILLA_DESKTOP_FIRST_CHAT_OUTPUT_DIR` to retain first-chat screenshots and
+its JSON report.
+
+Router support and default tiers come from the backend provider catalog and
+preset registry. After changing them, regenerate the checked-in offline catalog
+from the repository root:
+
+```bash
+uv run python scripts/generate_desktop_router_catalog.py --write
+uv run python scripts/generate_desktop_router_catalog.py --check
+```
+
+The Desktop build reads `src/generated/desktop-router-catalog.ts` without running
+Python. CI checks that it matches the backend and that the compiled Desktop
+serializer produces the same Gateway routes. Conflicting routing selections are
+rejected; saved routing conflicts expose the boot page's **Reset setup** action.
 
 The shell looks for the checkout root automatically. To point it at a different
 checkout:
@@ -68,25 +105,35 @@ This builds the shared Vue browser/Desktop artifact, bundles the gateway with
 PyInstaller, removes its staged duplicate UI copy, and emits desktop artifacts
 for the current platform under `dist/desktop-electron/`.
 
-For a faster rebuild after the runtime already exists:
+`npm run pack` (unpacked directory) and `npm run dist` (installer) both build
+the WebUI and Gateway before packaging. The `:local` names are compatibility aliases.
+For a faster Electron-only rebuild after a successful Gateway build:
 
 ```bash
 cd desktop/electron
-npm run build:web
-npm run dist
+npm run dist:prepared
 ```
+
+The internal `pack:prepared` / `dist:prepared` entries reject missing or stale
+Gateway build records and changed runtime files before electron-builder runs.
+Changes to Python sources, migrations, Router resources, the built WebUI, dependency
+locks, or the Gateway build recipe require a new full build. Final package verification
+also checks every migration ID/content and the Router manifest's SHA256 values.
+Release CI builds the Gateway once, verifies prepared outputs, then signs and packages
+them; final signature checks remain separate from resource checks.
 
 ## Windows Release Signing
 
-Windows release builds are currently unsigned. The release workflow builds the
-NSIS installer with electron-builder and uploads the unsigned `.exe`,
-`.blockmap`, and `latest.yml` artifacts together so updater metadata matches
-the exact installer bytes.
+The release workflow signs new Windows builds through DigiCert KeyLocker. It
+uses the protected `windows-code-signing` environment for manually
+dispatched test artifacts and `v*` release tags. Missing credentials, signing
+failures, and signature-policy mismatches fail the Windows build.
 
-Do not sign the `.exe` after `latest.yml` is emitted; that changes the
-installer bytes and invalidates the updater hash. If Windows code signing is
-enabled later, it must run inside the release build before updater metadata,
-blockmaps, and `SHA256SUMS` are finalized. See
+Signing runs inside electron-builder before updater metadata, blockmaps, and
+`SHA256SUMS` are finalized, so those files describe the signed installer bytes.
+The expected public certificate identity and timestamp endpoint are defined in
+`.github/signing/windows-signing-policy.json`; credentials remain GitHub
+environment secrets. See
 [`docs/code-signing-policy.md`](../../docs/code-signing-policy.md) for the
 current policy.
 

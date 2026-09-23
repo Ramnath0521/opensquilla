@@ -9,6 +9,7 @@ from types import SimpleNamespace
 import pytest
 
 from scripts import live_long_task_case_driver as driver
+from scripts import live_long_task_release_gate as gate
 from scripts.long_task_fault_proxy import (
     DeterministicFaultProxy,
     FaultRequestRecord,
@@ -162,17 +163,23 @@ def test_long_reasoning_is_executed_through_real_browser_path(
     assert calls == ["write_config", "start", "browser", "cleanup"]
 
 
-def test_tool_compaction_reserves_provider_tool_followup_and_summary_legs(
+@pytest.mark.parametrize(
+    ("scenario", "physical_requests"),
+    [("tool_compaction", 2), ("fault_429_retry_after", 1)],
+)
+def test_case_reserves_required_provider_followup_and_summary_legs(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    scenario: str,
+    physical_requests: int,
 ) -> None:
     directory = _case_directory(tmp_path)
     path = _write_case(
         directory,
         _case_payload(
-            scenario="tool_compaction",
+            scenario=scenario,
             model="deepseek-v4-pro",
-            physical_requests=2,
+            physical_requests=physical_requests,
         ),
     )
     monkeypatch.setenv("DEEPSEEK_API_KEY", "synthetic-not-a-real-key")
@@ -285,6 +292,163 @@ def test_gateway_config_contains_env_names_but_not_credential_values(
     assert 'api_key_env = "TOKENRHYTHM_API_KEY"' in rendered
     assert "http://127.0.0.1:12345/v1" in rendered
     assert "enabled = true" in rendered
+
+
+@pytest.fixture
+def startup_gateway():
+    case = driver.LiveCase(
+        case_id="deepseek-startup-synthetic-1", provider="deepseek",
+        model="deepseek-v4-flash", scenario="direct", repeat_index=1,
+        fallback_provider=None,
+        remaining_budget=driver.CaseBudget(60_000, 1, 1, 1_000),
+    )
+    gateway = driver.GatewayProcess(case, secret_values=())
+    yield gateway
+    # The failure-path tests use a synthetic process, never an OS PID.
+    gateway.proc = None
+    gateway.cleanup()
+    assert not gateway.root.exists()
+
+
+def test_gateway_restart_keeps_the_first_launch_port(
+    startup_gateway, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    gateway = startup_gateway
+    launch_ports: list[int] = []
+
+    def launch(command, **_kwargs):
+        launch_ports.append(int(command[command.index("--port") + 1]))
+        return SimpleNamespace(poll=lambda: 17)
+
+    monkeypatch.setattr(driver.subprocess, "Popen", launch)
+    with pytest.raises(driver.DriverConfigurationError):
+        gateway.start()
+    gateway.stop()
+    with pytest.raises(driver.DriverConfigurationError):
+        gateway.restart(force=True)
+
+    assert len(launch_ports) == 2
+    assert launch_ports[0] > 0
+    assert launch_ports[1] == launch_ports[0]
+
+
+@pytest.mark.parametrize("exit_code", [17, None])
+@pytest.mark.parametrize("prefix", [
+    "", "2026-09-18T13:00:00+00:00 [INFO] opensquilla.gateway.boot: ",
+])
+def test_gateway_startup_failure_keeps_safe_phase_evidence(
+    startup_gateway, monkeypatch: pytest.MonkeyPatch, exit_code: int | None, prefix: str,
+) -> None:
+    gateway = startup_gateway
+    secret = "synthetic-secret-must-never-appear"
+    phase = {
+        "event": "gateway.startup_phase", "phase": "services", "status": "ready",
+        "duration_ms": 12, "startup_elapsed_ms": 34,
+        "message": secret, "path": str(gateway.root),
+    }
+
+    def launch(*_args, **_kwargs):
+        (gateway.root / "gateway.stdout.log").write_text(prefix + json.dumps(phase) + "\n")
+        return SimpleNamespace(poll=lambda: exit_code)
+
+    now = [0.0]
+
+    def advance(seconds):
+        now[0] += seconds
+
+    def unavailable(*_args, **_kwargs):
+        raise driver.urllib.error.HTTPError(secret, 503, secret, {}, None)
+
+    monkeypatch.setattr(driver.subprocess, "Popen", launch)
+    monkeypatch.setattr(driver, "time", SimpleNamespace(monotonic=lambda: now[0], sleep=advance))
+    monkeypatch.setattr(driver.urllib.request, "urlopen", unavailable)
+    with pytest.raises(driver.DriverConfigurationError) as caught:
+        gateway.start()
+    message = str(caught.value)
+    assert secret not in message
+    assert str(gateway.root) not in message
+    evidence = json.loads(message.split("; startup=", 1)[1])
+    assert evidence == {
+        "elapsed_ms": 0 if exit_code is not None else 45_000,
+        "exit_code": exit_code,
+        "last_health_status": None if exit_code is not None else 503,
+        "phases": {"services": {
+            "status": "ready", "duration_ms": 12, "startup_elapsed_ms": 34,
+        }},
+    }
+
+
+@pytest.mark.parametrize("log_name", ["gateway.stdout.log", "gateway.stderr.log"])
+def test_gateway_startup_failure_excludes_previous_attempt_phases(
+    startup_gateway, monkeypatch: pytest.MonkeyPatch, log_name: str,
+) -> None:
+    gateway = startup_gateway
+    previous = {
+        "event": "gateway.startup_phase", "phase": "gateway_ready", "status": "ready",
+        "duration_ms": 12, "startup_elapsed_ms": 34_000,
+    }
+    current = {
+        **previous, "phase": "config", "duration_ms": 3, "startup_elapsed_ms": 4,
+    }
+    log = gateway.root / log_name
+    log.write_text(json.dumps(previous) + "\n", encoding="utf-8")
+
+    def launch(*_args, **_kwargs):
+        with log.open("a", encoding="utf-8") as stream:
+            stream.write(json.dumps(current) + "\n")
+        return SimpleNamespace(poll=lambda: 17)
+
+    monkeypatch.setattr(driver.subprocess, "Popen", launch)
+    with pytest.raises(driver.DriverConfigurationError) as caught:
+        gateway.start()
+
+    evidence = json.loads(str(caught.value).split("; startup=", 1)[1])
+    assert evidence["exit_code"] == 17
+    assert evidence["phases"] == {
+        "config": {"status": "ready", "duration_ms": 3, "startup_elapsed_ms": 4},
+    }
+    # Both attempts remain available for the mandatory secret scan in cleanup.
+    assert [json.loads(line) for line in log.read_text(encoding="utf-8").splitlines()] == [
+        previous, current,
+    ]
+
+
+def test_gateway_startup_diagnostics_bound_and_filter_raw_logs(startup_gateway) -> None:
+    gateway = startup_gateway
+    valid = {
+        "event": "gateway.startup_phase", "phase": "services", "status": "ready",
+        "duration_ms": 12, "startup_elapsed_ms": 34,
+    }
+    hostile = [
+        {**valid, "phase": "arbitrary-secret-phase"},
+        {**valid, "status": "arbitrary-secret-status"},
+        {**valid, "phase": ["services"]},
+        {**valid, "duration_ms": "secret-duration"},
+        {**valid, "duration_ms": True},
+        {**valid, "duration_ms": -1},
+        {**valid, "startup_elapsed_ms": 3_600_001},
+        {**valid, "event": "arbitrary-secret-event"},
+    ]
+    log = gateway.root / "gateway.stdout.log"
+    log.write_text(
+        json.dumps({**valid, "phase": "config"}) + "\n"
+        + "padding" * driver._STARTUP_LOG_TAIL_BYTES + "\n"
+        + "not-json\n[1,2,3]\n"
+        + "\n".join(json.dumps(record) for record in [valid, *hostile]),
+    )
+    error = gateway._startup_failure("Gateway did not become healthy", driver.time.monotonic(),
+                                     None, None)
+    evidence = json.loads(str(error).split("; startup=", 1)[1])
+    assert evidence["phases"] == {"services": {
+        "status": "ready", "duration_ms": 12, "startup_elapsed_ms": 34,
+    }}
+    assert "secret" not in str(error)
+    assert len(str(error)) < 400
+    log.unlink()
+    # Missing logs must preserve the original startup failure, not replace it.
+    error = gateway._startup_failure("Gateway exited during startup", driver.time.monotonic(),
+                                     1, None)
+    assert json.loads(str(error).split("; startup=", 1)[1])["phases"] == {}
 
 
 def test_gateway_cleanup_retries_transient_windows_file_handle_failure(
@@ -969,6 +1133,26 @@ def test_fault_429_case_proves_retry_after_was_not_violated(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setenv("DEEPSEEK_API_KEY", "synthetic-not-a-real-key")
+    request_records: list[FaultRequestRecord] = []
+    gateways: list[driver.GatewayProcess] = []
+
+    class ObservedGateway(driver.GatewayProcess):
+        def __init__(self, *args, **kwargs) -> None:
+            super().__init__(*args, **kwargs)
+            gateways.append(self)
+
+    class ObservedFaultProxy(DeterministicFaultProxy):
+        def __init__(self, *args, **kwargs) -> None:
+            # Reproduce kernel reuse of any port selected before the proxy
+            # binds. Its /health is also 200, but its /ws must never be used.
+            super().__init__(*args, port=gateways[-1].port, **kwargs)
+
+        def close(self) -> None:
+            request_records.extend(self.records)
+            super().close()
+
+    monkeypatch.setattr(driver, "GatewayProcess", ObservedGateway)
+    monkeypatch.setattr(driver, "DeterministicFaultProxy", ObservedFaultProxy)
     case = driver.LiveCase(
         case_id="deepseek-fault-429-retry-after-synthetic-1",
         provider="deepseek",
@@ -986,11 +1170,32 @@ def test_fault_429_case_proves_retry_after_was_not_violated(
 
     result, exit_code = driver.execute_case(case)
 
-    assert exit_code == driver.EXIT_PASSED
+    assert exit_code == driver.EXIT_PASSED, json.dumps(result, sort_keys=True)
     assert result["status"] == "passed"
-    assert result["physical_requests"] == 1
-    assert result["counts"]["retry_legs"] == 0
-    assert result["counts"]["accounted_provider_legs"] == 1
+    assert result["physical_requests"] == 2
+    assert result["counts"]["retry_legs"] >= 1
+    assert result["counts"]["accounted_provider_legs"] == 2
+    assert [record.scenario for record in request_records] == [
+        FaultScenario.RATE_LIMITED.value,
+        FaultScenario.OK.value,
+    ]
+    # The synthetic server emits Retry-After: 8. Prove spacing at the real
+    # HTTP boundary, without replacing sleep or trusting activity labels.
+    assert (
+        request_records[1].received_monotonic_ns - request_records[0].received_monotonic_ns
+    ) >= 8_000_000_000
+    assert result["counts"]["retry_after_honored"] == 1
+    assert result["metrics"]["retry_wait_ms"] >= 8_000
+    gate.validate_scenario_evidence(
+        gate.CaseSpec(
+            case_id=case.case_id,
+            provider=case.provider,
+            model=case.model,
+            scenario=case.scenario,
+            repeat_index=case.repeat_index,
+        ),
+        gate.parse_driver_result(result, driver_exit_code=exit_code),
+    )
 
 
 @pytest.mark.ci_serial

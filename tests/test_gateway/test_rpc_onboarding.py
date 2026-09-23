@@ -187,9 +187,9 @@ async def test_provider_configure_can_omit_model_for_router_profile(tmp_path, mo
         _admin_ctx(),
     )
     assert res.error is None, res.error
-    assert res.payload["entry"]["model"] == "deepseek-v4-flash"
+    assert res.payload["entry"]["model"] == "deepseek-flash"
     data = tomllib.loads((tmp_path / "c.toml").read_text())
-    assert data["llm"]["model"] == "deepseek-v4-flash"
+    assert data["llm"]["model"] == "deepseek-flash"
     assert data["squilla_router"]["tier_profile"] == "deepseek"
 
 
@@ -253,6 +253,8 @@ async def test_router_configure_accepts_tier_overrides_without_rebinding_direct_
     persisted = tomllib.loads((tmp_path / "c.toml").read_text())
     assert persisted["llm"]["model"] == "gpt-5.4-mini"
     assert persisted["squilla_router"]["tiers"]["c2"]["model"] == "gpt-5.5-custom"
+    assert "supports_image" not in persisted["squilla_router"]["tiers"]["c2"]
+    assert "supports_image" not in ctx.config.squilla_router.tiers["c2"]
     assert persisted["squilla_router"]["tiers"]["image_model"]["supports_image"] is True
 
 

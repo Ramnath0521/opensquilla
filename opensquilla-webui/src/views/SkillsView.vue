@@ -39,7 +39,7 @@
 
     <Transition name="modal">
       <div v-if="skillsOverviewOpen" class="sk-overview-modal" role="dialog" aria-modal="true" aria-labelledby="skills-overview-title" @click.self="skillsOverviewOpen = false">
-        <section class="sk-overview-modal__panel">
+        <section ref="skillsOverviewPanelRef" class="sk-overview-modal__panel">
           <header class="sk-overview-modal__head">
             <div><span class="sk-overview-modal__eyebrow">SKILLS OVERVIEW</span><h2 id="skills-overview-title">{{ t('cronSkills.skillsView.overviewTitle') }}</h2><p>{{ t('cronSkills.skillsView.overviewDesc') }}</p></div>
             <div class="sk-overview-modal__actions">
@@ -172,8 +172,10 @@
       :mutation-blocked="mutationBusy && !queueRunning"
       @close="addSkillOpen = false"
       @search="searchRegistry"
+      @source-change="resetRegistrySearch"
       @install-github="installGithub"
       @install="installSkill"
+      @view-details="openRegistryResultDetails"
       @retry="retryQueueItem"
       @cancel-install="cancelInstall"
       @clear-activity="clearInstallActivity"
@@ -187,16 +189,22 @@
       :install-feedback="installFeedback"
       :installing-deps-id="installingDepsId"
       :uninstalling-name="uninstallingName"
-      :mutation-disabled="mutationBusy"
+      :mutation-disabled="mutationBusy || skillLaunchPending"
+      :can-set-enabled="skillCatalog.supportsSetEnabled?.() ?? false"
+      :setting-enabled="settingEnabled"
+      :can-use-in-task="canUseSelectedSkillInTask"
       @close="closeDialog"
       @install-deps="installDepsAndMaybeClose"
       @uninstall="uninstallSkillAndClose"
+      @set-enabled="setSkillEnabled"
+      @use-in-task="useSkillInTask"
     />
   </div>
 </template>
 
 <script setup lang="ts">
-import { inject, nextTick, onActivated, onDeactivated, onUnmounted, ref } from 'vue'
+import { computed, inject, nextTick, onActivated, onDeactivated, onUnmounted, ref, watch } from 'vue'
+import { useRoute, useRouter } from 'vue-router'
 import { useI18n } from 'vue-i18n'
 import Icon from '@/components/Icon.vue'
 import ControlSwitch from '@/components/ControlSwitch.vue'
@@ -208,21 +216,29 @@ import SkillsAddDrawer from '@/components/skills/SkillsAddDrawer.vue'
 import SkillsStats from '@/components/skills/SkillsStats.vue'
 import { useSkillProposals } from '@/composables/skills/useSkillProposals'
 import { useSkillDetailController } from '@/composables/skills/useSkillDetailController'
+import { isSkillTaskEligible, prepareSkillTaskPrefill } from '@/composables/skills/skillTaskPrefill'
 import { createSkillMutationGate } from '@/composables/skills/useSkillMutationGate'
 import { useSkillRegistry } from '@/composables/skills/useSkillRegistry'
-import { skillLayerHelp, skillLayerLabel, useSkillsCatalog } from '@/composables/skills/useSkillsCatalog'
+import { isMetaSkill, skillLayerHelp, skillLayerLabel, useSkillsCatalog } from '@/composables/skills/useSkillsCatalog'
 import { useToasts } from '@/composables/useToasts'
+import { useDialogA11y } from '@/composables/useDialogA11y'
 import type { Proposal, Skill } from '@/types/skills'
 import { SKILL_CATALOG_KEY, type SkillReloadResult } from '@/modules/skillCatalog'
 
 const { t } = useI18n()
+const route = useRoute()
+const router = useRouter()
 const skillsOverviewOpen = ref(false)
+const skillsOverviewPanelRef = ref<HTMLElement | null>(null)
 const { pushToast } = useToasts()
 const injectedSkillCatalog = inject(SKILL_CATALOG_KEY)
 if (!injectedSkillCatalog) throw new Error('SkillCatalog was not provided')
 const skillCatalog = injectedSkillCatalog
 const addSkillOpen = ref(false)
+
+useDialogA11y(skillsOverviewPanelRef, skillsOverviewOpen, () => { skillsOverviewOpen.value = false })
 const reloading = ref(false)
+const settingEnabled = ref(false)
 const selectedProposal = ref<Proposal | null>(null)
 const proposalsPanelRef = ref<InstanceType<typeof PendingSkillProposals> | null>(null)
 
@@ -330,6 +346,7 @@ const {
   installingDepsId,
   uninstallingName,
   searchRegistry,
+  resetRegistrySearch,
   installGithub,
   installSkill,
   retryQueueItem,
@@ -350,6 +367,66 @@ const {
   installCurrentDependencies,
 } = skillDetail
 
+const skillLaunchPending = ref(false)
+const canUseSelectedSkillInTask = computed(() => {
+  const skill = selectedSkill.value
+  if (!skill || !isSkillTaskEligible(skill)) return false
+  return isMetaSkill(skill) || Boolean(skillCatalog.supportsCandidates?.())
+})
+
+async function useSkillInTask(skill: Skill) {
+  if (skillLaunchPending.value || mutationBusy.value || selectedSkill.value !== skill) return
+  skillLaunchPending.value = true
+  try {
+    const candidates = isMetaSkill(skill) ? [] : (await skillCatalog.listCandidates()).candidates
+    // Closing the dialog or selecting another skill retires an in-flight read.
+    if (selectedSkill.value !== skill) return
+    const prefill = prepareSkillTaskPrefill(skill, candidates)
+    if (!prefill) {
+      pushToast(t('cronSkills.skillDetail.useUnavailable'), { tone: 'warn' })
+      return
+    }
+    await router.push({
+      path: '/chat/new',
+      query: { agent: 'main' },
+      state: {
+        prefill: prefill.prefill,
+        autosend: false,
+        selectedSkillPrefill: prefill.selectedSkillPrefill.map(({ name, instanceId, digest }) => ({ name, instanceId, digest })),
+      },
+    })
+  } catch (error) {
+    if (selectedSkill.value === skill) pushToast(String(error instanceof Error ? error.message : error), { tone: 'danger' })
+  } finally {
+    skillLaunchPending.value = false
+  }
+}
+
+async function setSkillEnabled(name: string, enabled: boolean) {
+  if (!skillCatalog.supportsSetEnabled?.() || !mutationGate.acquire('allow_use')) return
+  const original = selectedSkill.value
+  if (!original || original.name !== name) {
+    mutationGate.release('allow_use')
+    return
+  }
+  settingEnabled.value = true
+  try {
+    const result = await skillCatalog.setEnabled({ name, enabled })
+    if (result.persisted) {
+      pushToast(t(result.refreshed
+        ? enabled ? 'cronSkills.skillDetail.enabledSaved' : 'cronSkills.skillDetail.disabledSaved'
+        : 'cronSkills.skillDetail.refreshPending'), { tone: result.refreshed ? 'ok' : 'warn' })
+      await loadData()
+      if (selectedSkill.value === original) await openSkill({ ...original, disabled: !enabled })
+    }
+  } catch (error) {
+    pushToast(String(error instanceof Error ? error.message : error), { tone: 'danger' })
+  } finally {
+    settingEnabled.value = false
+    mutationGate.release('allow_use')
+  }
+}
+
 // This view is kept-alive (route meta.keepAlive), so the data fetch is bound on
 // activation rather than mount — onMounted/onUnmounted only fire on first mount /
 // cache eviction, not when navigating away and back. onActivated also runs on
@@ -358,8 +435,23 @@ const {
 // no-op, but it is kept idempotent and wired to both onDeactivated and onUnmounted
 // to match the reference pattern and guard against future additions.
 let unsubs: Array<() => void> = []
+let activeView = false
+let routeSkillRequest = 0
+
+async function openRequestedSkill() {
+  const request = ++routeSkillRequest
+  const name = typeof route.query.skill === 'string' ? route.query.skill : ''
+  if (!activeView || !name) return
+  const skill = catalog.allSkills.value.find(item => item.name === name && item.active !== false)
+    || catalog.allSkills.value.find(item => item.name === name)
+  if (request === routeSkillRequest && skill) await openSkill(skill)
+}
+
+watch(() => route.query.skill, () => { void openRequestedSkill() })
 
 function teardownLive() {
+  activeView = false
+  routeSkillRequest += 1
   unsubs.forEach(unsub => unsub())
   unsubs = []
   closeDialog()
@@ -367,8 +459,9 @@ function teardownLive() {
 }
 
 onActivated(() => {
+  activeView = true
   if (queueRunning.value) return
-  void loadData()
+  void loadData().then(() => openRequestedSkill())
 })
 
 onDeactivated(teardownLive)
@@ -399,6 +492,45 @@ async function showProposalsFromStats() {
 async function openSkillDialog(skill: Skill) {
   selectedProposal.value = null
   await openSkill(skill)
+}
+
+function findCatalogSkill(name: string, installId: string): Skill | undefined {
+  const normalizedInstallId = installId.trim()
+  const normalizedName = name.trim()
+  return catalog.allSkills.value.find(skill => normalizedInstallId
+    && skill.install_id === normalizedInstallId)
+    || catalog.allSkills.value.find(skill => normalizedName && skill.name === normalizedName)
+}
+
+async function openRegistryResultDetails(
+  installId: string,
+  source: string,
+  displayName: string,
+) {
+  let skill = findCatalogSkill(displayName, installId)
+  if (!skill) {
+    // Installation refresh normally populates the exact install_id. Retry once
+    // here for a slow Gateway so the button never depends on stale catalog data.
+    await loadData()
+    skill = findCatalogSkill(displayName, installId)
+  }
+
+  addSkillOpen.value = false
+  selectedProposal.value = null
+  if (skill) {
+    await openSkill(skill)
+    return
+  }
+
+  // Keep the detail dialog useful even when the follow-up list refresh is
+  // unavailable. skills.get remains authoritative and will surface a visible
+  // error if the Gateway cannot resolve this installed skill.
+  await openSkill({
+    name: displayName || installId,
+    install_id: installId || undefined,
+    source: source || undefined,
+    installed: true,
+  })
 }
 
 async function openProposalDialog(proposalId: string) {

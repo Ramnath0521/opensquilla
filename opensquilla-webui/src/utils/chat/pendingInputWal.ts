@@ -1,4 +1,8 @@
+import { copySelectedSkills, isSelectedSkills } from '@/types/selectedSkills'
+import type { SelectedSkillRef } from '@/types/selectedSkills'
+import { normalizePageContext, type ChatPageContext } from '@/types/pageContext'
 import type { Attachment } from '@/types/chat'
+import { snapshotAttachment } from './attachments'
 import type { TurnSendParams } from '@/modules/turnCommands'
 
 const DATABASE_NAME = 'opensquilla-chat-pending-inputs'
@@ -21,7 +25,12 @@ export interface PendingInputWalRecord {
   clientMessageId: string
   text: string
   /** Annotation batch retained across IndexedDB/WAL queue recovery. */
+  draftIds?: string[]
+  /** Read-only upgrade input; never sent to Gateway. */
   promptAnnotationIds?: string[]
+  retiredAnnotationInput?: boolean
+  selectedSkills?: SelectedSkillRef[]
+  pageContext?: ChatPageContext
   attachments: Attachment[]
   intent: string | null
   confirmedPlainText?: boolean
@@ -29,6 +38,8 @@ export interface PendingInputWalRecord {
   state: PendingInputWalState
   /** True once enqueue may have crossed the browser/Gateway boundary. */
   mayHaveServerCopy?: boolean
+  /** Credential-free Gateway/subject fingerprint for a never-sent offline draft. */
+  deliveryIdentity?: string
   /** Complete an in-flight tombstone by preserving the text as a local draft. */
   retainAfterCancel?: boolean
   requestFingerprint?: string
@@ -120,7 +131,7 @@ const WAL_STATES = new Set<PendingInputWalState>([
   'cancelling',
 ])
 
-function validPromptAnnotationIds(value: unknown): boolean {
+function validAnnotationDraftIds(value: unknown): boolean {
   if (value === undefined) return true
   if (!Array.isArray(value) || value.length > 16) return false
   return value.every((item, index) => (
@@ -143,7 +154,13 @@ function isPendingInputWalRecord(value: unknown): value is PendingInputWalRecord
     && typeof record.clientMessageId === 'string'
     && record.clientMessageId.length > 0
     && typeof record.text === 'string'
-    && validPromptAnnotationIds(record.promptAnnotationIds)
+    && (record.deliveryIdentity === undefined || (
+      typeof record.deliveryIdentity === 'string'
+      && record.deliveryIdentity.length > 0
+    ))
+    && validAnnotationDraftIds(record.draftIds)
+    && (record.selectedSkills === undefined || isSelectedSkills(record.selectedSkills))
+    && (record.pageContext === undefined || normalizePageContext(record.pageContext) !== null)
     && Array.isArray(record.attachments)
     && record.attachments.every(attachment => (
       attachment !== null && typeof attachment === 'object'
@@ -194,6 +211,7 @@ function isResponseHandoffWalRecord(value: unknown): value is ResponseHandoffWal
     && params?.clientRequestId === record.clientRequestId
     && params?.clientMessageId === record.clientMessageId
     && params?.sessionKey === record.requestSessionKey
+    && (params?.selectedSkills === undefined || isSelectedSkills(params.selectedSkills))
     && typeof record.composerText === 'string'
     && Array.isArray(record.recoveryAttachments)
     && record.recoveryAttachments.every(attachment => (
@@ -235,12 +253,16 @@ function isResponseHandoffWalRecord(value: unknown): value is ResponseHandoffWal
 }
 
 function cloneRecord(record: PendingInputWalRecord): PendingInputWalRecord {
+  const { promptAnnotationIds, ...current } = record
   return {
-    ...record,
-    ...(record.promptAnnotationIds
-      ? { promptAnnotationIds: [...record.promptAnnotationIds] }
+    ...current,
+    ...(promptAnnotationIds?.length ? { retiredAnnotationInput: true } : {}),
+    ...(record.pageContext ? { pageContext: normalizePageContext(record.pageContext)! } : {}),
+    ...(record.selectedSkills ? { selectedSkills: copySelectedSkills(record.selectedSkills) } : {}),
+    ...(record.draftIds
+      ? { draftIds: [...record.draftIds] }
       : {}),
-    attachments: record.attachments.map(attachment => ({ ...attachment })),
+    attachments: record.attachments.map(snapshotAttachment),
   }
 }
 

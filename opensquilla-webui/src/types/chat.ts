@@ -56,6 +56,15 @@ export interface ApprovalStatusPayload {
 export type AssistantDelivery = 'visible' | 'suppressed'
 export type AssistantSuppressionReason = 'no_reply' | 'heartbeat_ack'
 
+/** A live project file, revalidated against its bound workspace on every use. */
+export interface WorkspaceFileReference {
+  workspaceId: string
+  relativePath: string
+  name: string
+  mime: string
+  size?: number
+}
+
 export interface ChatSendAttachmentPayload {
   type: string
   mime: string
@@ -84,7 +93,7 @@ export interface SessionSteerV2Params {
 }
 
 export interface Attachment {
-  kind: 'inline' | 'staged' | 'inline_pending' | 'uploading' | 'failed'
+  kind: 'inline' | 'staged' | 'workspace' | 'inline_pending' | 'uploading' | 'failed'
   local_id: number
   name: string
   mime: string
@@ -96,11 +105,13 @@ export interface Attachment {
   ttl_seconds?: number
   error?: string
   file?: File
+  workspaceFile?: WorkspaceFileReference
   /** Server-owned bytes restored from the durable pending-input queue. */
   durable_material?: true
 }
 
 export interface DisplayAttachment {
+  workspaceFile?: WorkspaceFileReference
   kind: 'inline' | 'staged' | 'file'
   displayId: string
   renderKey: string
@@ -145,7 +156,11 @@ export interface ChatPendingItem {
   pendingUiId: string
   text: string
   /** Annotation batch retained when a follow-up is queued behind an active turn. */
-  promptAnnotationIds?: string[]
+  draftIds?: string[]
+  /** Upgrade recovery requires the user to select the page again before sending. */
+  retiredAnnotationInput?: boolean
+  selectedSkills?: import('./selectedSkills').SelectedSkillRef[]
+  pageContext?: import('./pageContext').ChatPageContext
   attachments: Attachment[]
   intent: string | null
   /** Slash-prefixed text that a complete command catalog classified as ordinary input. */
@@ -190,6 +205,8 @@ export interface ChatPendingItem {
    * delete intent.
    */
   pendingMayHaveServerCopy?: boolean
+  /** Offline drafts may only cross the wire under their original Gateway identity. */
+  pendingDeliveryIdentity?: string
   /** A cancelling transport row must become a local editable draft after tombstoning. */
   pendingRetainAfterCancel?: boolean
   /** Browser/server staging lifecycle. Unknown enqueue results remain `saving`. */
@@ -243,7 +260,8 @@ export interface ChatRouterCell {
 
 export interface ChatRouterTierConfig {
   model: string
-  supportsImage: boolean
+  /** Accepted from legacy snapshots, not used to determine capability. */
+  supportsImage?: boolean
   imageOnly: boolean
   ensembleEnabled?: boolean
 }
@@ -260,6 +278,7 @@ export interface ChatToolCall {
   isError: boolean
   result: string
   resultPreview: string
+  executionLogHandle?: string
   sources?: unknown
   isOpen: boolean
   activityOrder?: number
@@ -295,6 +314,8 @@ export interface ToolResultContext {
   inputRaw?: string
   section?: 'input' | 'result' | 'error'
   format?: 'diff'
+  executionLogHandle?: string
+  executionIo?: import('@/utils/chat/executionIo').ExecutionIoSummary
 }
 
 export interface ChatToolCallGroup {
@@ -405,6 +426,8 @@ export interface ChatTurnOutcome {
   turnId: string
   taskId?: string
   status: string
+  /** Client-only provenance: lifecycle/history status outranks a stream receipt. */
+  statusSource?: 'task'
   kind?: string
   reason?: string
   cancellationSource?: string
@@ -413,6 +436,9 @@ export interface ChatTurnOutcome {
   retryable?: boolean
   documentMutationOutcome?: DocumentMutationOutcome
   errorClass?: string
+  failureKind?: string
+  /** null retains invalid/conflicting evidence across notice merges. */
+  errorId?: string | null
   terminalMessage?: string
   retryAfterMs?: number
   statusHistory?: import('./parts').StatusPart[]
@@ -510,6 +536,17 @@ export interface ChatModelCallSegment {
   endCodepoint?: number
 }
 
+export interface ChatExecutionLeg {
+  index?: number
+  kind?: string
+  provider?: string
+  model?: string
+  plan_id?: string
+  execution_id?: string
+  call_kind?: string
+  reason?: string
+}
+
 export interface ChatUsagePayload {
   model?: string
   routed_model?: string
@@ -537,6 +574,8 @@ export interface ChatUsagePayload {
   ensembleTrace?: ChatEnsembleTrace
   route_plan?: Record<string, unknown>
   routePlan?: Record<string, unknown>
+  execution_legs?: ChatExecutionLeg[]
+  executionLegs?: ChatExecutionLeg[]
   model_call_segments?: ChatModelCallSegment[]
   modelCallSegments?: ChatModelCallSegment[]
   /** Physical provider call whose visible output owns the route card. */
@@ -684,6 +723,8 @@ export interface ChatMessage {
   reasoningPresentationPending?: boolean
   activitySnapshot?: ActivitySnapshotV2
   activitySnapshotIncomplete?: boolean
+  /** Live physical execution model; never overwrites the logical route decision. */
+  routerExecutionModel?: string
   routerDecision?: ConversationRoutingSnapshot | null
   /** Routing-only usage projection for a split historical answer segment. */
   routerUsage?: ChatUsagePayload
@@ -694,6 +735,7 @@ export interface ChatMessage {
   planRevisions?: import('./plans').PlanRevisionSnapshot[]
   timeline?: ChatTimelineSegment[]
   attachments?: DisplayAttachment[]
+  selectedSkills?: import('./selectedSkills').SelectedSkillRef[]
   promptAnnotations?: PromptAnnotationSnapshot[]
   provenanceKind?: string
   provenanceSourceSessionKey?: string
@@ -745,6 +787,7 @@ export interface ChatMessage {
   /** Typed terminal error code (e.g. 'sandbox_threshold_exceeded') carried on
    *  role:'error' messages so the renderer can offer a recovery action. */
   errorCode?: string
+  modelCapacity?: import('@/modules/providerConfiguration').ModelCapacityFailure
 }
 
 export interface ChatMessageMeta {
@@ -780,6 +823,7 @@ export interface ChatRenderedMessage {
   id?: string
   clientId?: string
   sourceIndex?: number
+  skillLoads?: import('./skillLoads').SkillLoadReceipt[]
   role: string
   displayRole: string
   roleLabel: string
@@ -806,10 +850,13 @@ export interface ChatRenderedMessage {
   turnOutcome?: ChatTurnOutcome
   hasAttachments?: boolean
   attachments?: DisplayAttachment[]
+  selectedSkills?: import('./selectedSkills').SelectedSkillRef[]
   promptAnnotations?: PromptAnnotationSnapshot[]
   /** Explicit placement for successful sessions_spawn cards. An empty array
    *  suppresses the source card after it is rehomed below the parent reply. */
   createdSessionLinks?: ChatCreatedSessionLink[]
+  /** Versioned references returned by a structured session_search result. */
+  sessionReferences?: import('./references').SessionReferenceV1[]
   toolCalls?: ChatToolCall[]
   planRevisions?: import('./plans').PlanRevisionSnapshot[]
   timelineItems?: ChatStreamTimelineItem[]
@@ -847,6 +894,8 @@ export interface ChatRenderedMessage {
   winnerIdx?: number
   /** Authoritative model from the historical routing decision, independent of UI cells. */
   routerSelectedModel?: string
+  /** Current or terminal physical execution model, independent of the route decision. */
+  routerExecutionModel?: string
   parts?: import('./parts').ChatPart[]
   sources?: import('./parts').SourcePart[]
   statusHistory?: import('./parts').StatusPart[]
@@ -854,4 +903,5 @@ export interface ChatRenderedMessage {
   /** Typed terminal error code, propagated from the raw message so the error
    *  card can render a recovery action (e.g. resume after a sandbox pause). */
   errorCode?: string
+  modelCapacity?: import('@/modules/providerConfiguration').ModelCapacityFailure
 }

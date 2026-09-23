@@ -1,0 +1,178 @@
+# V2 usage statistics: external producer integration
+
+The OpenSquilla repository owns the v2 collector, desktop application, Gateway,
+Runtime, and Windows NSIS package. It does **not** contain the public website,
+CDN/download service, or account service. Those services must integrate at
+their own authoritative transaction boundaries; the desktop must not infer
+their results.
+
+## Shared destination
+
+For an isolated client verification run, set `OPENSQUILLA_TELEMETRY_BASE_URL`
+in the client process environment to an HTTPS collector base URL, optionally
+including a path prefix (for example `https://collector.example.com/test`).
+The Desktop Gateway inherits this setting; both v2 queues append their own
+`/v1/reliability/events` or `/v1/growth/events` path. It does not change the
+legacy v1 destination or the user's upload preference. Unset it to restore the
+default destination. An invalid explicit URL blocks v2 upload rather than
+falling back to the default server. Credentials, query strings, fragments,
+encoded path segments and relative path segments are not supported.
+
+All growth producers send strict v1 batches to:
+
+```text
+POST https://<collector-origin>/v1/growth/events
+Content-Type: application/json
+```
+
+The website, CDN, and account service each receive a different 32–64 byte
+random secret. Raw secrets never enter browser JavaScript, URLs, installer
+packages, application logs, or the dashboard. The collector refuses to start
+without all three server-side credentials and refuses unsigned server-owned
+events.
+
+For every request these services send:
+
+```text
+X-OpenSquilla-Producer: website | cdn | account_service
+X-OpenSquilla-Timestamp: <current Unix seconds>
+X-OpenSquilla-Signature: v1=<lowercase HMAC-SHA256 hex>
+```
+
+The signature input is the ASCII string below, without a trailing newline:
+
+```text
+v1
+POST
+/v1/growth/events
+<producer>
+<timestamp>
+<lowercase SHA-256 hex of the exact request body>
+```
+
+The collector accepts at most five minutes of clock skew. The signed producer
+must match every event's `source`; mixed-source batches are rejected. Device
+sources (`installer`, `desktop`, `gateway`, and `runtime`) cannot receive or use
+these service credentials.
+
+Python services can use
+`opensquilla.telemetry.server_growth_producer.ServerGrowthProducer`. The helper
+strictly validates and signs canonical batches, performs one bounded upload
+attempt, and classifies the result. It intentionally does not provide an
+in-memory retry queue.
+
+## Authoritative event boundaries
+
+Each service must create a stable UUIDv4 `event_id` and persist it in the same
+transaction as the fact below. A retry uses the same event ID. The producer's
+durable outbox also keeps a stable `batch_id` and `sent_at_utc` until that batch
+is accepted.
+
+| Owner | Event | Emit only when |
+|---|---|---|
+| Website backend | `landing_view` | the consented landing response is served and the first-party acquisition cookie is created/read |
+| Website backend | `download_click` | a consented, valid download action is accepted by the backend |
+| CDN/download service | `download_served` | the complete installer object is successfully delivered, not merely requested |
+| Account service | `registration_result` | the registration transaction reaches success, fail, or cancel |
+| Runtime | `metaskill_usage` | the first executable MetaSkill step starts; one event counts one run |
+| Runtime | `coding_mode_usage` | a Coding Mode task starts its coding Agent process; one event counts one run |
+| Gateway / CLI runtime | `product_active` | a Desktop or Web owner UI is visibly active, a TUI is ready or receives user input, or a CLI Agent run is submitted; device counts deduplicate across profiles and surfaces per UTC day |
+
+`metaskill_usage` and `coding_mode_usage` intentionally carry no MetaSkill name,
+prompt, plan, step, command, repository, tool argument, or run identifier. The
+runtime-only events are emitted at their first demonstrated execution boundary,
+are gated by the client's unified network-reporting policy, and are counted by
+the dashboard as usage totals, unique devices, and UTC daily trends. They carry
+the device token without requiring a fresh-install cohort; first-use
+funnel milestones still require that cohort. Enabling Coding Mode or
+injecting its turn directive without starting the coding Agent is not counted.
+
+`product_active` is a v1 Growth event with `source=gateway`, `outcome=null`,
+and `surface` (`desktop`, `web`, `tui`, or `cli`). Its `device_id` is stable
+across profiles on the same OS device; the legacy random `analytics_user_id`
+remains only for cohort and queue compatibility. It does not create a fresh-user
+cohort and contains no prompt, response, route, input, or account ID.
+Background Gateway uptime and internal Coding Mode child processes
+do not count. Its daily observations support cross-surface DAU and rolling
+30-day MAU, both deduplicated by device token across profiles and surfaces.
+Records without a device token are excluded from these device metrics.
+For Gateway-observed Web/TUI activity the device is the Gateway execution host;
+remote browser machines are not assigned synthetic physical-device identities.
+The local daily ledger is persisted before enqueue; retries retain `event_id`
+and occurrence time. It uses the existing unified reporting control and CI /
+`DO_NOT_TRACK` vetoes, with no new prompt or statistics preference.
+
+## Source CLI reporting lifecycle
+
+Local owner connections to a loopback Gateway can record content-free TUI
+launch and activity events in the default `auth.mode = "none"` configuration.
+Remote guests and non-owner connections cannot use those recording methods;
+statistics preference changes retain their separate authorization requirements.
+
+Source Gateways record `gateway_start_result` after both runtime and listener
+readiness. Startup failures are recorded only after a valid configuration is
+available to enforce its reporting preference. Desktop-owned Gateways leave
+this event to the Desktop lifecycle observer, avoiding duplicate startup counts.
+
+Short CLI processes make a bounded final v2 upload attempt after event producers
+finish. Unacknowledged events remain in the persistent queue for a later run.
+Offline shutdown therefore does not discard accepted events or wait indefinitely.
+
+V1 installation/version and daily usage reporting also run for user-invoked
+`agent` and `chat --standalone` processes. Standalone daily counters live in a
+dedicated counts-only database, independently of `--session-db-path` and
+temporary conversations. A later standalone process or listening Gateway can
+upload these counters. Existing Gateway and explicitly persisted CLI usage
+buckets retain their identities and acknowledgement state; new standalone turns
+are recorded only in the dedicated store. Counts lost by older in-memory clients
+cannot be reconstructed.
+
+Daily usage uploads include only completed UTC days. The current day's counters
+are durable locally and become eligible after midnight UTC. Internal Coding Mode
+child processes do not start V1 reporting or count a second user conversation.
+The existing reporting preference and environment vetoes apply at collection
+and upload boundaries for both versions.
+
+`analytics_user_id` is a random analytics-only UUID. It is not a hash of the
+account ID. On successful registration, the account service stores the mapping
+needed for deletion and emits both the journey's `acquisition_id` and the new
+`analytics_user_id`. Failure and cancellation events must not contain an
+analytics user ID.
+
+All application-owned Growth and Reliability event schemas accept optional
+`device_id`, exactly 64 lowercase hexadecimal characters. Current clients
+derive it as SHA-256 over UTF-8 `opensquilla.telemetry.device.v1`, a NUL byte,
+the platform (`macos`, `windows`, or `linux`), another NUL, and the OS machine
+identifier normalized to 32 lowercase hex characters with UUID hyphens removed.
+Raw machine identifiers, profile paths, MAC/IP addresses and account values
+must never be sent. Missing or invalid OS identity omits the field; it must not
+fall back to a new random identity. Website/CDN/account journey schemas do not
+accept this field. Deploy the updated collector before updated clients; old
+collectors reject the additive field. Pending old events retain their exact
+payload and IDs. Website acquisition journeys remain distinct journey metrics.
+
+## Deliberately inactive boundaries
+
+The current ordinary NSIS package has no trustworthy acquisition token. It must
+not collect or upload `install_started` or `install_result`, and the desktop
+must not backfill them when client reporting is enabled. These events can be activated only after
+a guided installer or short-lived signed acquisition token is implemented with
+an explicit pre-install notice and consent receipt.
+
+The in-app registration action currently opens the external TokenRhythm site.
+OpenSquilla has neither the account transaction nor a trustworthy acquisition
+bridge at that point, so it must not emit `registration_result` or pretend the
+external registration succeeded. The account service owns that result.
+
+## Privacy and operations
+
+- Never add IP address, MAC address, raw machine identifier, raw account ID, URL
+  query, referrer, file data, prompt, response, order, or payment fields.
+- Reject unknown fields through the shared strict event contract.
+- Do not sample growth events.
+- Keep producer outboxes separate from business payloads and from Reliability
+  diagnostics.
+- A `202` receipt is accepted only when its batch ID matches and
+  `accepted + duplicates` equals the sent event count.
+- Network ambiguity, `429`, and `5xx` are retryable. Authentication, contract,
+  and identifier-conflict responses require operator repair and must not loop.

@@ -156,7 +156,19 @@
               aria-hidden="true"
             />
             <span class="tool-row__trailing">
-              <span v-if="showGroupStatus(item.group)" class="tool-row__status">{{ resolvedGroupStatusText(item.group) }}</span>
+              <span
+                v-if="executionIoLabel(executionIoForGroup(item.group))"
+                class="tool-row__status tool-row__status--execution-io"
+                :class="`tool-row__status--execution-${executionIoForGroup(item.group).kind}`"
+              >{{ executionIoLabel(executionIoForGroup(item.group)) }}</span>
+              <span
+                v-if="presentation === 'activity' && showGroupStatus(item.group)"
+                class="tool-row__status-dot"
+                role="img"
+                :aria-label="activityStatusHint(resolvedGroupStatusText(item.group))"
+                :title="activityStatusHint(resolvedGroupStatusText(item.group))"
+              />
+              <span v-else-if="showGroupStatus(item.group)" class="tool-row__status">{{ resolvedGroupStatusText(item.group) }}</span>
               <Icon v-if="presentation !== 'activity' && groupHasDetails(item.group)" class="step-chevron" name="chevronRight" :size="14" />
             </span>
           </button>
@@ -203,11 +215,20 @@
                   aria-hidden="true"
                 />
                 <span class="tool-row__trailing">
-                  <!-- Failure text is plain row content on purpose: it joins the
-                       button's accessible name, which screen readers announce when
-                       the row is reached. A live region mounted already-populated
-                       would never announce. -->
-                  <span v-if="activityTerminalStatusText(call)" class="tool-row__status">{{ activityTerminalStatusText(call) }}</span>
+                  <span
+                    v-if="executionIoLabel(executionIoForCall(call))"
+                    class="tool-row__status tool-row__status--execution-io"
+                    :class="`tool-row__status--execution-${executionIoForCall(call).kind}`"
+                  >{{ executionIoLabel(executionIoForCall(call)) }}</span>
+                  <!-- The dot's accessible name keeps the status available when
+                       the disclosure row receives keyboard focus. -->
+                  <span
+                    v-if="activityTerminalStatusText(call)"
+                    class="tool-row__status-dot"
+                    role="img"
+                    :aria-label="activityStatusHint(activityTerminalStatusText(call))"
+                    :title="activityStatusHint(activityTerminalStatusText(call))"
+                  />
                   <span v-if="resultCountText(call)" class="tool-row__status">{{ resultCountText(call) }}</span>
                   <span v-if="elapsedFor(call)" class="tool-row__elapsed">{{ elapsedFor(call) }}</span>
                   <Icon v-if="presentation !== 'activity' && iconFor(call).glyph === 'check'" class="tool-row__state-icon tool-row__state-icon--ok" name="check" :size="13" />
@@ -292,7 +313,18 @@
                 aria-hidden="true"
               />
               <span class="tool-row__trailing">
-                <span v-if="activityTerminalStatusText(call)" class="tool-row__status">{{ activityTerminalStatusText(call) }}</span>
+                <span
+                  v-if="executionIoLabel(executionIoForCall(call))"
+                  class="tool-row__status tool-row__status--execution-io"
+                  :class="`tool-row__status--execution-${executionIoForCall(call).kind}`"
+                >{{ executionIoLabel(executionIoForCall(call)) }}</span>
+                <span
+                  v-if="activityTerminalStatusText(call)"
+                  class="tool-row__status-dot"
+                  role="img"
+                  :aria-label="activityStatusHint(activityTerminalStatusText(call))"
+                  :title="activityStatusHint(activityTerminalStatusText(call))"
+                />
                 <span v-if="resultCountText(call)" class="tool-row__status">{{ resultCountText(call) }}</span>
                 <span v-if="elapsedFor(call)" class="tool-row__elapsed">{{ elapsedFor(call) }}</span>
                 <Icon v-if="presentation !== 'activity' && iconFor(call).glyph === 'check'" class="tool-row__state-icon tool-row__state-icon--ok" name="check" :size="13" />
@@ -347,6 +379,11 @@
 import { defineComponent, h, type PropType } from 'vue'
 import { useI18n } from 'vue-i18n'
 import type { ChatToolCallRenderItem, ToolResultContext } from '@/types/chat'
+import {
+  mergeExecutionIo,
+  projectExecutionIoForCall,
+  type ExecutionIoSummary,
+} from '@/utils/chat/executionIo'
 
 const SECTION_PREVIEW_LIMIT = 200
 const COMPACT_SECTION_CHAR_LIMIT = 360
@@ -499,10 +536,13 @@ function toolResultContext(
   call: ChatToolCallRenderItem,
   section: NonNullable<ToolResultContext['section']>,
 ): ToolResultContext {
+  const executionIo = projectExecutionIoForCall(call)
   return {
     toolName: call.name,
     inputRaw: call.inputRaw || call.inputPreview,
     section,
+    executionLogHandle: section === 'input' ? undefined : call.executionLogHandle,
+    ...(executionIo.kind === 'unknown' ? {} : { executionIo }),
   }
 }
 
@@ -541,6 +581,14 @@ function webDiagnosticsSummary(raw: string): string {
   if (returnedChars !== null) parts.push(`${returnedChars} chars`)
   if (truncated) parts.push('truncated')
   return parts.join(' · ')
+}
+
+function executionIoTextKey(summary: ExecutionIoSummary): string {
+  if (summary.kind === 'pty') return 'shared.runTrace.executionIoPty'
+  if (summary.kind === 'fallback') return 'shared.runTrace.executionIoFallback'
+  if (summary.kind === 'pipe') return 'shared.runTrace.executionIoPipe'
+  if (summary.kind === 'mixed') return 'shared.runTrace.executionIoMixed'
+  return 'shared.runTrace.executionIoUnknown'
 }
 
 // Labeled input / result / error sections shown in an expanded row body.
@@ -592,6 +640,15 @@ const ToolRowSections = defineComponent({
           h('pre', { class: 'tool-row-section__pre' }, diagnostics),
         ]))
       }
+      const executionIo = projectExecutionIoForCall(call)
+      if (executionIo.kind !== 'unknown') {
+        sections.push(h('section', { class: ['tool-row-section', { 'tool-row-section--warning': executionIo.kind === 'fallback' }] }, [
+          h('div', { class: 'tool-row-section__label' }, t(executionIoTextKey(executionIo))),
+          executionIo.kind === 'fallback' && executionIo.fallbackReason
+            ? h('pre', { class: 'tool-row-section__pre' }, executionIo.fallbackReason)
+            : null,
+        ]))
+      }
       if (call.result) {
         const kindLabel = call.isError
           ? t('shared.runTrace.sectionError')
@@ -608,7 +665,7 @@ const ToolRowSections = defineComponent({
                 h('span', { class: 'tool-row-section__compact-snippet' }, compactSnippet(resultContent)),
               ])
             : h('pre', { class: 'tool-row-section__pre' }, call.resultPreview),
-          call.result.length > SECTION_PREVIEW_LIMIT || compact
+          call.result.length > SECTION_PREVIEW_LIMIT || compact || call.executionLogHandle
             ? h('button', {
                 type: 'button',
                 class: 'step-view-btn',
@@ -644,7 +701,6 @@ import type {
 import type { NodeStep, RunTraceStatus, RunTraceSummary } from '@/types/runTrace'
 import {
   toolGroupStatusText as defaultToolGroupStatusText,
-  isDocumentAgentToolName,
   toolSecondaryText as defaultToolSecondaryText,
   toolStatusText as defaultToolStatusText,
   toolIconName,
@@ -660,6 +716,7 @@ import {
   projectActivityToolTargets,
   type ActivityToolTarget,
 } from '@/utils/chat/activityToolDetails'
+import { isLegacyDocumentTool } from '@/utils/chat/legacyDocumentTool'
 import { requestBrowserWorkbenchOpen } from '@/workbench/browserItems'
 
 const { t } = useI18n()
@@ -824,63 +881,6 @@ function decorateCodeBlocks() {
 // Chat passes `items` (proven group data); non-chat surfaces pass flat steps,
 // which compose into the same tool-group timeline shape so the markup never
 // branches on input source.
-function withoutFailedActivityRows(
-  items: ChatStreamTimelineItem[],
-): ChatStreamTimelineItem[] {
-  if (props.presentation !== 'activity') return items
-
-  return items.flatMap((item): ChatStreamTimelineItem[] => {
-    if (item.type !== 'tool-group') return [item]
-    const documentAgentGroup = item.group.operationKey.startsWith('document.')
-      || isDocumentAgentToolName(item.group.operationKey)
-
-    const failedCalls = item.group.calls.filter(
-      call => call.isError || call.status === 'error',
-    )
-    // Restored histories can retain only the group-level failure marker. In
-    // that case none of the calls is safe to present as completed activity.
-    if (
-      (item.group.isError || item.group.status === 'error')
-      && failedCalls.length === 0
-      && !documentAgentGroup
-    ) {
-      return []
-    }
-
-    const groupLevelWriterError = documentAgentGroup
-      && (item.group.isError || item.group.status === 'error')
-      && failedCalls.length === 0
-    const calls = item.group.calls.filter(
-      call => (
-        (!call.isError && call.status !== 'error')
-        || isDocumentAgentToolName(call.name)
-      ),
-    ).map(call => groupLevelWriterError
-      ? { ...call, isError: true, status: 'error' as const }
-      : call)
-    if (calls.length === 0) return []
-
-    const isRunning = calls.some(call => call.isRunning)
-    const isError = calls.some(call => call.isError || call.status === 'error')
-      || (documentAgentGroup && (item.group.isError || item.group.status === 'error'))
-    return [{
-      ...item,
-      group: {
-        ...item.group,
-        calls,
-        isRunning,
-        isError,
-        status: isError
-          ? 'error'
-          : isRunning
-          ? ''
-          : calls.every(call => call.status === 'success')
-            ? 'success'
-            : '',
-      },
-    }]
-  })
-}
 
 const resolvedItems = computed<ChatStreamTimelineItem[]>(() => {
   const items = props.items ?? composeTree(props.steps ?? []).map((node): ChatStreamTimelineItem => {
@@ -904,7 +904,26 @@ const resolvedItems = computed<ChatStreamTimelineItem[]>(() => {
     }
     return { type: 'tool-group', key: node.step.id, group }
   })
-  return withoutFailedActivityRows(items)
+  return items.map((item): ChatStreamTimelineItem => {
+    if (item.type !== 'tool-group') return item
+    const group = item.group
+    const singleCall = group.calls.length === 1 ? group.calls[0] : undefined
+    const restoredFailure = singleCall && !group.isRunning && !singleCall.isRunning
+      && (group.isError || group.status === 'error')
+      && !singleCall.isError && singleCall.status !== 'error'
+    const hasLegacyDetails = group.calls.some(isDocumentCall)
+    if (!restoredFailure && !hasLegacyDetails) return item
+    return {
+      ...item,
+      group: {
+        ...group,
+        secondary: hasLegacyDetails ? '' : group.secondary,
+        calls: restoredFailure
+          ? [{ ...singleCall, isError: true, status: 'error' }]
+          : group.calls,
+      },
+    }
+  })
 })
 
 function stepToRenderItem(step: NodeStep): ChatToolCallRenderItem {
@@ -1121,8 +1140,7 @@ function operationKey(call: ChatToolCallRenderItem): string {
 }
 
 function isDocumentCall(call: ChatToolCallRenderItem): boolean {
-  const key = operationKey(call)
-  return key === 'document.read' || key === 'document.update'
+  return isLegacyDocumentTool(call.name)
 }
 
 function callDefaultOpen(call: ChatToolCallRenderItem): boolean {
@@ -1340,7 +1358,7 @@ function resolvedGroupStatusText(group: ChatToolCallGroup): string {
 }
 
 function resolvedSecondaryText(call: ChatToolCallRenderItem): string {
-  if (isResourceActivityCall(call)) return ''
+  if (isResourceActivityCall(call) || isDocumentCall(call)) return ''
   return (props.toolSecondaryText ?? defaultToolSecondaryText)(call)
 }
 
@@ -1356,9 +1374,33 @@ function activityTerminalStatusText(call: ChatToolCallRenderItem): string {
   return injected
 }
 
+function activityStatusHint(status: string): string {
+  return `${status} · ${t('shared.runTrace.activityViewDetails')}`
+}
+
+function executionIoTextKey(summary: ExecutionIoSummary): string {
+  if (summary.kind === 'pty') return 'shared.runTrace.executionIoPty'
+  if (summary.kind === 'fallback') return 'shared.runTrace.executionIoFallback'
+  if (summary.kind === 'pipe') return 'shared.runTrace.executionIoPipe'
+  if (summary.kind === 'mixed') return 'shared.runTrace.executionIoMixed'
+  return 'shared.runTrace.executionIoUnknown'
+}
+
+function executionIoForCall(call: ChatToolCallRenderItem): ExecutionIoSummary {
+  return projectExecutionIoForCall(call)
+}
+
+function executionIoForGroup(group: ChatToolCallGroup): ExecutionIoSummary {
+  return mergeExecutionIo(group.calls.map(executionIoForCall))
+}
+
+function executionIoLabel(summary: ExecutionIoSummary): string {
+  if (summary.kind === 'unknown') return ''
+  return t(executionIoTextKey(summary))
+}
+
 function forwardShowResult(content: string, title: string, context?: ToolResultContext) {
-  const key = toolOperationKey(context?.toolName || '')
-  if (key === 'document.read' || key === 'document.update') return
+  if (isLegacyDocumentTool(context?.toolName)) return
   emit('showResult', content, title, context)
 }
 
@@ -1763,6 +1805,25 @@ function fmtTok(n?: number | null): string {
   white-space: nowrap;
 }
 
+.tool-row__status-dot {
+  width: 0.375rem;
+  height: 0.375rem;
+  flex: 0 0 auto;
+  border-radius: var(--radius-full);
+  background: var(--warn);
+}
+
+.tool-row__status--execution-io {
+  color: var(--text-muted);
+  max-width: min(22rem, 45vw);
+  white-space: normal;
+  overflow-wrap: anywhere;
+}
+
+.tool-row__status--execution-fallback {
+  color: var(--warn);
+}
+
 .tool-row__elapsed {
   font-family: var(--font-mono);
   font-variant-numeric: tabular-nums;
@@ -1971,6 +2032,10 @@ function fmtTok(n?: number | null): string {
 }
 
 .tool-timeline--activity .tool-row--error .tool-row__status {
+  color: var(--warn);
+}
+
+.tool-timeline--activity .tool-row__status--execution-fallback {
   color: var(--warn);
 }
 
@@ -2294,6 +2359,11 @@ function fmtTok(n?: number | null): string {
 .tool-row-section--error {
   background: color-mix(in srgb, var(--danger) 8%, var(--bg-surface));
   border-color: color-mix(in srgb, var(--danger) 30%, var(--border));
+}
+
+.tool-row-section--warning {
+  background: color-mix(in srgb, var(--warn) 8%, var(--bg-surface));
+  border-color: color-mix(in srgb, var(--warn) 30%, var(--border));
 }
 
 .tool-row-section__label {

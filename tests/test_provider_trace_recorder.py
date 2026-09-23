@@ -2,12 +2,40 @@ from __future__ import annotations
 
 import json
 
+import pytest
+
 from opensquilla.provider import trace_recorder as trace_recorder_module
 from opensquilla.provider.trace_recorder import LLMTraceRecorder
 
 
 def _jsonl(path):
     return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
+
+
+@pytest.mark.parametrize("mode", [None, "off"])
+def test_disabled_recorder_never_traverses_payloads(monkeypatch, tmp_path, mode):
+    monkeypatch.delenv("OPENSQUILLA_LLM_TRACE_RECORDER", raising=False)
+    monkeypatch.delenv("OPENSQUILLA_LLM_TRACE_PATH", raising=False)
+    if mode is not None:
+        monkeypatch.setenv("OPENSQUILLA_LLM_TRACE_RECORDER", mode)
+        monkeypatch.setenv("OPENSQUILLA_LLM_TRACE_PATH", str(tmp_path / "disabled.jsonl"))
+    recorder = LLMTraceRecorder(
+        provider="synthetic", model="synthetic", base_url="https://example.invalid",
+        endpoint="/chat/completions", stream=True,
+    )
+    assert not recorder.enabled
+
+    class UnreadablePayload(dict):
+        def items(self):
+            raise AssertionError("disabled diagnostics must not inspect model data")
+
+    payload = UnreadablePayload(content="synthetic")
+    recorder.record_request(payload=payload)
+    recorder.record_chunk(payload)
+    recorder.record_response(response=payload)
+    recorder.record_response_headers(response_ids=payload)
+    recorder.record_error(code="timeout", message="synthetic", metadata=payload)
+    assert not list(tmp_path.iterdir())
 
 
 def test_llm_trace_recorder_writes_full_payload_and_redacts_headers(
@@ -26,7 +54,11 @@ def test_llm_trace_recorder_writes_full_payload_and_redacts_headers(
         stream=True,
     )
     recorder.record_request(
-        payload={"model": "qwen3.6-flash", "messages": [{"role": "user", "content": "hi"}]},
+        payload={
+            "model": "qwen3.6-flash",
+            "messages": [{"role": "user", "content": "hi"}],
+            "vendor_options": {"api_key": "nested-secret"},
+        },
         headers={
             "Authorization": "Bearer secret",
             "Content-Type": "application/json",
@@ -55,6 +87,7 @@ def test_llm_trace_recorder_writes_full_payload_and_redacts_headers(
         "llm.response",
     ]
     assert rows[0]["payload"]["messages"][0]["content"] == "hi"
+    assert rows[0]["payload"]["vendor_options"]["api_key"] == "[REDACTED]"
     assert rows[0]["headers"]["Authorization"] == "[REDACTED]"
     assert rows[0]["headers"]["X-OpenSquilla-Install-Id"] == "[PRESENT]"
     assert rows[0]["headers"]["X-OpenSquilla-Session-Id"] == "[PRESENT]"

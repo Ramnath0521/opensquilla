@@ -117,12 +117,6 @@ def _patch_budget_resolvers(runner: TurnRunner) -> None:
     def _max_iter(self, session_key, mi):  # noqa: ARG001, ARG002
         return mi if mi is not None else 10
 
-    def _iter_t(self, session_key, it):  # noqa: ARG001, ARG002
-        return it if it is not None else 30.0
-
-    def _tool_t(self, session_key, tt):  # noqa: ARG001, ARG002
-        return tt if tt is not None else 20.0
-
     def _req_t(self, session_key, rt):  # noqa: ARG001, ARG002
         return rt if rt is not None else 120.0
 
@@ -131,8 +125,6 @@ def _patch_budget_resolvers(runner: TurnRunner) -> None:
 
     runner._resolve_agent_runtime_timeout = _runtime.__get__(runner, TurnRunner)
     runner._resolve_agent_max_iterations = _max_iter.__get__(runner, TurnRunner)
-    runner._resolve_agent_iteration_timeout = _iter_t.__get__(runner, TurnRunner)
-    runner._resolve_agent_tool_timeout = _tool_t.__get__(runner, TurnRunner)
     runner._resolve_agent_request_timeout = _req_t.__get__(runner, TurnRunner)
     runner._resolve_agent_max_provider_retries = _retries.__get__(runner, TurnRunner)
 
@@ -144,16 +136,12 @@ def _patch_thinking(runner: TurnRunner) -> None:
 
 
 def _patch_compaction_history(runner: TurnRunner) -> None:
-    async def _t3(self, *_a, **_kw):  # noqa: ARG002
-        return "not_applicable"
-
     async def _preflight(self, *_a, **_kw):  # noqa: ARG002
         return None
 
     async def _load_history(self, *_a, **_kw):  # noqa: ARG002
         return None
 
-    runner._maybe_compact_on_t3_upgrade = _t3.__get__(runner, TurnRunner)
     runner._maybe_preflight_compact = _preflight.__get__(runner, TurnRunner)
     runner._load_history = _load_history.__get__(runner, TurnRunner)
 
@@ -180,10 +168,8 @@ def _text_attachment(name: str, body: str) -> dict[str, str]:
 
 
 def _pdf_attachment() -> dict[str, str]:
-    # A minimal-but-malformed PDF blob. The extractor will fail and the
-    # build path will fold the failure into the "[attachment unavailable:
-    # PDF text could not be extracted: ...]" placeholder text block —
-    # identically in both modes.
+    # A malformed PDF still reaches the provider as metadata. Admission never
+    # imports a PDF parser; explicit tools inspect the retained original.
     return {
         "type": "application/pdf",
         "name": "tiny.pdf",
@@ -257,10 +243,10 @@ _CORPUS: list[tuple[str, dict[str, Any]]] = [
         expected_extra_is_none=False,
         expected_kinds=("ContentBlockText", "ContentBlockImage", "ContentBlockText"),
     ),
-    # PDF text-extraction failure folds into a ContentBlockText placeholder —
-    # same block kinds tuple in both modes.
+    # Ordinary file metadata is one text block, including an unavailable path
+    # when this harness has no workspace.
     _case(
-        "pdf_attachment_text_extraction",
+        "pdf_attachment_metadata",
         message="summarize",
         attachments=[_pdf_attachment()],
         expected_extra_is_none=False,
@@ -316,7 +302,7 @@ def _build_runner() -> TurnRunner:
         model_catalog=_StubModelCatalog(),
         memory_retrievers=None,
         turn_capture_services=None,
-        session_flush_service=None,
+
         session_lock_provider=None,
         diagnostics_state=None,
         turn_hooks=None,

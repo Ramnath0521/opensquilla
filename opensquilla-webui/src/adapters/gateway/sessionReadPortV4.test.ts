@@ -1,4 +1,9 @@
-import { describe, expect, it, vi } from 'vitest'
+import { RpcTimeoutError } from '@/lib/rpc'
+import { createSessionReadLifecycle, type SessionReadPortLease } from '@/modules/sessionReadLifecycle'
+import { createConversationRuntime } from '@/modules/conversationRuntime'
+import { createConversationSubscriptionLifecycle } from '@/modules/conversationSubscriptionLifecycle'
+import { afterEach, describe, expect, it, vi } from 'vitest'
+import { effectScope, ref } from 'vue'
 import type { RpcCallOptions } from '@/lib/rpc'
 import { CHAT_HISTORY_METHOD, type ChatHistoryResult } from '@/contracts/generated/v4/chatHistory'
 import {
@@ -17,8 +22,14 @@ import { SESSIONS_MESSAGES_UNSUBSCRIBE_METHOD } from '@/contracts/generated/v4/s
 import {
   SessionReadContractError,
   SessionReadFailure,
+  SessionReadHistoryCursorError,
   SessionReadSessionMissingError,
+  type SessionReadMetadata,
 } from '@/modules/sessionReadLifecycle'
+import type { ConversationEvent } from '@/modules/conversationEvents'
+import type { InterruptViewState } from '@/types/parts'
+import { useChatApprovals } from '@/composables/chat/useChatApprovals'
+import { createConversationEventsTestHarness } from '@/testing/conversationEvents.test-helper'
 import { createV4SessionReadPort } from './sessionReadPortV4'
 import { mapSessionReadError } from './sessionReadErrorMapping'
 
@@ -58,6 +69,7 @@ function metadataFields(hydrationComplete = true) {
     pendingUserInputs: [{ request_id: 'input-1' }],
     collaboration: { mode_name: 'delegate' },
     routing: { mode: 'recommended' },
+    planPresentations: [{ revisionId: 'plan-1', dismissed: true, stateRevision: 2 }],
     currentPlan: { plan_id: 'plan-1' },
     activePlanRun: { run_id: 'run-1' },
     goal: { goal_id: 'goal-1' },
@@ -259,7 +271,378 @@ async function flushAsyncWork() {
   await Promise.resolve()
 }
 
+const SNAPSHOT_READ = 'sessions.messages.snapshot.read'
+const SNAPSHOT_RESUME = 'sessions.messages.resume'
+const SNAPSHOT_RELEASE = 'sessions.messages.snapshot.release'
+
+function installationHarness(modern = true) {
+  const base = makeHarness()
+  const snapshot = snapshotResult()
+  const bytes = Buffer.from(JSON.stringify(snapshot))
+  const resume = vi.fn(async (params: Record<string, unknown>) => ({
+    ...params, session_id: null, session_epoch: 3, replay_to_seq: snapshot.current_stream_seq,
+  }))
+  const consume = vi.fn(async () => {})
+  const resumeFlow = vi.fn(async () => {})
+  base.requestMock.mockImplementation(async (method, params = {}, options) => {
+    base.calls.push({ method, params, options })
+    options?.onSent?.(base.rpc.generation)
+    if (method === SNAPSHOT_READ) return {
+      key: 'alpha', sync_revision: params.sync_revision, snapshot_id: `snapshot-${params.sync_revision}`,
+      segment_index: 0, segment_count: 1, byte_length: bytes.length,
+      encoding: 'base64-json-utf8', data: bytes.toString('base64'),
+      stream_generation: snapshot.stream_generation, current_stream_seq: snapshot.current_stream_seq,
+      task_id: snapshot.task_id, session_id: null, session_epoch: 3,
+    }
+    if (method === SNAPSHOT_RESUME) return resume(params)
+    if (method === SNAPSHOT_RELEASE) return { ...params, retired: true }
+    const result = base.results.get(method)
+    if (result instanceof Error) throw result
+    return result
+  })
+  const rpc = {
+    ...base.rpc,
+    get generation() { return base.rpc.generation },
+    supports: (method: string) => method === SNAPSHOT_READ || modern,
+    waitForConsumption: consume,
+    resumeFlow,
+  }
+  return { ...base, rpc, resume, consume, resumeFlow }
+}
+
+describe('SessionReadPort installation error boundary', () => {
+  for (const source of ['initial', 'reconciliation'] as const) {
+    it.each([
+      ['SNAPSHOT_STALE', 'unavailable', true],
+      ['SNAPSHOT_EXPIRED', 'unavailable', true],
+      ['SNAPSHOT_BUSY', 'busy', false],
+      ['RPC_TIMEOUT', 'timeout', false],
+    ] as const)(`${source} installation recovers after %s on the current lease`, async (code, kind, replace) => {
+      const h = installationHarness()
+      const lease = createV4SessionReadPort(h.rpc).open(openRequest())
+      try {
+        let live = await lease.live
+        if (source === 'reconciliation') {
+          await live.confirmInstalled!()
+          live = await lease.reconcile()
+        }
+        const before = h.calls.filter(call => call.method === SNAPSHOT_READ)
+        const revision = before[before.length - 1]!.params!.sync_revision
+        const error = Object.assign(new Error('Snapshot installation is no longer available'), {
+          code, retryable: false, retry_after_ms: 100,
+        })
+        h.resume.mockRejectedValueOnce(error)
+        await expect(live.confirmInstalled!()).rejects.toMatchObject({
+          name: 'SessionReadFailure', kind, retryable: true, retryAfterMs: 100, cause: error,
+        })
+
+        const [first, concurrent] = await Promise.all([lease.reconcile(), lease.reconcile()])
+        expect(first).toBe(concurrent)
+        await first.confirmInstalled!()
+        const reads = h.calls.filter(call => call.method === SNAPSHOT_READ)
+        expect(reads).toHaveLength(before.length + Number(replace))
+        expect(reads[reads.length - 1]!.params!.sync_revision === revision).toBe(!replace)
+        expect(h.calls.filter(call => call.method === SESSIONS_MESSAGES_SUBSCRIBE_METHOD)).toHaveLength(1)
+        expect(h.calls.filter(call => call.method === SESSIONS_MESSAGES_UNSUBSCRIBE_METHOD)).toHaveLength(0)
+      } finally { await lease.close() }
+    })
+  }
+
+  it.each(['legacy-flow', 'consumption'] as const)('maps %s confirmation failures at the same boundary', async source => {
+    const h = installationHarness(source !== 'legacy-flow')
+    const lease = createV4SessionReadPort(h.rpc).open(openRequest())
+    try {
+      const live = await lease.live
+      const error = Object.assign(new Error('confirmation busy'), { code: 'STORAGE_BUSY' })
+      const confirmation = source === 'legacy-flow' ? h.resumeFlow : h.consume
+      confirmation.mockRejectedValueOnce(error)
+      await expect(live.confirmInstalled!()).rejects.toMatchObject({ kind: 'busy', retryable: true, cause: error })
+    } finally { await lease.close() }
+  })
+
+  it.each(['abort', 'generation'] as const)('fences confirmation and its synchronous check after %s', async reason => {
+    const h = installationHarness()
+    const controller = new AbortController()
+    const lease = createV4SessionReadPort(h.rpc).open(openRequest(controller.signal))
+    try {
+      const live = await lease.live
+      if (reason === 'abort') controller.abort()
+      else h.setGeneration(8)
+      await expect(live.confirmInstalled!()).rejects.toMatchObject({ kind: 'aborted' })
+      expect(() => live.assertInstalledCurrent!()).toThrow(SessionReadFailure)
+      expect(h.resume).not.toHaveBeenCalled()
+    } finally { await lease.close() }
+  })
+
+  it.each(['abort', 'generation'] as const)('rejects an in-flight proof after %s without consuming its tail', async reason => {
+    const h = installationHarness()
+    const controller = new AbortController()
+    const lease = createV4SessionReadPort(h.rpc).open(openRequest(controller.signal))
+    try {
+      const live = await lease.live
+      const proof = deferred<Awaited<ReturnType<typeof h.resume>>>()
+      h.resume.mockImplementationOnce(() => proof.promise)
+      const rejected = expect(live.confirmInstalled!()).rejects.toMatchObject({ kind: 'aborted' })
+      await flushAsyncWork()
+      if (reason === 'abort') controller.abort()
+      else h.setGeneration(8)
+      proof.resolve({ ...h.resume.mock.calls[0]![0], session_id: null, session_epoch: 3, replay_to_seq: 8 })
+      await rejected
+      expect(h.consume).not.toHaveBeenCalled()
+    } finally { await lease.close() }
+  })
+
+  it('preserves terminal failure and contract-error semantics', async () => {
+    const h = installationHarness()
+    const lease = createV4SessionReadPort(h.rpc).open(openRequest())
+    try {
+      const live = await lease.live
+      h.resume.mockRejectedValueOnce(Object.assign(new Error('not authorized'), {
+        code: 'UNAUTHORIZED', retryable: false,
+      }))
+      await expect(live.confirmInstalled!()).rejects.toMatchObject({ kind: 'unavailable', retryable: false })
+      const contractError = new SessionReadContractError('invalid installation proof')
+      h.resume.mockRejectedValueOnce(contractError)
+      await expect(live.confirmInstalled!()).rejects.toBe(contractError)
+    } finally { await lease.close() }
+  })
+
+  it('keeps old installation closures bound to the retired snapshot', async () => {
+    const h = installationHarness()
+    const lease = createV4SessionReadPort(h.rpc).open(openRequest())
+    try {
+      const old = await lease.live
+      await old.confirmInstalled!()
+      const current = await lease.reconcile()
+      const resumeCount = h.resume.mock.calls.length
+      await expect(old.confirmInstalled!()).rejects.toMatchObject({ kind: 'aborted' })
+      expect(() => old.assertInstalledCurrent!()).toThrow(SessionReadFailure)
+      expect(h.resume).toHaveBeenCalledTimes(resumeCount)
+      await current.confirmInstalled!()
+      expect(h.resume).toHaveBeenCalledTimes(resumeCount + 1)
+      expect(h.calls.filter(call => call.method === SNAPSHOT_RELEASE)).toHaveLength(1)
+    } finally { await lease.close() }
+  })
+
+  it('hydrates from the recovered subscription ACK after the original subscribe failed', async () => {
+    const h = installationHarness()
+    h.results.set(SESSIONS_MESSAGES_SUBSCRIBE_METHOD, new RpcTimeoutError(SESSIONS_MESSAGES_SUBSCRIBE_METHOD, 7_000))
+    const lease = createV4SessionReadPort(h.rpc).open(openRequest())
+    try {
+      await Promise.all([
+        expect(lease.live).rejects.toMatchObject({ kind: 'timeout' }),
+        expect(lease.metadata).rejects.toMatchObject({ kind: 'timeout' }),
+      ])
+      h.results.set(SESSIONS_MESSAGES_SUBSCRIBE_METHOD, subscribeResult({
+        ...metadataFields(false), current_stream_seq: 25,
+      }))
+      await (await lease.reconcile()).confirmInstalled!()
+      const [first, concurrent] = await Promise.all([lease.retryMetadata(), lease.retryMetadata()])
+      expect(first).toBe(concurrent)
+      expect(first).toMatchObject({
+        hydrationComplete: true,
+        pendingUserInputsCursor: { streamGeneration: 'stream-1', currentStreamSeq: 25 },
+      })
+      expect(h.calls.filter(call => call.method === SESSIONS_MESSAGES_HYDRATE_METHOD)).toHaveLength(1)
+      expect(h.calls.filter(call => call.method === SESSIONS_MESSAGES_SUBSCRIBE_METHOD)).toHaveLength(2)
+      expect(h.calls.filter(call => call.method === SESSIONS_MESSAGES_UNSUBSCRIBE_METHOD)).toHaveLength(0)
+    } finally { await lease.close() }
+  })
+})
+
 describe('v4 SessionReadPort Adapter', () => {
+  it('recovers admission on the same lease after ready times out without a socket generation change', async () => {
+    const harness = makeHarness()
+    harness.rpc.ready.mockRejectedValueOnce(new RpcTimeoutError('ready', 15_000))
+    const lease = createV4SessionReadPort(harness.rpc).open(openRequest())
+    // All initial consumers see the bounded failure, rather than hiding it.
+    await Promise.all([
+      expect(lease.live).rejects.toMatchObject({ kind: 'timeout' }),
+      expect(lease.metadata).rejects.toMatchObject({ kind: 'timeout' }),
+      expect(lease.criticalRequestsQueued).rejects.toMatchObject({ kind: 'timeout' }),
+    ])
+    expect(harness.calls).toHaveLength(0)
+
+    harness.results.set(SESSIONS_MESSAGES_SNAPSHOT_METHOD, snapshotResult({ task_id: null, events: [] }))
+    harness.results.set(SESSIONS_MESSAGES_HYDRATE_METHOD, hydrateResult({
+      run_status: 'idle', active_task: null,
+      last_task: { task_id: 'task-1', status: 'succeeded' },
+    }))
+    const [first, second] = await Promise.all([lease.reconcile(), lease.reconcile()])
+    expect(first).toBe(second)
+    expect(first.initialMetadata.runStatus).toBe('idle')
+    expect(harness.rpc.ready).toHaveBeenCalledTimes(2)
+    expect(harness.calls.filter(call => call.method === SESSIONS_MESSAGES_SUBSCRIBE_METHOD)).toHaveLength(1)
+    await expect(lease.readHistory({ direction: 'latest', limit: 100,
+      signal: new AbortController().signal })).resolves.toMatchObject({ loadedCount: 1 })
+    await lease.close()
+  })
+
+  it('refreshes a live subscription in place and coalesces concurrent reconciliation', async () => {
+    const harness = makeHarness()
+    const lease = createV4SessionReadPort(harness.rpc).open(openRequest())
+    await lease.live
+    harness.calls.length = 0
+    const fresh = deferred<SessionsMessagesSnapshotResult>()
+    harness.results.set(SESSIONS_MESSAGES_SNAPSHOT_METHOD, fresh.promise)
+    const first = lease.reconcile()
+    const second = lease.reconcile()
+    await flushAsyncWork()
+    expect(harness.calls.map(call => call.method)).toEqual([SESSIONS_MESSAGES_SNAPSHOT_METHOD])
+    fresh.resolve(snapshotResult({ current_stream_seq: 42 }))
+    const [a, b] = await Promise.all([first, second])
+    expect(a).toBe(b)
+    expect(a.snapshotCursor?.currentStreamSeq).toBe(42)
+    expect(a.initialMetadata.pendingUserInputsCursor).toEqual({
+      streamGeneration: 'stream-1', currentStreamSeq: 42,
+    })
+    expect(a.initialMetadata.goalSnapshotStreamSeq).toBe(6)
+    expect(harness.calls.map(call => call.method)).toEqual([
+      SESSIONS_MESSAGES_SNAPSHOT_METHOD, SESSIONS_MESSAGES_HYDRATE_METHOD,
+    ])
+    await lease.close()
+  })
+
+  it('retains a newer live questionnaire across late empty in-place hydration, then expires it at a newer snapshot', async () => {
+    const harness = makeHarness()
+    const lease = createV4SessionReadPort(harness.rpc).open(openRequest())
+    await lease.live
+    const scope = effectScope()
+    const events = createConversationEventsTestHarness()
+    const interruptState = ref<ReadonlyMap<string, InterruptViewState>>(new Map())
+    const approvals = scope.run(() => useChatApprovals({
+      gatewayAvailability: ref('available'),
+      approvalCenter: {
+        snapshot: vi.fn(async () => ({ pending: [], mode: 'prompt' as const })),
+        subscribe: vi.fn(() => ({ close: vi.fn() })),
+        subscribeAvailability: vi.fn(() => ({ close: vi.fn() })),
+      } as never,
+      conversationEvents: events.events,
+      clarificationSubmission: { submit: vi.fn() } as never,
+      sessionKey: ref('alpha'), interruptState,
+      runStatus: ref({ status: 'running', label: '', task: { task_id: 'task-1' } }),
+      stream: { isStreaming: ref(true), appendInterruptFrame: vi.fn(), ensureInterruptBubble: vi.fn() },
+    }))!
+    const unsubscribe = approvals.subscribe()
+    const applyMetadata = (metadata: SessionReadMetadata) => approvals.applyUserInputBootstrap({
+      sessionKey: metadata.sessionKey,
+      epoch: metadata.epoch,
+      streamSeq: metadata.pendingUserInputsCursor?.currentStreamSeq,
+      streamGeneration: metadata.pendingUserInputsCursor?.streamGeneration,
+      pendingUserInputs: [...metadata.pendingUserInputs],
+    })
+    const ask = (requestId: string, streamSeq: number) => events.emit({
+      kind: 'conversation', event: {
+        kind: 'known', semanticKind: 'tool-result',
+        payload: {
+          key: 'alpha', task_id: 'task-1', epoch: 3,
+          stream_generation: 'stream-1', stream_seq: streamSeq,
+          id: `call-${requestId}`, name: 'request_user_input',
+          approvalResult: {
+            kind: 'user_input', paused: true, request_id: requestId,
+            run_id: 'task-1', step: 'clarify',
+            clarify_schema: {
+              presentation: 'plan_questionnaire_v1',
+              fields: [{ name: 'scope', type: 'string', required: true, prompt: 'Which scope?' }],
+            },
+          },
+        },
+        meta: {}, sessionKey: 'alpha', taskId: 'task-1', turnId: null,
+        streamGeneration: 'stream-1', streamSeq, connectionSeq: null, generationEpoch: null,
+      },
+    } as ConversationEvent)
+    try {
+      ask('older-question', 10)
+      harness.results.set(SESSIONS_MESSAGES_SNAPSHOT_METHOD, snapshotResult({ current_stream_seq: 40 }))
+      const lateMetadata = deferred<SessionsMessagesHydrateResult>()
+      harness.results.set(SESSIONS_MESSAGES_HYDRATE_METHOD, lateMetadata.promise)
+      const recovery = lease.reconcile()
+      await flushAsyncWork()
+      expect(harness.calls[harness.calls.length - 1]?.method).toBe(SESSIONS_MESSAGES_HYDRATE_METHOD)
+
+      ask('newer-question', 41)
+      lateMetadata.resolve(hydrateResult({ pendingUserInputs: [], goalSnapshotStreamSeq: 77 }))
+      const recovered = await recovery
+      expect(recovered.initialMetadata.pendingUserInputsCursor).toEqual({
+        streamGeneration: 'stream-1', currentStreamSeq: 40,
+      })
+      expect(recovered.initialMetadata.goalSnapshotStreamSeq).toBe(77)
+      applyMetadata(recovered.initialMetadata)
+      expect(approvals.pendingClarify.value?.requestId).toBe('newer-question')
+      expect(interruptState.value.get('older-question')?.resolution).toBe('expired')
+      expect(interruptState.value.get('newer-question')?.resolution).not.toBe('expired')
+
+      harness.results.set(SESSIONS_MESSAGES_SNAPSHOT_METHOD, snapshotResult({ current_stream_seq: 42 }))
+      harness.results.set(SESSIONS_MESSAGES_HYDRATE_METHOD, hydrateResult({ pendingUserInputs: [] }))
+      applyMetadata((await lease.reconcile()).initialMetadata)
+      expect(approvals.pendingClarify.value).toBeNull()
+      expect(interruptState.value.get('newer-question')?.resolution).toBe('expired')
+      expect(harness.calls.filter(call => call.method === SESSIONS_MESSAGES_SUBSCRIBE_METHOD)).toHaveLength(1)
+      expect(harness.calls.filter(call => call.method === SESSIONS_MESSAGES_UNSUBSCRIBE_METHOD)).toHaveLength(0)
+    } finally {
+      unsubscribe()
+      scope.stop()
+      await lease.close()
+    }
+  })
+
+  it('retains the confirmed subscription lower bound when an older Gateway has no snapshot capability', async () => {
+    const harness = makeHarness()
+    harness.results.set(SESSIONS_MESSAGES_SNAPSHOT_METHOD, Object.assign(new Error('legacy Gateway'), {
+      code: 'METHOD_NOT_FOUND',
+    }))
+    const lease = createV4SessionReadPort(harness.rpc).open(openRequest())
+    await lease.live
+    try {
+      const recovered = await lease.reconcile()
+      expect(recovered.snapshot).toBeNull()
+      expect(recovered.initialMetadata.pendingUserInputsCursor).toEqual({
+        streamGeneration: 'stream-1', currentStreamSeq: 9,
+      })
+      expect(recovered.initialMetadata.goalSnapshotStreamSeq).toBe(6)
+      expect(harness.calls.filter(call => call.method === SESSIONS_MESSAGES_SUBSCRIBE_METHOD)).toHaveLength(1)
+    } finally {
+      await lease.close()
+    }
+  })
+
+  it('rejects original-lease reconciliation after a real connection generation change', async () => {
+    const harness = makeHarness()
+    const lease = createV4SessionReadPort(harness.rpc).open(openRequest())
+    await lease.live
+    harness.calls.length = 0
+    harness.setGeneration(8)
+    await expect(lease.reconcile()).rejects.toMatchObject({ kind: 'aborted' })
+    expect(harness.calls).toHaveLength(0)
+  })
+
+  it('restores physical provider models independently of the router selection', async () => {
+    const harness = makeHarness()
+    const routerDecision = { model: 'deepseek-v4-pro', tier: 'c2', decision_id: 'decision-A' }
+    const activities = [
+      { phase: 'requesting', model: 'deepseek-v4-pro' },
+      { phase: 'fallback', model: 'kimi-k2.7-code' },
+      { phase: 'retrying', model: 'kimi-k2.7-code', retry_attempt: 1 },
+      { phase: 'fallback', model: 'deepseek-v4-pro-0813' },
+      { phase: 'reasoning', model: 'deepseek-v4-pro-0813' },
+      { phase: 'reasoning', heartbeat: true },
+    ]
+    harness.results.set(SESSIONS_MESSAGES_SNAPSHOT_METHOD, snapshotResult({ events: [
+      { event: 'session.event.router_decision', payload: routerDecision },
+      ...activities.map(payload => ({ event: 'session.event.provider_activity', payload })),
+    ] }))
+    const lease = createV4SessionReadPort(harness.rpc).open(openRequest())
+    try {
+      const live = await lease.live
+      expect(live.snapshot?.events).toEqual([
+        { semanticKind: 'router-decision', payload: routerDecision },
+        ...activities.map(payload => ({ semanticKind: 'provider-activity', payload })),
+      ])
+    } finally {
+      await lease.close()
+    }
+  })
+
   it.each([
     {
       name: 'an empty canonical key',
@@ -361,6 +744,21 @@ describe('v4 SessionReadPort Adapter', () => {
     } satisfies Partial<SessionReadFailure>)
   })
 
+  it.each([
+    ['HISTORY_CURSOR_INVALID', 'invalid'],
+    ['history_cursor_invalidated', 'stale'],
+  ] as const)('maps %s to reload-latest cursor recovery', (code, reason) => {
+    const cause = Object.assign(new Error('cursor rejected'), { code })
+
+    expect(mapSessionReadError(cause)).toMatchObject({
+      name: 'SessionReadHistoryCursorError',
+      code: 'history-cursor-rejected',
+      reason,
+      recovery: 'reload-latest',
+      cause,
+    } satisfies Partial<SessionReadHistoryCursorError>)
+  })
+
   it('queues critical frames in order while live, metadata and history settle independently', async () => {
     const harness = makeHarness()
     const subscribe = deferred<SessionsMessagesSubscribeResult>()
@@ -396,6 +794,7 @@ describe('v4 SessionReadPort Adapter', () => {
       activeTaskId: 'task-snapshot',
       initialMetadata: {
         hydrationComplete: false,
+        pendingUserInputsCursor: { streamGeneration: 'stream-1', currentStreamSeq: 9 },
         projectWorkspace: { display_name: 'Workspace One' },
       },
       snapshot: {
@@ -434,7 +833,10 @@ describe('v4 SessionReadPort Adapter', () => {
 
     hydrated.resolve(hydrateResult())
     history.resolve(historyResult())
-    await expect(lease.metadata).resolves.toMatchObject({ hydrationComplete: true })
+    await expect(lease.metadata).resolves.toMatchObject({
+      hydrationComplete: true,
+      pendingUserInputsCursor: { streamGeneration: 'stream-1', currentStreamSeq: 9 },
+    })
     await expect(firstHistory).resolves.toMatchObject({ loadedCount: 1 })
 
     await lease.close()
@@ -462,6 +864,7 @@ describe('v4 SessionReadPort Adapter', () => {
       runModeLock: { locked: true, runMode: 'safe', source: 'profile' },
       pendingUserInputs: [{ request_id: 'input-1' }],
       collaboration: { mode_name: 'delegate' },
+      planPresentations: [{ revisionId: 'plan-1', dismissed: true, stateRevision: 2 }],
       currentPlan: { plan_id: 'plan-1' },
       activePlanRun: { run_id: 'run-1' },
       goal: { goal_id: 'goal-1' },
@@ -470,6 +873,7 @@ describe('v4 SessionReadPort Adapter', () => {
       lastTask: { task_id: 'task-0' },
       queuedTaskIds: ['task-2'],
       epoch: 3,
+      pendingUserInputsCursor: { streamGeneration: 'stream-1', currentStreamSeq: 9 },
       hydrationComplete: true,
       additional: { future_metadata: { snake_value: true } },
     })
@@ -585,8 +989,14 @@ describe('v4 SessionReadPort Adapter', () => {
     }))
     const firstRetry = lease.retryMetadata()
     const secondRetry = lease.retryMetadata()
-    await expect(firstRetry).resolves.toMatchObject({ routing: { mode: 'manual' } })
-    await expect(secondRetry).resolves.toMatchObject({ routing: { mode: 'manual' } })
+    // Hydration has no stream cursor of its own. Retain the subscription's
+    // lower bound so an empty pending list cannot erase newer live questions.
+    const expectedMetadata = {
+      routing: { mode: 'manual' },
+      pendingUserInputsCursor: { streamGeneration: 'stream-1', currentStreamSeq: 9 },
+    }
+    await expect(firstRetry).resolves.toMatchObject(expectedMetadata)
+    await expect(secondRetry).resolves.toMatchObject(expectedMetadata)
     expect(harness.calls.filter(call => call.method === SESSIONS_MESSAGES_HYDRATE_METHOD))
       .toHaveLength(2)
     expect(harness.calls.filter(call => call.method === SESSIONS_MESSAGES_SUBSCRIBE_METHOD))
@@ -690,6 +1100,93 @@ describe('v4 SessionReadPort Adapter', () => {
     await lease.close()
   })
 
+  it.each(['subscribe', 'hydrate'] as const)(
+    'decodes only the v3 trusted run-mode alias at the %s boundary',
+    async (boundary) => {
+      const harness = makeHarness()
+      const result = boundary === 'subscribe' ? subscribeResult() : hydrateResult()
+      const wire = {
+        ...result,
+        run_mode_lock: { locked: true, runMode: 'trusted', source: 'task', extra: 'preserved' },
+        future_metadata: { runMode: 'trusted' },
+      }
+      const original = structuredClone(wire)
+      harness.results.set(SESSIONS_MESSAGES_SUBSCRIBE_METHOD, boundary === 'subscribe'
+        ? wire : subscribeResult({ ...metadataFields(false), hydration_complete: false }))
+      harness.results.set(SESSIONS_MESSAGES_HYDRATE_METHOD, wire)
+      const lease = createV4SessionReadPort(harness.rpc).open(openRequest())
+
+      await Promise.all([
+        expect(lease.live).resolves.toMatchObject({ sessionKey: 'alpha' }),
+        expect(lease.metadata).resolves.toMatchObject({
+          runModeLock: { locked: true, runMode: 'safe', source: 'task', additional: { extra: 'preserved' } },
+          additional: { future_metadata: { runMode: 'trusted' } },
+        }),
+      ])
+      expect(wire).toEqual(original)
+      await lease.close()
+    },
+  )
+
+  it.each(['trusted', 'unknown'])(
+    'validates run mode %s when reconciliation retries a lost subscribe ACK', async (runMode) => {
+      const harness = makeHarness()
+      harness.results.set(SESSIONS_MESSAGES_SUBSCRIBE_METHOD, new Error('subscribe ACK lost'))
+      const lease = createV4SessionReadPort(harness.rpc).open(openRequest())
+      await Promise.all([
+        expect(lease.live).rejects.toThrow('subscribe ACK lost'),
+        expect(lease.metadata).rejects.toThrow('subscribe ACK lost'),
+      ])
+      harness.results.set(SESSIONS_MESSAGES_SUBSCRIBE_METHOD, {
+        ...subscribeResult(), run_mode_lock: { locked: true, runMode },
+      })
+      harness.results.set(SESSIONS_MESSAGES_HYDRATE_METHOD, {
+        ...hydrateResult(), run_mode_lock: { locked: true, runMode: 'trusted' },
+      })
+      if (runMode === 'trusted') {
+        await expect(lease.reconcile()).resolves.toMatchObject({
+          initialMetadata: { runModeLock: { locked: true, runMode: 'safe' } },
+        })
+      } else {
+        await expect(lease.reconcile()).rejects.toBeInstanceOf(SessionReadContractError)
+      }
+      expect(harness.calls.filter(call => call.method === SESSIONS_MESSAGES_SUBSCRIBE_METHOD)).toHaveLength(2)
+      await lease.close()
+    },
+  )
+
+  it.each(['safe', 'full', undefined] as const)('preserves canonical or absent run mode %s', async (runMode) => {
+    const harness = makeHarness()
+    harness.results.set(SESSIONS_MESSAGES_HYDRATE_METHOD, {
+      ...hydrateResult(), run_mode_lock: { locked: runMode !== undefined, ...(runMode ? { runMode } : {}) },
+    })
+    harness.results.set(SESSIONS_MESSAGES_SUBSCRIBE_METHOD,
+      subscribeResult({ ...metadataFields(false), hydration_complete: false }))
+    const lease = createV4SessionReadPort(harness.rpc).open(openRequest())
+    await lease.live
+    await expect(lease.metadata).resolves.toMatchObject({
+      runModeLock: { locked: runMode !== undefined, runMode: runMode ?? null },
+    })
+    await lease.close()
+  })
+
+  it.each([
+    { locked: true, runMode: 'bypass' },
+    { locked: true, runMode: 'unknown' },
+    { locked: true, runMode: null },
+    { locked: 'yes', runMode: 'trusted' },
+    { locked: true, runMode: 'trusted', source: 42 },
+  ])('keeps malformed run-mode locks invalid: %j', async (lock) => {
+    const harness = makeHarness()
+    harness.results.set(SESSIONS_MESSAGES_SUBSCRIBE_METHOD,
+      subscribeResult({ ...metadataFields(false), hydration_complete: false }))
+    harness.results.set(SESSIONS_MESSAGES_HYDRATE_METHOD, { ...hydrateResult(), run_mode_lock: lock })
+    const lease = createV4SessionReadPort(harness.rpc).open(openRequest())
+    await lease.live
+    await expect(lease.metadata).rejects.toBeInstanceOf(SessionReadContractError)
+    await lease.close()
+  })
+
   it('normalizes only the legacy canonical proof fields before result validation', async () => {
     const harness = makeHarness()
     const legacy = { ...historyResult() } as Record<string, unknown>
@@ -763,6 +1260,7 @@ describe('v4 SessionReadPort Adapter', () => {
         timeoutAction: expectedAction,
         abortAction: 'reject',
         expectedGeneration: 7,
+        recoveryClass: 'safe-read',
       })
 
       await lease.close()
@@ -860,5 +1358,175 @@ describe('v4 SessionReadPort Adapter', () => {
     await replacedLease.close()
     expect(replaced.calls.some(call => call.method === SESSIONS_MESSAGES_UNSUBSCRIBE_METHOD))
       .toBe(false)
+  })
+
+  it('keeps a late malformed unsubscribe reply local after its successor has subscribed', async () => {
+    const h = makeHarness()
+    const failProtocol = vi.fn()
+    const port = createV4SessionReadPort({ ...h.rpc, failProtocol })
+    const prior = port.open(openRequest())
+    await prior.live
+    const oldReply = deferred<unknown>()
+    h.results.set(SESSIONS_MESSAGES_UNSUBSCRIBE_METHOD, oldReply.promise)
+    await prior.close()
+    const successor = port.open(openRequest())
+    await successor.live
+    oldReply.resolve({ subscribed: false })
+    await flushAsyncWork()
+    expect(failProtocol).not.toHaveBeenCalled()
+    await expect(successor.reconcile()).resolves.toMatchObject({ sessionKey: 'alpha' })
+    h.results.set(SESSIONS_MESSAGES_UNSUBSCRIBE_METHOD, null)
+    await successor.close()
+  })
+
+  it('still rejects an invalid cleanup result when no send receipt settled the close', async () => {
+    const h = makeHarness()
+    const original = h.requestMock.getMockImplementation()!
+    h.requestMock.mockImplementation((method, params, options) => (
+      method === SESSIONS_MESSAGES_UNSUBSCRIBE_METHOD
+        ? Promise.resolve({ subscribed: false }) : original(method, params, options)
+    ))
+    const lease = createV4SessionReadPort(h.rpc).open(openRequest())
+    await lease.live
+    await expect(lease.close()).rejects.toBeInstanceOf(SessionReadContractError)
+  })
+})
+
+function deadlineHarness(options: {
+  delayedAck?: boolean
+  preSend?: boolean
+  abortOwner?: boolean
+  changeGeneration?: boolean
+  snapshotError?: string
+  rejectSubscribe?: boolean
+  replayGap?: boolean
+} = {}) {
+  const base = makeHarness()
+  const ack = deferred<SessionsMessagesSubscribeResult>()
+  const lateSnapshot = deferred<SessionsMessagesSnapshotResult>()
+  const controller = new AbortController()
+  let subscribed = false
+  const delivered: string[] = []
+  base.results.set(SESSIONS_MESSAGES_SUBSCRIBE_METHOD, subscribeResult({
+    ...(options.replayGap ? { replay_complete: false, replay_gap_reason: 'trimmed' } : {}),
+  }))
+  base.requestMock.mockImplementation((method, params, callOptions) => {
+    base.calls.push({ method, params, options: callOptions })
+    if (method === SESSIONS_MESSAGES_SNAPSHOT_METHOD && options.preSend) {
+      return Promise.reject(new RpcTimeoutError(method, callOptions!.timeoutMs!))
+    }
+    callOptions?.onSent?.(base.rpc.generation)
+    if (method === SESSIONS_MESSAGES_SUBSCRIBE_METHOD) {
+      if (options.rejectSubscribe) return Promise.reject(new Error('subscribe rejected'))
+      subscribed = true
+      return options.delayedAck ? ack.promise : Promise.resolve(base.results.get(method))
+    }
+    if (method === SESSIONS_MESSAGES_UNSUBSCRIBE_METHOD) {
+      subscribed = false
+      return Promise.resolve(null)
+    }
+    if (method === SESSIONS_MESSAGES_SNAPSHOT_METHOD) {
+      return new Promise((resolve, reject) => {
+        const timer = setTimeout(() => {
+          if (options.abortOwner) controller.abort()
+          if (options.changeGeneration) base.setGeneration(8)
+          reject(options.snapshotError
+            ? Object.assign(new Error('snapshot rejected'), { code: options.snapshotError })
+            : new RpcTimeoutError(method, callOptions!.timeoutMs!))
+        }, callOptions!.timeoutMs)
+        lateSnapshot.promise.then(value => { clearTimeout(timer); resolve(value) }, reject)
+      })
+    }
+    return Promise.resolve(base.results.get(method))
+  })
+  return {
+    ...base, ack, lateSnapshot, controller,
+    isSubscribed: () => subscribed,
+    emit(name: string) { if (subscribed) delivered.push(name) },
+    delivered,
+  }
+}
+
+afterEach(() => { vi.useRealTimers() })
+
+describe('sent snapshot deadline regression', () => {
+  it.each([false, true])('retains actual subscription after 3s snapshot deadline (ACK delayed=%s)', async delayedAck => {
+    vi.useFakeTimers()
+    const harness = deadlineHarness({ delayedAck })
+    const lifecycle = createSessionReadLifecycle({
+      port: createV4SessionReadPort(harness.rpc),
+      runtime: createConversationRuntime(),
+      subscriptions: createConversationSubscriptionLifecycle<SessionReadPortLease>(),
+    })
+    const lease = lifecycle.open({ sessionKey: 'alpha', includeInitialHistory: false })
+    const outcome = lease.live.then(value => ({ value }), error => ({ error }))
+    try {
+      await lease.criticalRequestsQueued
+      const request = harness.calls.find(call => call.method === SESSIONS_MESSAGES_SNAPSHOT_METHOD)
+      expect(request?.options).toMatchObject({ timeoutMs: 3000, timeoutAction: 'reject', abortAction: 'reject', expectedGeneration: 7, recoveryClass: 'safe-read' })
+      await vi.advanceTimersByTimeAsync(2999)
+      expect(harness.isSubscribed()).toBe(true)
+      await vi.advanceTimersByTimeAsync(1)
+      expect(harness.isSubscribed(), 'a request-local snapshot deadline must not unregister the acknowledged stream').toBe(true)
+      await vi.advanceTimersByTimeAsync(4630)
+      harness.ack.resolve(subscribeResult())
+      await vi.advanceTimersByTimeAsync(0)
+      const result = await outcome
+      expect(result).toMatchObject({ value: { snapshot: null, sessionKey: 'alpha', activeTaskId: 'task-1' } })
+      expect(lifecycle.current()).toBe(lease)
+      harness.lateSnapshot.resolve(snapshotResult({ current_stream_seq: 900 }))
+      await vi.advanceTimersByTimeAsync(0)
+      expect(await lease.live).toMatchObject({ snapshot: null })
+      // Only server-delivered tick/terminal names are synthetic; the actual
+      // Port and lifecycle own the live registration and close decision.
+      harness.emit('tick')
+      await vi.advanceTimersByTimeAsync(600_000)
+      harness.emit('session.event.done')
+      harness.emit('session.event.turn_committed')
+      expect(harness.delivered).toEqual(['tick', 'session.event.done', 'session.event.turn_committed'])
+      expect(harness.calls.filter(call => call.method === SESSIONS_MESSAGES_SUBSCRIBE_METHOD)).toHaveLength(1)
+      expect(harness.calls.filter(call => call.method === SESSIONS_MESSAGES_UNSUBSCRIBE_METHOD)).toHaveLength(0)
+    } finally { await lease.close() }
+    expect(harness.isSubscribed()).toBe(false)
+  })
+
+  it('retains incomplete replay as a required history recovery without inventing a snapshot watermark', async () => {
+    vi.useFakeTimers()
+    const harness = deadlineHarness({ replayGap: true })
+    const lifecycle = createSessionReadLifecycle({
+      port: createV4SessionReadPort(harness.rpc),
+      runtime: createConversationRuntime(),
+      subscriptions: createConversationSubscriptionLifecycle<SessionReadPortLease>(),
+    })
+    const lease = lifecycle.open({ sessionKey: 'alpha', includeInitialHistory: false })
+    const outcome = lease.live.then(value => ({ value }), error => ({ error }))
+    try {
+      await lease.criticalRequestsQueued
+      await vi.advanceTimersByTimeAsync(3000)
+      expect(await outcome).toMatchObject({ value: { snapshot: null, reloadRequired: 'replayGap' } })
+      expect(harness.isSubscribed()).toBe(true)
+      expect(await lease.history.latest()).toMatchObject({ messages: [{ id: '41', messageId: 'message-1' }] })
+    } finally { await lease.close() }
+  })
+
+  it.each<{ name: string; options: NonNullable<Parameters<typeof deadlineHarness>[0]> }>([
+    { name: 'not actually sent', options: { preSend: true } },
+    { name: 'owner aborted', options: { abortOwner: true } },
+    { name: 'generation changed', options: { changeGeneration: true } },
+    { name: 'session missing', options: { snapshotError: 'SESSION_NOT_FOUND' } },
+    { name: 'subscribe rejected', options: { rejectSubscribe: true } },
+  ])('fails closed when $name', async ({ options }) => {
+    vi.useFakeTimers()
+    const harness = deadlineHarness(options)
+    const lease = createV4SessionReadPort(harness.rpc).open(openRequest(harness.controller.signal, false))
+    const outcome = lease.live.then(value => ({ value }), error => ({ error }))
+    const admitted = lease.criticalRequestsQueued.then(() => ({ ready: true }), error => ({ error }))
+    const metadata = lease.metadata.then(value => ({ value }), error => ({ error }))
+    try {
+      await vi.advanceTimersByTimeAsync(3000)
+      expect(await outcome).toHaveProperty('error')
+      if (options.preSend) expect(await admitted).toHaveProperty('error')
+      if (options.rejectSubscribe) expect(await metadata).toHaveProperty('error')
+    } finally { await lease.close() }
   })
 })

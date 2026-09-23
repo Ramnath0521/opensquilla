@@ -92,9 +92,7 @@ export function runtimeArtifactHttpBaseOrigin(): string {
 }
 
 export function runtimeAttachmentHttpBaseOrigin(): string {
-  return typeof window !== 'undefined' && window.location?.origin
-    ? window.location.origin
-    : DEFAULT_BASE_ORIGIN
+  return runtimeArtifactHttpBaseOrigin()
 }
 
 function urlsShareArtifactOrigin(candidate: URL, base: URL): boolean {
@@ -180,13 +178,6 @@ export function artifactHttpAccessUrl(
   return artifactContentUrl(artifact, baseOrigin, 'content', options.absolute === true)
 }
 
-export function artifactHttpThumbnailUrl(
-  artifact: ArtifactPayload,
-  baseOrigin: string,
-): string {
-  return artifactContentUrl(artifact, baseOrigin, 'thumbnail')
-}
-
 export function artifactHttpGatewayOpenUrl(
   artifact: ArtifactPayload,
   baseOrigin: string,
@@ -229,7 +220,7 @@ export function artifactHttpAttachmentUrl(raw: unknown, baseOrigin: string): str
   try {
     const base = new URL(baseOrigin)
     const url = new URL(raw, base)
-    if ((url.protocol !== 'http:' && url.protocol !== 'https:') || url.origin !== base.origin) {
+    if (!trustedOrigin(url.href, baseOrigin)) {
       return ''
     }
     if (url.username || url.password) return ''
@@ -337,7 +328,7 @@ export function createArtifactPreviewLeaseHttp<T>(
   artifactId: string,
   mode: ArtifactPreviewMode,
   client: PlatformId,
-  context: ArtifactPreviewHttpContext,
+  context: ArtifactPreviewHttpContext & { pagePath?: string },
 ): Promise<T> {
   const url = new URL(
     `${ARTIFACT_CONTENT_PATH}${encodeURIComponent(artifactId)}/preview-leases`,
@@ -345,7 +336,7 @@ export function createArtifactPreviewLeaseHttp<T>(
   ).toString()
   return http.requestJson<T>(url, {
     method: 'POST',
-    json: { version: 1, mode, client },
+    json: { version: 1, mode, client, ...(context.pagePath ? { pagePath: context.pagePath } : {}) },
     sessionKey: context.sessionKey,
     timeoutMs: 0,
   })

@@ -33,6 +33,7 @@ from opensquilla.engine.turn_runner.stream_consumer_stage import (
     StreamConsumerStage,
     StreamConsumerStageInput,
     _ArtifactHandler,
+    _cancel_pending_user_input_results,
     _CompactionHandler,
     _DoneHandler,
     _ErrorHandler,
@@ -164,8 +165,11 @@ class _RecordingCompactionPersist:
         removed_count: int = 0,
         source_entries: tuple[Any, ...] | None = None,
         source_preimage: tuple[tuple[Any, ...], ...] | None = None,
+        source_context_fingerprint: str | None = None,
         source_boundary_message_id: str | None = None,
         source_boundary_entry_id: int | None = None,
+        expected_session_id: str | None = None,
+        expected_session_epoch: int | None = None,
     ) -> bool | None:
         self.calls.append(
             {
@@ -185,8 +189,11 @@ class _RecordingCompactionPersist:
                 "removed_count": removed_count,
                 "source_entries": source_entries,
                 "source_preimage": source_preimage,
+                "source_context_fingerprint": source_context_fingerprint,
                 "source_boundary_message_id": source_boundary_message_id,
                 "source_boundary_entry_id": source_boundary_entry_id,
+                "expected_session_id": expected_session_id,
+                "expected_session_epoch": expected_session_epoch,
             }
         )
         if self.raises is not None:
@@ -291,8 +298,11 @@ def _make_input(
     tool_context: Any | None = None,
     compaction_source_entries: tuple[Any, ...] | None = None,
     compaction_source_preimage: tuple[tuple[Any, ...], ...] | None = None,
+    compaction_source_context_fingerprint: str | None = None,
     compaction_source_boundary_message_id: str | None = None,
     compaction_source_boundary_entry_id: int | None = None,
+    expected_session_id: str | None = None,
+    expected_session_epoch: int | None = None,
     execution_context: TurnExecutionContext | None = None,
 ) -> StreamConsumerStageInput:
     return StreamConsumerStageInput(
@@ -318,10 +328,13 @@ def _make_input(
         tool_context=tool_context,
         compaction_source_entries=compaction_source_entries,
         compaction_source_preimage=compaction_source_preimage,
+        compaction_source_context_fingerprint=compaction_source_context_fingerprint,
         compaction_source_boundary_message_id=(
             compaction_source_boundary_message_id
         ),
         compaction_source_boundary_entry_id=compaction_source_boundary_entry_id,
+        expected_session_id=expected_session_id,
+        expected_session_epoch=expected_session_epoch,
         input_mode=input_mode,
         execution_context=execution_context,
     )
@@ -925,7 +938,6 @@ def test_tool_result_handler_keeps_small_write_file_arguments() -> None:
     ("tool_name", "arguments"),
     [
         ("publish_artifact", {"path": "deck.pptx"}),
-        ("create_pptx", {"name": "deck.pptx", "slides": [{"title": "Deck"}]}),
     ],
 )
 def test_tool_result_handler_clears_delivery_failure_after_same_target_succeeds(
@@ -1033,128 +1045,10 @@ def test_tool_result_handler_matches_publish_target_across_workspace_path_forms(
     assert state.artifact_delivery_failures_by_target == {}
 
 
-def test_tool_result_handler_uses_create_pptx_effective_basename_and_suffix() -> None:
-    state = _make_state()
-    handler = _ToolResultHandler()
-
-    handler.handle(
-        ToolResultEvent(
-            tool_use_id="failed",
-            tool_name="create_pptx",
-            result='{"status":"error","user_message":"regenerate"}',
-            is_error=True,
-            arguments={"name": "reports/deck"},
-        ),
-        state,
-    )
-    handler.handle(
-        ToolResultEvent(
-            tool_use_id="succeeded",
-            tool_name="create_pptx",
-            result='{"status":"published"}',
-            arguments={"name": "deck.pptx"},
-        ),
-        state,
-    )
-
-    assert state.artifact_delivery_failures == []
-    assert state.artifact_delivery_failures_by_target == {}
 
 
-def test_publish_success_clears_create_name_failure_but_not_other_path_failure(
-    tmp_path,
-) -> None:
-    workspace = tmp_path / "workspace"
-    ctx = SimpleNamespace(workspace_dir=str(workspace))
-    state = _make_state()
-    handler = _ToolResultHandler()
-
-    handler.handle(
-        ToolResultEvent(
-            tool_use_id="create-failed",
-            tool_name="create_pptx",
-            result='{"status":"error","user_message":"create failed"}',
-            is_error=True,
-            arguments={"name": "deck.pptx"},
-        ),
-        state,
-        tool_context=ctx,
-    )
-    handler.handle(
-        ToolResultEvent(
-            tool_use_id="root-publish-failed",
-            tool_name="publish_artifact",
-            result='{"status":"error","user_message":"root path failed"}',
-            is_error=True,
-            arguments={"path": "deck.pptx"},
-        ),
-        state,
-        tool_context=ctx,
-    )
-    handler.handle(
-        ToolResultEvent(
-            tool_use_id="nested-publish-succeeded",
-            tool_name="publish_artifact",
-            result='{"status":"published","artifact":{"name":"deck.pptx"}}',
-            arguments={"path": "reports/deck.pptx"},
-        ),
-        state,
-        tool_context=ctx,
-    )
-
-    assert state.artifact_delivery_failures == ["root path failed"]
-    assert len(state.artifact_delivery_failures_by_target) == 1
-    assert next(iter(state.artifact_delivery_failures_by_target)).startswith("path:")
 
 
-@pytest.mark.parametrize(
-    ("failed_path_factory", "cleared"),
-    [
-        (lambda workspace: "deck.pptx", True),
-        (lambda workspace: str(workspace / "deck.pptx"), True),
-        (lambda workspace: "/workspace/deck.pptx", True),
-        (lambda workspace: "reports/deck.pptx", False),
-    ],
-)
-def test_create_pptx_success_only_clears_matching_root_publish_failure(
-    tmp_path,
-    failed_path_factory,
-    cleared: bool,
-) -> None:
-    workspace = tmp_path / "workspace"
-    ctx = SimpleNamespace(workspace_dir=str(workspace))
-    state = _make_state()
-    handler = _ToolResultHandler()
-    failed_path = failed_path_factory(workspace)
-
-    handler.handle(
-        ToolResultEvent(
-            tool_use_id="publish-failed",
-            tool_name="publish_artifact",
-            result='{"status":"error","user_message":"regenerate"}',
-            is_error=True,
-            arguments={"path": failed_path},
-        ),
-        state,
-        tool_context=ctx,
-    )
-    handler.handle(
-        ToolResultEvent(
-            tool_use_id="create-succeeded",
-            tool_name="create_pptx",
-            result='{"status":"published","artifact":{"name":"deck.pptx"}}',
-            arguments={"name": "deck.pptx", "slides": [{"title": "Deck"}]},
-        ),
-        state,
-        tool_context=ctx,
-    )
-
-    if cleared:
-        assert state.artifact_delivery_failures == []
-        assert state.artifact_delivery_failures_by_target == {}
-    else:
-        assert state.artifact_delivery_failures == ["regenerate"]
-        assert len(state.artifact_delivery_failures_by_target) == 1
 
 
 @pytest.mark.parametrize(
@@ -1198,13 +1092,13 @@ def test_explicit_publish_name_is_the_single_logical_failure_identity(
     handler.handle(
         ToolResultEvent(
             tool_use_id="create-succeeded",
-            tool_name="create_pptx",
+            tool_name="publish_artifact",
             result=(
                 '{"status":"published","artifact":{"name":"'
                 + created_name
                 + '"}}'
             ),
-            arguments={"name": created_name, "slides": [{"title": "Deck"}]},
+            arguments={"path": created_name},
         ),
         state,
         tool_context=ctx,
@@ -1351,6 +1245,41 @@ def test_tool_result_handler_preserves_initial_user_input_request() -> None:
     ]
 
 
+@pytest.mark.parametrize(
+    "boundary",
+    ["foreign-task", "foreign-tool", "unpaired-tool", "missing-request", "answered", "cancelled"],
+)
+def test_cancelled_user_input_projection_preserves_other_ownership_and_terminal_results(
+    boundary: str,
+) -> None:
+    state = _make_state()
+    pending = {
+        "status": "input_required", "kind": "user_input", "paused": True,
+        "request_id": "request-1", "run_id": "task-1",
+    }
+    if boundary == "foreign-task":
+        pending["run_id"] = "other-task"
+    elif boundary == "missing-request":
+        pending.pop("request_id")
+    elif boundary in {"answered", "cancelled"}:
+        pending.update(status=boundary, paused=False)
+    state.turn_segments.extend([
+        {"type": "tool_use", "tool_use_id": "call-1",
+         "name": "lookup" if boundary == "foreign-tool" else "request_user_input"},
+        {"type": "tool_result", "name": "request_user_input",
+         "tool_use_id": "other-call" if boundary == "unpaired-tool" else "call-1",
+         "result": json.dumps(pending), "is_error": False},
+    ])
+    before = json.dumps(state.turn_segments, sort_keys=True)
+    replay = {"version": 1, "messages": []}
+    for _ in range(2):
+        result = _cancel_pending_user_input_results(
+            state, task_id="task-1", assistant_replay=replay,
+        )
+        assert result is replay
+        assert json.dumps(state.turn_segments, sort_keys=True) == before
+
+
 def test_artifact_handler_appends_payload() -> None:
     state = _make_state()
     handler = _ArtifactHandler()
@@ -1432,10 +1361,23 @@ async def test_generated_artifact_adoption_failure_keeps_delivery() -> None:
 def test_error_handler_rewrites_timeout_envelope() -> None:
     state = _make_state()
     handler = _ErrorHandler()
-    result = handler.handle(ErrorEvent(message="x", code="timeout"), state)
+    event = ErrorEvent(
+        message="x", code="timeout", error_id="abcd1234",
+        failure_kind="transport_transient", generation_epoch=3,
+        retry_after_ms=8000, usage_call_index=2,
+        no_prior_provider_dispatch=False, replay_safe=False,
+    )
+    result = handler.handle(event, state)
     assert result is _SUPPRESS
     assert state.pending_error_event is not None
     assert state.pending_error_event.code == "llm_timeout"
+    assert state.pending_error_event.error_id == event.error_id
+    assert state.pending_error_event.failure_kind == event.failure_kind
+    assert state.pending_error_event.generation_epoch == event.generation_epoch
+    assert state.pending_error_event.retry_after_ms == event.retry_after_ms
+    assert state.pending_error_event.usage_call_index == event.usage_call_index
+    assert state.pending_error_event.no_prior_provider_dispatch is False
+    assert state.pending_error_event.replay_safe is False
 
 
 def test_error_handler_drops_unpaired_tool_use_on_incomplete_stream() -> None:
@@ -1676,8 +1618,11 @@ async def test_compaction_handler_runs_persist_snapshot_prompt_in_order() -> Non
     inp = _make_input(
         compaction_source_entries=source_entries,
         compaction_source_preimage=source_preimage,
+        compaction_source_context_fingerprint="frozen-context",
         compaction_source_boundary_message_id="source-boundary",
         compaction_source_boundary_entry_id=7,
+        expected_session_id="session-admitted",
+        expected_session_epoch=7,
     )
     await handler.handle(
         CompactionEvent(
@@ -1695,8 +1640,11 @@ async def test_compaction_handler_runs_persist_snapshot_prompt_in_order() -> Non
     assert persist.calls[0]["removed_count"] == 4
     assert persist.calls[0]["source_entries"] is source_entries
     assert persist.calls[0]["source_preimage"] is source_preimage
+    assert persist.calls[0]["source_context_fingerprint"] == "frozen-context"
     assert persist.calls[0]["source_boundary_message_id"] == "source-boundary"
     assert persist.calls[0]["source_boundary_entry_id"] == 7
+    assert persist.calls[0]["expected_session_id"] == "session-admitted"
+    assert persist.calls[0]["expected_session_epoch"] == 7
     assert len(snapshot.calls) == 1
     assert len(prompt.calls) == 1
 
@@ -2313,6 +2261,42 @@ async def test_system_event_keeps_bare_marker_on_a_middle_tool_boundary() -> Non
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("returncode", [0, 1])
+async def test_completed_background_process_does_not_emit_stale_notice(returncode: int) -> None:
+    state = _make_state()
+    state.turn_segments.extend([
+        {
+            "type": "tool_result",
+            "name": "background_process",
+            "result": "session_id=process-a\ncommand: synthetic-job\nstatus: running",
+            "execution_status": {"status": "unknown", "reason": "background_running"},
+        },
+        {
+            "type": "tool_result",
+            "name": "process",
+            "result": json.dumps({
+                "status": "ok",
+                "action": "wait",
+                "exited": True,
+                "session": {"session_id": "process-a", "returncode": returncode},
+            }),
+            "execution_status": {"status": "success" if returncode == 0 else "error"},
+        },
+    ])
+    final_text = "Process completed." if returncode == 0 else "Process exited unsuccessfully."
+    stage, _ = _make_stage(
+        agent_run=_RecordingAgentRun(events=[DoneEvent(text=final_text, text_snapshot=final_text)])
+    )
+
+    yielded = await _drain(stage, _make_input(state=state))
+
+    assert all("could not confirm" not in getattr(event, "text", "") for event in yielded)
+    assert isinstance(yielded[-1], DoneEvent)
+    assert yielded[-1].text == final_text
+    assert yielded[-1].text_snapshot == final_text
+
+
+@pytest.mark.asyncio
 async def test_system_event_runtime_notice_overrides_suppressed_model_delivery() -> None:
     state = _make_state()
     state.turn_segments.append(
@@ -2350,7 +2334,7 @@ async def test_system_event_runtime_notice_overrides_suppressed_model_delivery()
         "DoneEvent",
     ]
     notice = yielded[0].text
-    assert "could not confirm" in notice
+    assert "A running process was reported" in notice
     done = yielded[1]
     assert isinstance(done, DoneEvent)
     assert done.text == notice
@@ -2775,7 +2759,7 @@ async def test_auto_published_artifact_is_adopted_before_public_yield(
             "step-1",
             "in_progress",
             "task-artifact",
-            0,
+            1,
             id="running-current-step",
         ),
         pytest.param(
@@ -2791,7 +2775,7 @@ async def test_auto_published_artifact_is_adopted_before_public_yield(
             None,
             "completed",
             "other-task",
-            0,
+            1,
             id="running-delivery-ready-other-owner",
         ),
         pytest.param(
@@ -2804,7 +2788,7 @@ async def test_auto_published_artifact_is_adopted_before_public_yield(
         ),
     ],
 )
-async def test_plan_run_auto_publish_requires_live_delivery_ready_state(
+async def test_plan_run_auto_publish_uses_normal_delivery_rules_without_checkpoint_reads(
     tmp_path: Path,
     run_status: str,
     current_step_id: str | None,
@@ -2848,7 +2832,7 @@ async def test_plan_run_auto_publish_requires_live_delivery_ready_state(
 
     await _drain(stage, _make_input(state=state, tool_context=ctx))
 
-    assert storage.calls == ["run-artifact"]
+    assert storage.calls == []
     assert len(ctx.published_artifacts) == expected_artifact_count
     assert state.turn_artifacts == ctx.published_artifacts
 

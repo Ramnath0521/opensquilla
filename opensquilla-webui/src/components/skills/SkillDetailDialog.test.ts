@@ -31,7 +31,7 @@ afterEach(() => {
   document.body.innerHTML = ''
 })
 
-function mountDialog(initial: Skill | null, initialProposal: Proposal | null = null) {
+function mountDialog(initial: Skill | null, initialProposal: Proposal | null = null, canUseInTask = false) {
   const skill = ref<Skill | null>(initial)
   const proposal = ref<Proposal | null>(initialProposal)
   const close = vi.fn(() => {
@@ -39,6 +39,8 @@ function mountDialog(initial: Skill | null, initialProposal: Proposal | null = n
     proposal.value = null
   })
   const installDeps = vi.fn()
+  const setEnabled = vi.fn()
+  const useInTask = vi.fn()
   const host = document.createElement('div')
   document.body.appendChild(host)
   const app = createApp({
@@ -52,15 +54,45 @@ function mountDialog(initial: Skill | null, initialProposal: Proposal | null = n
       uninstallingName: null,
       onClose: close,
       onInstallDeps: installDeps,
+      canSetEnabled: true,
+      onSetEnabled: setEnabled,
+      canUseInTask,
+      onUseInTask: useInTask,
     }),
   })
   app.use(createI18n({ legacy: false, locale: 'en', messages: { en } }))
   app.mount(host)
   apps.push(app)
-  return { skill, proposal, close, installDeps, host, dialog: host.querySelector('dialog')! }
+  return { skill, proposal, close, installDeps, setEnabled, useInTask, host, dialog: host.querySelector('dialog')! }
 }
 
 describe('SkillDetailDialog behavior contract', () => {
+  it('hands an eligible skill to the draft action without toggling or installing it', async () => {
+    const skill = { name: 'synthetic-ready', status: 'ready' }
+    const mounted = mountDialog(skill, null, true)
+    await nextTick()
+    mounted.dialog.querySelector<HTMLButtonElement>('.sk-detail__launch button')!.click()
+    expect(mounted.useInTask).toHaveBeenCalledExactlyOnceWith(skill)
+    expect(mounted.installDeps).not.toHaveBeenCalled()
+    expect(mounted.setEnabled).not.toHaveBeenCalled()
+  })
+
+  it('does not advertise a draft launch when the catalog says it is unavailable', async () => {
+    const mounted = mountDialog({ name: 'synthetic-disabled', disabled: true })
+    await nextTick()
+    expect(mounted.dialog.querySelector('.sk-detail__launch')).toBeNull()
+  })
+  it('allows a disabled skill without implicitly installing its dependencies', async () => {
+    const mounted = mountDialog({ name: 'synthetic', disabled: true, missing_bins: ['synthetic-bin'] })
+    await nextTick()
+    const toggle = mounted.dialog.querySelector<HTMLButtonElement>('[role="switch"]')!
+    expect(toggle.getAttribute('aria-checked')).toBe('false')
+    toggle.click()
+    expect(mounted.setEnabled).toHaveBeenCalledExactlyOnceWith('synthetic', true)
+    expect(mounted.installDeps).not.toHaveBeenCalled()
+    expect(mounted.dialog.textContent).toContain('Use is disabled')
+  })
+
   it('routes native cancel through the parent close path and can reopen', async () => {
     const alpha = { name: 'alpha', description: 'Alpha skill' }
     const mounted = mountDialog(alpha)

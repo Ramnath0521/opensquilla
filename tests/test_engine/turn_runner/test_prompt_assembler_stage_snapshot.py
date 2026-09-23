@@ -61,6 +61,7 @@ class _StubSelector:
 
     def override_model(self, model: str) -> None:
         self.overridden_models.append(model)
+        self.current_model = model
 
     def resolve(self):
         return self.resolve_returns or _StubProvider("resolved-after-override")
@@ -283,7 +284,7 @@ def _build_runner() -> TurnRunner:
         model_catalog=None,
         memory_retrievers=None,
         turn_capture_services=None,
-        session_flush_service=None,
+
         session_lock_provider=None,
         diagnostics_state=None,
         turn_hooks=None,
@@ -522,7 +523,7 @@ async def test_prompt_assembler_stage_snapshot(
         "cache_breakpoints": case["cache_breakpoints"],
         "request_context_prompt": case["request_context_prompt"],
         "resolved_model": expected_resolved_model,
-        "selector_model": "claude-sonnet-4.5",
+        "selector_model": case.get("model") or "claude-sonnet-4.5",
         "session_id_for_log": case["session_id"],
         "trace_context_session_id": case["session_id"],
         "prompt_report_chars": len(case["final_prompt"]),
@@ -623,3 +624,25 @@ async def test_runtime_same_session_assigns_distinct_turn_and_execution_ids() ->
     assert correlations[0].session_id == correlations[1].session_id
     assert correlations[0].turn_id != correlations[1].turn_id
     assert correlations[0].execution_id != correlations[1].execution_id
+
+
+@pytest.mark.parametrize("mode", ["plan", "default"])
+def test_compaction_refresh_preserves_current_mode_without_promoting_reference_data(mode) -> None:
+    from opensquilla.engine import Agent, AgentConfig
+    from opensquilla.engine.turn_runner.harness import _TurnRunnerSystemPromptRefreshAdapter
+    from opensquilla.tools.types import ToolContext
+
+    agent = Agent(provider=_StubProvider("synthetic"),
+                  tool_context=ToolContext(collaboration_mode=mode), config=AgentConfig(
+                      system_prompt="OLD", cache_breakpoints=[{"text": "OLD", "cache": "true"}],
+                      request_context_prompt="UNTRUSTED_PROPOSAL_MARKER",
+                  ))
+    runner = SimpleNamespace(_assemble_prompt=lambda *args, **kwargs: ("REFRESHED", "Daily data"))
+    _TurnRunnerSystemPromptRefreshAdapter(runner).refresh_system_prompt(
+        agent=agent, agent_id="main", tool_defs=[], session_key="agent:main:synthetic",
+        bootstrap_context_mode=None,
+    )
+    assert f"Current Collaboration Mode: {mode.title()}" in agent.config.system_prompt
+    assert "UNTRUSTED_PROPOSAL_MARKER" not in agent.config.system_prompt
+    assert agent.config.request_context_prompt == "UNTRUSTED_PROPOSAL_MARKER"
+    assert agent.config.cache_breakpoints[0]["text"] == agent.config.system_prompt

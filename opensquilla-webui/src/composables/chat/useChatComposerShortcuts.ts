@@ -23,6 +23,13 @@ export interface UseChatComposerShortcutsOptions {
   popPendingTail: () => boolean
   enqueuePendingInput: (text: string) => boolean | Promise<boolean>
   sendCurrentInput: () => void
+  /**
+   * Undo an uncommitted message edit, returning whether it had one to undo.
+   * Escape has to offer this before it clears the composer: edit mode has no
+   * other exit, and clearing the draft on its own leaves the truncated
+   * transcript on screen (#1372).
+   */
+  cancelMessageEdit?: () => boolean
   isSafariWebKit?: () => boolean
 }
 
@@ -68,6 +75,7 @@ export function useChatComposerShortcuts(options: UseChatComposerShortcutsOption
   function onTextareaInput(event?: Event) {
     updateTextareaUndoStateAfterInput(event)
     options.autoResizeTextarea()
+    if (options.composing.value || (event && 'isComposing' in event && event.isComposing)) return
     options.handleSlashInput()
   }
 
@@ -89,7 +97,7 @@ export function useChatComposerShortcuts(options: UseChatComposerShortcutsOption
     if (options.slashOpen.value) {
       if (e.key === 'ArrowDown') {
         e.preventDefault()
-        options.slashIdx.value = Math.min(options.slashIdx.value + 1, options.filteredSlashCmds.value.length - 1)
+        options.slashIdx.value = Math.max(0, Math.min(options.slashIdx.value + 1, options.filteredSlashCmds.value.length - 1))
         return
       }
       if (e.key === 'ArrowUp') {
@@ -99,8 +107,8 @@ export function useChatComposerShortcuts(options: UseChatComposerShortcutsOption
       }
       if (e.key === 'Enter' || e.key === 'Tab') {
         const candidate = options.filteredSlashCmds.value[options.slashIdx.value]
-        if (!candidate) return
         e.preventDefault()
+        if (!candidate) return
         clearTextareaUndoState()
         if (e.key === 'Tab') {
           options.completeSlashCmd(candidate)
@@ -116,12 +124,26 @@ export function useChatComposerShortcuts(options: UseChatComposerShortcutsOption
       }
     }
 
-    if (e.key === 'Escape' && !options.isStreaming.value && options.pendingQueue.value.length === 0 && options.inputText.value) {
-      e.preventDefault()
-      clearTextareaUndoState()
-      options.inputText.value = ''
-      options.autoResizeTextarea()
-      return
+    if (e.key === 'Escape' && !options.isStreaming.value) {
+      // An uncommitted edit outranks clearing the draft, and is offered before
+      // the guards below rather than inside them. Those guards exist for the
+      // draft-clearing behaviour: an empty composer, or a non-empty pending
+      // queue, used to mean Escape did nothing here. While an edit is live
+      // that would leave the truncated transcript on screen with no way out,
+      // which is the defect this is fixing, one queued message away.
+      // Streaming still belongs to Stop.
+      if (options.cancelMessageEdit?.()) {
+        e.preventDefault()
+        resetInputHistory()
+        return
+      }
+      if (options.pendingQueue.value.length === 0 && options.inputText.value) {
+        e.preventDefault()
+        clearTextareaUndoState()
+        options.inputText.value = ''
+        options.autoResizeTextarea()
+        return
+      }
     }
 
     if (e.key === 'ArrowUp' && e.altKey && caretAtStart && options.pendingQueue.value.length > 0) {

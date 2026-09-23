@@ -6,9 +6,13 @@ import {
   type UseChatSessionSubscriptionOptions,
 } from './useChatSessionSubscription'
 import { useChatTaskOwnership, type ChatTaskOwnershipApi } from './useChatTaskOwnership'
+import { useChatHistory } from './useChatHistory'
+import { useChatCompaction } from './useChatCompaction'
 import { createConversationRuntime } from '@/modules/conversationRuntime'
 import {
   createSessionReadLifecycle,
+  SessionReadFailure,
+  SessionReadHistoryCursorError,
   SessionReadSessionMissingError,
   type SessionReadHistoryPage,
   type SessionReadLease,
@@ -101,6 +105,7 @@ const EMPTY_HISTORY: SessionReadHistoryPage = {
 
 function leaseFixture(options: {
   live?: SessionReadLive | Promise<SessionReadLive>
+  history?: SessionReadLease['history']
   metadata?: SessionReadMetadata | Promise<SessionReadMetadata>
   retryMetadata?: () => Promise<SessionReadMetadata>
   criticalRequestsQueued?: Promise<void>
@@ -114,12 +119,13 @@ function leaseFixture(options: {
     criticalRequestsQueued: options.criticalRequestsQueued ?? Promise.resolve(),
     live: Promise.resolve(options.live ?? live()),
     metadata: metadataPromise,
-    history: {
+    history: options.history ?? {
       latest: async () => EMPTY_HISTORY,
       before: async () => EMPTY_HISTORY,
       after: async () => EMPTY_HISTORY,
     },
     retryMetadata,
+    reconcile: async () => options.live ?? live(),
     close,
   }
   return { lease, retryMetadata, close }
@@ -164,6 +170,7 @@ interface HarnessOptions {
   reconcileStreamTaskClock?: UseChatSessionSubscriptionOptions['reconcileStreamTaskClock']
   loadHistory?: UseChatSessionSubscriptionOptions['loadHistory']
   resetStreamLiveTurnState?: UseChatSessionSubscriptionOptions['resetStreamLiveTurnState']
+  onStreamGenerationReset?: UseChatSessionSubscriptionOptions['onStreamGenerationReset']
   onLiveSnapshot?: UseChatSessionSubscriptionOptions['onLiveSnapshot']
   onAuthoritativeIdle?: UseChatSessionSubscriptionOptions['onAuthoritativeIdle']
   onRunModeLock?: UseChatSessionSubscriptionOptions['onRunModeLock']
@@ -218,6 +225,7 @@ function harness(
     loadHistory,
     resetStreamIdleTimer: vi.fn(),
     resetStreamLiveTurnState,
+    onStreamGenerationReset: options.onStreamGenerationReset,
     onLiveSnapshot: options.onLiveSnapshot,
     onAuthoritativeIdle,
     onRunModeLock: options.onRunModeLock,
@@ -245,6 +253,75 @@ function harness(
 }
 
 describe('useChatSessionSubscription domain lease', () => {
+  it('waits for a rejected history cursor to recover before confirming reconciliation', async () => {
+    const confirmInstalled = vi.fn(async () => {})
+    const page: SessionReadHistoryPage = {
+      ...EMPTY_HISTORY,
+      messages: [{
+        id: 'm4', messageId: 'm4', transcriptId: 'transcript:m4',
+        role: 'assistant', text: 'hello', createdAt: 1,
+        reasoningContent: null, routerDecision: null,
+        artifacts: [], toolCalls: [], timeline: [], attachments: [], promptAnnotations: [],
+        provenance: { kind: null, sourceSessionKey: null, sourceTool: null },
+        turnContext: null, usage: null, model: null, inputTokens: null, outputTokens: null,
+        additional: {},
+      }],
+      hasMore: true,
+      oldestCursor: 'cursor-4',
+      newestCursor: 'cursor-4',
+    }
+    const latest = vi.fn(async () => page)
+    const before = vi.fn(async () => {
+      throw new SessionReadHistoryCursorError('stale', 'cursor rejected')
+    })
+    const fixture = leaseFixture({
+      live: live({ confirmInstalled }),
+      history: { latest, before, after: async () => EMPTY_HISTORY },
+    })
+    const history = useChatHistory({
+      sessionReadLeaseReader: { current: () => fixture.lease },
+      sessionKey: ref(KEY),
+      messages: ref([]),
+      lastHeaderRole: ref(''),
+      lastHeaderDay: ref(''),
+      stripTimePrefix: text => text,
+      scrollToBottom: vi.fn(),
+    })
+    const subject = harness(fixture.lease, { loadHistory: () => history.reconcileHistory() })
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
+    try {
+      await history.loadHistory()
+      await history.loadEarlierHistory()
+
+      await expect(subject.api.reconcileSession()).resolves.toMatchObject({ authoritative: false })
+      expect(latest).toHaveBeenCalledTimes(1)
+      expect(confirmInstalled).not.toHaveBeenCalled()
+
+      await history.retryHistory()
+      await expect(subject.api.reconcileSession()).resolves.toMatchObject({ authoritative: true })
+      expect(confirmInstalled).toHaveBeenCalledTimes(1)
+      expect(before).toHaveBeenCalledTimes(1)
+      expect(fixture.close).not.toHaveBeenCalled()
+    } finally {
+      history.cleanup()
+      warn.mockRestore()
+    }
+  })
+
+  it('does not declare installation when history reconciliation returns an explicit failed result', async () => {
+    const confirmInstalled = vi.fn(async () => {})
+    const fixture = leaseFixture({ live: live({ confirmInstalled }) })
+    const subject = harness(fixture.lease, {
+      loadHistory: async () => ({ ok: false, error: new Error('history unavailable') }),
+    })
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
+    try {
+      await expect(subject.api.reconcileSession()).resolves.toMatchObject({ authoritative: false })
+      expect(confirmInstalled).not.toHaveBeenCalled()
+      expect(fixture.close).not.toHaveBeenCalled()
+    } finally { warn.mockRestore() }
+  })
+
   it('fences only this consumer and leaves the shared lease open', async () => {
     const pendingLive = deferred<SessionReadLive>()
     const fixture = leaseFixture({ live: pendingLive.promise })
@@ -318,6 +395,7 @@ describe('useChatSessionSubscription domain lease', () => {
       open: request => ({
         criticalRequestsQueued: Promise.resolve(),
         live: missingLive.promise,
+        reconcile: () => missingLive.promise,
         metadata: Promise.resolve(metadata({ sessionKey: request.sessionKey })),
         readHistory: async () => EMPTY_HISTORY,
         retryMetadata: async () => metadata({ sessionKey: request.sessionKey }),
@@ -668,6 +746,39 @@ describe('useChatSessionSubscription domain lease', () => {
     expect(onSessionMetadata).toHaveBeenCalledWith(KEY, 12, recovered)
   })
 
+  it('exposes deferred storage failure for recovery and clears stale working after terminal hydration', async () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
+    const pendingMetadata = deferred<SessionReadMetadata>()
+    const fixture = leaseFixture({
+      live: live({ initialMetadata: metadata({ hydrationComplete: false }) }),
+      metadata: pendingMetadata.promise,
+    })
+    const lease = { ...fixture.lease, reconcile: async () => live({
+      initialMetadata: metadata({ lastTask: { task_id: 'task-1', status: 'succeeded' } }),
+    }) }
+    const subject = harness(lease, {
+      isStreaming: ref(true), activeStreamTaskId: ref('task-1'),
+      runStatus: ref({ status: 'running', label: 'running', task: { task_id: 'task-1' } }),
+    })
+    try {
+      await expect(subject.api.subscribeSession()).resolves.toMatchObject({ authoritative: true })
+      pendingMetadata.reject(new SessionReadFailure('busy', 'storage busy', true, 100))
+      await Promise.resolve()
+      await Promise.resolve()
+      expect(subject.api.metadataRecoveryError.value).toMatchObject({ kind: 'busy' })
+      expect(subject.isStreaming.value).toBe(true)
+
+      await expect(subject.api.reconcileSession()).resolves.toMatchObject({ authoritative: true, live: false })
+      expect(subject.api.metadataRecoveryError.value).toBeNull()
+      expect(subject.runStatus.value.status).toBe('idle')
+      expect(subject.isStreaming.value).toBe(false)
+      expect(subject.loadHistory).toHaveBeenCalledOnce()
+      expect(fixture.close).not.toHaveBeenCalled()
+    } finally {
+      warn.mockRestore()
+    }
+  })
+
   it('cancels and bounds metadata retry locally', async () => {
     vi.useFakeTimers()
     const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
@@ -716,5 +827,55 @@ describe('useChatSessionSubscription domain lease', () => {
     expect(replaySeq.value).toBe(42)
     expect(replayGap.resetStreamLiveTurnState).not.toHaveBeenCalled()
     expect(replayGap.loadHistory).toHaveBeenCalledOnce()
+  })
+
+  it.each(['generationChanged', 'replayGap', null] as const)(
+    'reconciles an idle %s response with manual maintenance even without a new generation event', async reloadRequired => {
+      const sessionKey = ref(KEY)
+      const recoverPending = vi.fn(() => true)
+      const compact = useChatCompaction({ sessionKey,
+        schedulePendingDrainAfterTerminal: vi.fn(), popAllPendingIntoComposer: recoverPending })
+      const subject = harness(leaseFixture({ live: live({ reloadRequired }) }).lease, {
+        sessionKey, onStreamGenerationReset: compact.handleGatewayRestart,
+      })
+      try {
+        compact.showCompactionToast({ key: KEY, source: 'manual', status: 'started', compaction_id: 'cmp-old' })
+        expect(subject.api.streamGeneration.value).toBeNull()
+        await subject.api.subscribeSession()
+        expect(compact.isCompactInFlightForCurrentSession()).toBe(reloadRequired !== 'generationChanged')
+        expect(subject.isStreaming.value).toBe(false)
+        expect(recoverPending).toHaveBeenCalledTimes(reloadRequired === 'generationChanged' ? 1 : 0)
+        if (reloadRequired === 'generationChanged') {
+          expect(compact.compactStatus.value).toMatchObject({ status: 'failed', reason: 'gateway_restarted' })
+          expect(compact.showCompactionToast({ source: 'manual', status: 'started', compaction_id: 'cmp-old' })).toBe(false)
+        }
+      } finally { compact.cleanup() }
+    },
+  )
+
+  it('retires previous process maintenance before installing new process live maintenance', async () => {
+    const sessionKey = ref(KEY)
+    const compact = useChatCompaction({ sessionKey,
+      schedulePendingDrainAfterTerminal: vi.fn(), popAllPendingIntoComposer: vi.fn(() => true) })
+    const fresh = { key: KEY, source: 'manual', status: 'started', compaction_id: 'cmp-new' }
+    const subject = harness(leaseFixture({ live: live({
+      reloadRequired: 'generationChanged',
+      snapshot: { sessionKey: KEY, taskId: null, events: [{ semanticKind: 'compaction-progress', payload: fresh }] },
+    }) }).lease, {
+      sessionKey, onStreamGenerationReset: compact.handleGatewayRestart,
+      onLiveSnapshot: snapshot => snapshot.events.forEach(entry => compact.showCompactionToast({
+        key: entry.payload.key,
+        source: String(entry.payload.source),
+        status: String(entry.payload.status),
+        compaction_id: entry.payload.compaction_id,
+      }, { authoritativeLive: true })),
+    })
+    try {
+      compact.showCompactionToast({ ...fresh, compaction_id: 'cmp-old' })
+      await subject.api.subscribeSession()
+      expect(compact.compactStatus.value).toMatchObject({ compactionId: 'cmp-new', isBusy: true })
+      expect(compact.isCompactInFlightForCurrentSession()).toBe(true)
+      expect(subject.isStreaming.value).toBe(false)
+    } finally { compact.cleanup() }
   })
 })

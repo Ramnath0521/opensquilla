@@ -71,8 +71,11 @@ EXPECTED_WORKSPACE_METHODS = (
     "sandbox.path.list",
     "sandbox.path.create-directory",
     "sandbox.path.pick",
+    "workspaces.references.read",
 )
 EXPECTED_META_RUN_CENTER_METHODS = (
+    "meta.list",
+    "meta.inspect",
     "meta.drafts.list",
     "meta.drafts.discard",
     "meta.run",
@@ -170,6 +173,16 @@ _WORKSPACE = {
 }
 
 _VALID_REGISTRATION_RESULTS: dict[str, dict[str, Any]] = {
+    "meta.list": {"skills": []},
+    "meta.inspect": {
+        "name": "synthetic-meta",
+        "layer": "bundled",
+        "instance_id": "synthetic-instance",
+        "install_id": "",
+        "ready": True,
+        "status": "ready",
+        "dependencies": [],
+    },
     "workspaces.open": {"workspace": _WORKSPACE},
     "workspaces.update": {"workspace": _WORKSPACE},
     "workspaces.pin": {"workspace": _WORKSPACE},

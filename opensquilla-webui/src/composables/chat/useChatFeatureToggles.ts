@@ -1,4 +1,4 @@
-import { computed, ref } from 'vue'
+import { computed, ref, watch, type Ref } from 'vue'
 import i18n from '@/i18n'
 import { useToasts } from '@/composables/useToasts'
 import type { ChatRouterTierConfig } from '@/types/chat'
@@ -16,6 +16,7 @@ import {
   normalizeRouterVisualMode,
 } from '@/utils/chat/routerVisualMode'
 import { useRouterVisualEffectsPreference } from '@/composables/useRouterVisualEffectsPreference'
+import { normalizeAgentId } from '@/utils/chat/sessionKeys'
 import type { AppSettings } from '@/modules/appSettings'
 import {
   ProviderConfigurationError,
@@ -26,11 +27,15 @@ export interface UseChatFeatureTogglesOptions {
   appSettings: AppSettings
   modelRouting: ModelRouting
   readOptions?: { readonly signal?: AbortSignal }
+  connectionEpoch?: Readonly<Ref<unknown>>
+  connectionAvailable?: Readonly<Ref<boolean>>
   setGlobalElevatedMode: (mode: string) => void
   loadCurrentSessionUsage: () => void | Promise<void>
 }
 
 interface ChatFeatureConfig {
+  llm?: { model?: string; provider?: string }
+  agents?: readonly { id?: string; model?: string | null; enabled?: boolean }[]
   squilla_router?: {
     enabled?: boolean
     rollout_phase?: string
@@ -84,7 +89,7 @@ function parseCapabilitiesByMode(value: unknown): ModelRoutingCapabilitiesByMode
     ) return null
     parsed[mode] = {
       image_input: {
-        admission,
+        admission: effectiveImageAdmission(admission, reason),
         reason,
       },
     }
@@ -94,6 +99,24 @@ function parseCapabilitiesByMode(value: unknown): ModelRoutingCapabilitiesByMode
 
 function isMethodNotFound(error: unknown): boolean {
   return error instanceof ProviderConfigurationError && error.code === 'unsupported'
+}
+
+const IMAGE_DEGRADATION_REASONS = new Set([
+  'ensemble_mode_unsupported',
+  'model_vision_unsupported',
+  'router_image_route_unavailable',
+])
+
+function effectiveImageAdmission(
+  admission: ImageInputAdmission,
+  reason: string,
+): ImageInputAdmission {
+  // Older Gateways reported route/model limitations as a client-side hard
+  // block. They are now safe degradation signals: the Gateway preserves the
+  // turn and projects image blocks to truthful markers for text-only routes.
+  return admission === 'blocked' && IMAGE_DEGRADATION_REASONS.has(reason)
+    ? 'allowed'
+    : admission
 }
 
 export function useChatFeatureToggles(options: UseChatFeatureTogglesOptions) {
@@ -121,6 +144,49 @@ export function useChatFeatureToggles(options: UseChatFeatureTogglesOptions) {
   const routerSlots = ref<string[]>([])
   const routerModels = ref<Record<string, string>>({})
   const routerTierConfigs = ref<Record<string, ChatRouterTierConfig>>({})
+  const defaultModelConfig = ref<{
+    model: string
+    provider: string
+    agentModels: Readonly<Record<string, string>>
+  } | null>(null)
+  let defaultModelConfigGeneration = 0
+
+  function invalidateDefaultModel(): number {
+    defaultModelConfig.value = null
+    return ++defaultModelConfigGeneration
+  }
+
+  function applyDefaultModelConfig(cfg: ChatFeatureConfig | undefined, generation: number) {
+    if (generation !== defaultModelConfigGeneration || options.connectionAvailable?.value === false) return
+    const model = typeof cfg?.llm?.model === 'string' ? cfg.llm.model.trim() : ''
+    const provider = typeof cfg?.llm?.provider === 'string' ? cfg.llm.provider.trim().toLowerCase() : ''
+    if (!model || !provider) return
+    const agentModels: Record<string, string> = Object.create(null)
+    for (const agent of Array.isArray(cfg?.agents) ? cfg.agents : []) {
+      if (agent?.enabled === false || typeof agent?.id !== 'string' || typeof agent?.model !== 'string') continue
+      const agentModel = agent.model.trim()
+      if (agentModel) agentModels[normalizeAgentId(agent.id)] = agentModel
+    }
+    defaultModelConfig.value = { model, provider, agentModels }
+  }
+
+  function defaultModelForAgent(agentId: string): { model: string; provider: string } | null {
+    const config = defaultModelConfig.value
+    if (!config || options.connectionAvailable?.value === false) return null
+    const agentModel = config.agentModels[normalizeAgentId(agentId)]
+    // Agent overrides carry only a model ID, not an authoritative deployment.
+    // Do not infer their provider from a potentially ambiguous model catalog.
+    if (agentModel && agentModel !== config.model) return null
+    return { model: config.model, provider: config.provider }
+  }
+
+  if (options.connectionEpoch || options.connectionAvailable) {
+    watch(
+      [() => options.connectionEpoch?.value, () => options.connectionAvailable?.value],
+      invalidateDefaultModel,
+      { flush: 'sync' },
+    )
+  }
 
   const modelRoutingMode = computed<ModelRoutingMode>(() => {
     if (llmEnsembleEnabled.value) return 'llm_ensemble'
@@ -146,13 +212,14 @@ export function useChatFeatureToggles(options: UseChatFeatureTogglesOptions) {
     const admission = snapshot.image_input?.admission
     if (admission === 'allowed' || admission === 'blocked' || admission === 'unknown') {
       hasCanonicalImageAdmission = true
-      globalImageInputAdmission.value = admission
-      globalImageInputAdmissionReason.value = String(
+      const reason = String(
         snapshot.image_input?.reason || 'capability_unknown',
       )
+      globalImageInputAdmission.value = effectiveImageAdmission(admission, reason)
+      globalImageInputAdmissionReason.value = reason
     } else if (mode === 'ensemble') {
       hasCanonicalImageAdmission = false
-      globalImageInputAdmission.value = 'blocked'
+      globalImageInputAdmission.value = 'allowed'
       globalImageInputAdmissionReason.value = 'ensemble_mode_unsupported'
     } else {
       hasCanonicalImageAdmission = false
@@ -175,7 +242,7 @@ export function useChatFeatureToggles(options: UseChatFeatureTogglesOptions) {
     llmEnsembleEnabled.value = ensembleEnabled
     llmEnsembleSelectionMode.value = String(cfg?.llm_ensemble?.selection_mode || '')
     if (!hasCanonicalImageAdmission) {
-      globalImageInputAdmission.value = ensembleEnabled ? 'blocked' : 'unknown'
+      globalImageInputAdmission.value = ensembleEnabled ? 'allowed' : 'unknown'
       globalImageInputAdmissionReason.value = ensembleEnabled
         ? 'ensemble_mode_unsupported'
         : 'capability_unknown'
@@ -209,7 +276,6 @@ export function useChatFeatureToggles(options: UseChatFeatureTogglesOptions) {
         ).trim()
         tierConfigs[lower] = {
           model: typeof model === 'string' ? model.trim() : '',
-          supportsImage: rawTierRecord.supports_image === true || rawTierRecord.supportsImage === true,
           imageOnly: rawTierRecord.image_only === true || rawTierRecord.imageOnly === true,
           // New Gateways expose the explicit execution switch. Older PR
           // snapshots only expose the legacy selection mode, which still
@@ -237,12 +303,14 @@ export function useChatFeatureToggles(options: UseChatFeatureTogglesOptions) {
   }
 
   async function loadFeatureToggles() {
+    const defaultModelGeneration = invalidateDefaultModel()
     const requestGeneration = ++modelRoutingRequestGeneration
     const eventGeneration = modelRoutingEventGeneration
     let cfg: ChatFeatureConfig | undefined
     try {
       cfg = await options.appSettings.readAll({ signal: options.readOptions?.signal }) as ChatFeatureConfig
       if (requestGeneration !== modelRoutingRequestGeneration) return
+      applyDefaultModelConfig(cfg, defaultModelGeneration)
       await applyFeatureConfig(cfg, { refreshUsage: true })
       if (requestGeneration !== modelRoutingRequestGeneration) return
       // Config remains the compatibility source for older Gateways. A routing
@@ -419,6 +487,7 @@ export function useChatFeatureToggles(options: UseChatFeatureTogglesOptions) {
     routerSlots,
     routerModels,
     routerTierConfigs,
+    defaultModelForAgent,
     loadFeatureToggles,
     setRouterEnabled,
     setModelRoutingMode,

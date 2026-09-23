@@ -43,6 +43,7 @@ class _ScriptedWebSocket:
         self._frames = list(frames)
         self.sent: list[str] = []
         self.close_codes: list[int] = []
+        self.close_reasons: list[str] = []
         self.accepted = False
 
     async def accept(self) -> None:
@@ -56,8 +57,9 @@ class _ScriptedWebSocket:
             raise WebSocketDisconnect(code=1000)
         return self._frames.pop(0)
 
-    async def close(self, code: int = 1000) -> None:
+    async def close(self, code: int = 1000, reason: str = "") -> None:
         self.close_codes.append(code)
+        self.close_reasons.append(reason)
 
     def responses(self) -> list[dict[str, Any]]:
         return [f for f in (json.loads(s) for s in self.sent) if f.get("type") == "res"]
@@ -284,6 +286,23 @@ async def test_raw_ping_pong_uses_bounded_connection_send_and_survives() -> None
     assert ws.close_codes == []
 
 
+async def test_malformed_cancel_frame_gets_error_and_connection_survives() -> None:
+    ws = await _run(
+        [
+            _CONNECT_FRAME,
+            json.dumps({"type": "cancel", "id": "probe", "extra": True}),
+            json.dumps({"type": "req", "id": "after-cancel", "method": "noop"}),
+        ]
+    )
+
+    responses = ws.responses()
+    invalid = next(response for response in responses if response["id"] == "probe")
+    assert invalid["ok"] is False
+    assert invalid["error"]["code"] == "INVALID_REQUEST"
+    assert any(response["ok"] and response["id"] == "after-cancel" for response in responses)
+    assert ws.close_codes == []
+
+
 async def test_non_string_method_gets_error_res_and_connection_survives() -> None:
     ws = await _run(
         [
@@ -473,6 +492,7 @@ async def test_unserializable_outbound_frame_closes_connection_not_zombifies() -
         await asyncio.sleep(0.005)
 
     assert ws.close_codes == [1011]
+    assert ws.close_reasons == ["writer_serialize_failed"]
     await conn._stop_writer()
 
 

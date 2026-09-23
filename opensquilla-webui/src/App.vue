@@ -75,7 +75,6 @@
       </router-link>
     </div>
 
-    <SidebarSetupBanner />
 
     <!-- Recent conversations -->
     <SidebarConversations
@@ -217,6 +216,8 @@
           @open-deliverables="chatRouteHeader.invoke('openDeliverables')"
           @start-share="chatRouteHeader.invoke('startShare')"
           @copy-session-key="chatRouteHeader.invoke('copySessionKey')"
+          @copy-session-link="chatRouteHeader.invoke('copySessionLink')"
+          @copy-gateway-link="chatRouteHeader.invoke('copyGatewayLink')"
         />
       </div>
       <div
@@ -318,7 +319,8 @@
         id="content"
       >
         <ErrorBoundary @error-captured="clearChatRouteHeaderAfterError">
-          <router-view v-slot="{ Component, route }">
+          <SettingsBackgroundRoute :route="settingsContentRoute">
+          <router-view :route="settingsContentRoute" v-slot="{ Component, route }">
             <!-- out-in: one view in the DOM at a time, so pages never overlap (no
                  double-exposure, and never two composers/textareas mid-swap).
                  Console views are kept-alive, so the entering page is instant —
@@ -336,6 +338,8 @@
               <component v-else :is="Component" :key="route.meta.viewKey || route.name" />
             </Transition>
           </router-view>
+          </SettingsBackgroundRoute>
+          <router-view v-if="settingsBackgroundRoute" />
         </ErrorBoundary>
       </main>
       <AppWorkbench
@@ -354,8 +358,8 @@
   </div>
 
   <!-- Mobile bottom tab bar (<=768px only; hides while the keyboard is up):
-       Chat, Sessions, Overview, then More for the flat drawer containing
-       Sessions / Overview / Skills & Channels / Cron and Settings. -->
+       Chat, Overview, then More for the sidebar drawer with session history,
+       navigation, and Settings. -->
   <nav
     class="mobile-tabbar"
     :class="{ 'is-keyboard-open': mobileKeyboardOpen }"
@@ -370,16 +374,6 @@
     >
       <Icon name="chat" :size="20" />
       <span class="mobile-tab__label">{{ t('nav.chat') }}</span>
-    </router-link>
-    <router-link
-      to="/sessions"
-      class="mobile-tab"
-      :class="{ 'is-active': isNavActive('/sessions') }"
-      @click="handleNavClick"
-    >
-      <Icon name="sessions" :size="20" />
-      <span class="mobile-tab__label">{{ t('nav.sessions') }}</span>
-      <span v-if="appStore.approvalCount > 0" class="mobile-tab__badge">{{ appStore.approvalCount }}</span>
     </router-link>
     <router-link
       to="/overview"
@@ -450,11 +444,15 @@
 <script setup lang="ts">
 import { computed, inject, nextTick, onMounted, onUnmounted, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
+import { SettingsBackgroundRoute, useSettingsRouteOverlay } from './router/settingsRouteOverlay'
 import { useI18n } from 'vue-i18n'
 import { routeTitle } from './router'
 import { getPlatform } from '@/platform'
 import { useAppStore, type ThemeMode, type PendingApproval } from './stores/app'
 import { GATEWAY_ACCESS_KEY } from './modules/gatewayAccess'
+import { PRODUCT_ACTIVITY_KEY } from './modules/productActivity'
+import { useProductActivity } from './composables/useProductActivity'
+import { useReadinessConnectionSync } from './composables/setup/useReadinessConnectionSync'
 import { SESSION_DIRECTORY_KEY } from './modules/sessionDirectory'
 import { SESSION_DIRECTORY_CHANGES_KEY } from './modules/sessionDirectoryChanges'
 import { SESSION_LIFECYCLE_KEY } from './modules/sessionLifecycle'
@@ -463,6 +461,7 @@ import {
   arrangeSidebarSections,
   useSessions,
   type SessionItem,
+  type SessionListLoadResult,
   type SidebarSection,
   type SidebarSectionRow,
 } from './composables/useSessions'
@@ -478,7 +477,6 @@ import DesktopUpdateIndicator from './components/DesktopUpdateIndicator.vue'
 import ChatSystemStatus from './components/chat/ChatSystemStatus.vue'
 import ChatHeaderActions from './components/chat/ChatHeaderActions.vue'
 import SidebarConversations from './components/SidebarConversations.vue'
-import SidebarSetupBanner from './components/SidebarSetupBanner.vue'
 import SidebarResizer from './components/SidebarResizer.vue'
 import CommandPalette from './components/CommandPalette.vue'
 import LanguageSwitcher from './components/LanguageSwitcher.vue'
@@ -507,6 +505,7 @@ import { useConfirm } from './composables/useConfirm'
 import { useProjectWorkspaces } from './composables/useProjectWorkspaces'
 import { useFreshTaskDraft } from './composables/useFreshTaskDraft'
 import { useNavigation } from './app/useNavigation'
+import { bindDesktopSessionDeepLinks } from './app/desktopSessionDeepLinks'
 import { useSurfaceSkin } from './themes/useSurfaceSkin'
 import { themePickerOptions, getManifest } from './themes/registry'
 import { normalizeAgentId } from './utils/chat/sessionKeys'
@@ -524,7 +523,7 @@ import {
   LOCAL_SESSIONS_DELETED_EVENT,
 } from './utils/sessionSync'
 import { activeTaskWasDeletedWithProjectHistory } from './utils/projectHistory'
-import { createCoalescedRefresh } from './utils/coalescedRefresh'
+import { createAppAutomaticRpc } from './utils/appAutomaticRpc'
 import {
   optionalSessionRpcAllowed,
   optionalSessionReadOptions,
@@ -543,9 +542,13 @@ import {
 } from './composables/chat/useChatSessionTitles'
 
 const appStore = useAppStore()
+const platform = getPlatform()
 const injectedGatewayAccess = inject(GATEWAY_ACCESS_KEY)
 if (!injectedGatewayAccess) throw new Error('GatewayAccess was not provided')
 const gatewayAccess = injectedGatewayAccess
+useReadinessConnectionSync(gatewayAccess)
+const productActivity = inject(PRODUCT_ACTIVITY_KEY)
+if (productActivity) useProductActivity(gatewayAccess, productActivity)
 const injectedSessionDirectory = inject(SESSION_DIRECTORY_KEY)
 if (!injectedSessionDirectory) throw new Error('SessionDirectory was not provided')
 const sessionDirectory = injectedSessionDirectory
@@ -568,10 +571,12 @@ const shortcutsStore = useShortcutsStore()
 const artifactImageLightbox = provideArtifactImageLightbox()
 const { t } = useI18n()
 const $route = useRoute()
+const router = useRouter()
+const { backgroundRoute: settingsBackgroundRoute, contentRoute: settingsContentRoute } = useSettingsRouteOverlay(router)
 // Every transient control in the global topbar shares one active owner. The
 // controls render on chat and non-chat routes, so route-scoped coordination
 // would allow sibling menus such as Language and Theme to overlap.
-const isChatRoute = computed(() => $route.path === '/chat' || $route.path === '/chat/new')
+const isChatRoute = computed(() => settingsContentRoute.value.path === '/chat' || settingsContentRoute.value.path === '/chat/new')
 const topbarPopoverCoordinationEnabled = ref(true)
 const topbarPopoverCoordinator = provideChatTopbarPopoverCoordinator(
   topbarPopoverCoordinationEnabled,
@@ -629,19 +634,28 @@ const APP_SESSION_SYNC_SOURCE = 'app-sidebar'
 // Localized connection-state label for the topbar pill and its tooltip. The
 // Semantic availability is projected into the existing presentation keys;
 // CSS uppercases the result (a no-op for CJK scripts).
-const connectionState = computed(() => gatewayAccess.availability === 'available'
-  ? 'connected'
-  : gatewayAccess.availability === 'preparing' ? 'connecting' : 'disconnected')
+const gatewayConnectionPhase = computed(() => {
+  if (gatewayAccess.availability === 'available') {
+    return gatewayAccess.connectionPhase
+      || (gatewayAccess.isResuming || gatewayAccess.connectionHealth === 'suspect' ? 'suspect' : 'healthy')
+  }
+  return gatewayAccess.availability === 'preparing' ? 'checking' : 'disconnected'
+})
+const connectionState = computed(() => {
+  if (gatewayConnectionPhase.value === 'healthy') return 'connected'
+  if (gatewayConnectionPhase.value === 'disconnected') return 'disconnected'
+  return 'connecting'
+})
 const effectiveConnectionState = computed(() => effectiveChatConnectionState(
   connectionState.value,
   appStore.chatLivePhase,
   isChatRoute.value,
 ))
-const connectionStateLabel = computed(() => t(
-  `chrome.connectionState.${effectiveConnectionState.value}`,
-))
-const router = useRouter()
-
+const connectionStateLabel = computed(() => getPlatform().id === 'web' && gatewayAccess.requiresCredential
+  ? t('setup.connection.tokenRequired')
+  : gatewayConnectionPhase.value === 'healthy' || gatewayConnectionPhase.value === 'disconnected'
+  ? t(`chrome.connectionState.${effectiveConnectionState.value}`)
+  : t(`chrome.connectionState.${gatewayConnectionPhase.value}`))
 // afterEach only fires on navigation, so a same-route language switch needs an
 // explicit re-localize of the tab title.
 watch(() => appStore.locale, () => {
@@ -656,6 +670,7 @@ const {
   hasMore,
   loadSessions,
   loadMoreSessions,
+  cancelPendingRequests,
 } = useSessions(sessionDirectory)
 const { bottomRoutes, workNav } = useNavigation()
 // Axis-B: the active expressive skin for the routed content area (meta.skin).
@@ -1162,7 +1177,6 @@ function onPinSidebarSession(payload: { key: string; pinned: boolean }) {
 }
 
 let appAutomaticRpcMounted = false
-let appAutomaticRpcStarted = false
 
 // Hide the bottom tab bar while the on-screen keyboard owns the bottom edge.
 // A visual-viewport shrink well beyond browser-chrome changes (>140px) is the
@@ -1534,14 +1548,15 @@ function onPaletteSelectSession(key: string) {
   switchToSession(key, 'command_palette.select_session')
 }
 
-function switchToSession(key: string, source = 'app.switchToSession') {
+async function switchToSession(key: string, source = 'app.switchToSession') {
   if (!key) return
   sessionTaskAttention.markRead(key)
   recordSessionNavigationDiag(source, {
     from: currentSessionKey.value,
     to: key,
   })
-  router.push({ path: '/chat', query: { session: key } })
+  await router.push({ path: '/chat', query: { session: key } })
+  if ($route.path === '/chat' && $route.query.session === key) closeSidebarDrawer()
 }
 
 // Optimistic rename: show the new title immediately, then persist through the
@@ -1655,7 +1670,7 @@ async function onDeleteSession(key: string) {
 // in-thread card can be answered. The live `pendingApprovals` list (kept fresh
 // by the push subscription + reconnect seed) is the source of truth — no
 // re-fetch — and the oldest pending session is the deterministic target. With
-// no routable session, fall back to the Sessions page.
+// no routable session, fall back to Chat; the topbar retains the pending count.
 function openBlockedApprovalSession() {
   const oldest = appStore.oldestPendingWithSession
   if (oldest?.sessionKey) {
@@ -1663,9 +1678,8 @@ function openBlockedApprovalSession() {
     switchToSession(oldest.sessionKey, 'approval.openBlockedSession')
     return
   }
-  // No session attached to the pending approval: land on Sessions, whose
-  // attention strip shows the pending count (the /approvals page is retired).
-  router.push('/sessions')
+  // No session attached to the pending approval: return to chat.
+  router.push('/chat')
 }
 
 // Footer settings row. Both platforms mount the same `/settings` overlay now, so
@@ -1689,15 +1703,12 @@ function openDesktopRuntimeSettings() {
 }
 
 function scheduleSessionRefresh() {
-  sidebarRefresh.schedule()
+  automaticAppRpc.schedule()
 }
 
-function flushScheduledSidebarRefresh() {
-  sidebarRefresh.flush()
-}
-
-async function performSidebarLoad(): Promise<void> {
-  const requests: Promise<unknown>[] = [loadSessions()]
+async function performSidebarLoad(): Promise<SessionListLoadResult> {
+  const sessionRead = loadSessions()
+  const requests: Promise<unknown>[] = [sessionRead]
   if (
     gatewayAccess.canManageProjectWorkspaces
     && optionalSessionRpcAllowed.value
@@ -1707,24 +1718,26 @@ async function performSidebarLoad(): Promise<void> {
     )
   }
   await Promise.allSettled(requests)
+  return sessionRead
 }
 
-const sidebarRefresh = createCoalescedRefresh({
-  run: performSidebarLoad,
-  allowed: () => appAutomaticRpcMounted && optionalSessionRpcAllowed.value,
-  delayMs: 150,
+const automaticAppRpc = createAppAutomaticRpc({
+  available: () => gatewayAccess.isAvailable,
+  admitted: () => optionalSessionRpcAllowed.value,
+  resumeDirectory: () => sessionDirectoryChanges.resume(),
+  subscribeCron: subscribeCronEventsWhenAdmitted,
+  loadAgents,
+  loadSidebar: performSidebarLoad,
+  cancelSidebar: cancelPendingRequests,
 })
 
 function loadSidebarData(): Promise<void> {
-  return sidebarRefresh.load()
+  return automaticAppRpc.load()
 }
 
-function refreshSidebarDataWhenAdmitted(): void | Promise<void> {
-  if (!optionalSessionRpcAllowed.value) {
-    sidebarRefresh.defer()
-    return
-  }
-  return loadSidebarData()
+function handleAppForeground() {
+  markCurrentSessionReadIfVisible()
+  if (document.visibilityState === 'visible') automaticAppRpc.foreground()
 }
 
 const sessionDirectoryChangesSubscription = sessionDirectoryChanges.subscribe(change => {
@@ -1748,35 +1761,16 @@ function subscribeCronEventsWhenAdmitted() {
   cronFinishedSubscription = cronScheduler.subscribe(handleCronRunFinished)
 }
 
-function resumeAutomaticAppRpc() {
-  if (!appAutomaticRpcMounted || !optionalSessionRpcAllowed.value) return
-  subscribeCronEventsWhenAdmitted()
-  void sessionDirectoryChanges.resume()
-  if (!appAutomaticRpcStarted) {
-    appAutomaticRpcStarted = true
-    void loadAgents()
-    void loadSidebarData()
-  }
-  flushScheduledSidebarRefresh()
-}
-
-watch(optionalSessionRpcAllowed, admitted => {
-  if (admitted) resumeAutomaticAppRpc()
+watch(optionalSessionRpcAllowed, () => {
+  void automaticAppRpc.admissionChanged()
 }, { flush: 'sync' })
 
 watch(
   () => gatewayAccess.availability,
-  state => {
-    if (state !== 'available') return
-    subscribeCronEventsWhenAdmitted()
-    if (!appAutomaticRpcMounted || !optionalSessionRpcAllowed.value) return
-    // The event stream is live-only. Rebind the logical lease and refresh a
-    // complete directory snapshot after every physical reconnect so events
-    // missed during the gap cannot leave the sidebar stale.
-    void sessionDirectoryChanges.resume().then(() => {
-      if (appAutomaticRpcStarted) void refreshSidebarDataWhenAdmitted()
-    })
+  () => {
+    void automaticAppRpc.availabilityChanged()
   },
+  { flush: 'sync' },
 )
 
 function handleKeydown(e: KeyboardEvent) {
@@ -1861,6 +1855,7 @@ function errorMessage(err: unknown): string {
 // ---------------------------------------------------------------------------
 
 const approvalSubscriptions: ApprovalSubscription[] = []
+let approvalSeedGeneration = 0
 
 function approvalItemToPending(item: ApprovalItem): PendingApproval | null {
   const approvalId = item.id.trim()
@@ -1877,8 +1872,12 @@ function approvalItemToPending(item: ApprovalItem): PendingApproval | null {
 // while a request is already pending. The
 // snapshot is ordered oldest-first, which the deep-link relies on.
 async function seedPendingApprovals() {
+  if (!appAutomaticRpcMounted || gatewayAccess.availability !== 'available') return
+  const generation = ++approvalSeedGeneration
   try {
     const snapshot = await approvalCenter.snapshot()
+    if (!appAutomaticRpcMounted || generation !== approvalSeedGeneration
+      || gatewayAccess.availability !== 'available') return
     const items = snapshot.pending
       .map(approvalItemToPending)
       .filter((item): item is PendingApproval => item !== null)
@@ -1903,6 +1902,7 @@ function onApprovalEvent(event: ApprovalEvent) {
 // was down); the push events keep it live thereafter.
 function onApprovalAvailability(state: 'available' | 'recovering' | 'unavailable') {
   if (state !== 'available') {
+    approvalSeedGeneration++
     appStore.setPendingApprovals([])
     return
   }
@@ -1917,6 +1917,7 @@ function subscribeApprovals() {
 }
 
 function unsubscribeApprovals() {
+  approvalSeedGeneration++
   approvalSubscriptions.splice(0).forEach(subscription => subscription.close())
   approvalCenter.dispose()
 }
@@ -1947,13 +1948,32 @@ watch(() => appStore.approvalCount, count => {
 
 useDocumentEvent('keydown', handleKeydown)
 
+let desktopDeepLinkUnsubscribe: (() => void) | null = null
+
 onMounted(() => {
   appAutomaticRpcMounted = true
+  desktopDeepLinkUnsubscribe = bindDesktopSessionDeepLinks({
+    window: platform.window,
+    directory: sessionDirectory,
+    gatewayContext: () => ({
+      endpoint: gatewayAccess.isAvailable ? gatewayAccess.loadConnectionEndpoint() : '',
+      epoch: gatewayAccess.isAvailable ? gatewayAccess.subscriptionEpoch : null,
+      authenticated: gatewayAccess.isAuthenticated,
+    }),
+    onGatewayContextChange: callback => watch(() => [
+      gatewayAccess.isAvailable,
+      gatewayAccess.subscriptionEpoch,
+      gatewayAccess.isAuthenticated,
+      gatewayAccess.loadConnectionEndpoint(),
+    ], callback, { flush: 'sync' }),
+    openSession: key => switchToSession(key, 'desktop.deep_link'),
+    unavailable: () => pushToast(t('chat.sessionReference.unavailable'), { tone: 'danger' }),
+  })
   window.visualViewport?.addEventListener('resize', syncMobileKeyboard)
   window.addEventListener(LOCAL_SESSIONS_DELETED_EVENT, handleLocalSessionsDeleted)
-  window.addEventListener('focus', markCurrentSessionReadIfVisible)
-  document.addEventListener('visibilitychange', markCurrentSessionReadIfVisible)
-  resumeAutomaticAppRpc()
+  window.addEventListener('focus', handleAppForeground)
+  document.addEventListener('visibilitychange', handleAppForeground)
+  void automaticAppRpc.mount()
   // Keep the approval badge/count live app-wide, not just on the Approvals page.
   subscribeApprovals()
   // Seed now in case an approval was pending before mount. Availability events
@@ -1963,13 +1983,15 @@ onMounted(() => {
 
 onUnmounted(() => {
   appAutomaticRpcMounted = false
-  sidebarRefresh.dispose()
+  automaticAppRpc.dispose()
   window.removeEventListener(LOCAL_SESSIONS_DELETED_EVENT, handleLocalSessionsDeleted)
-  window.removeEventListener('focus', markCurrentSessionReadIfVisible)
-  document.removeEventListener('visibilitychange', markCurrentSessionReadIfVisible)
+  window.removeEventListener('focus', handleAppForeground)
+  document.removeEventListener('visibilitychange', handleAppForeground)
   sessionDirectoryChangesSubscription.close()
   sessionDirectoryChanges.dispose()
   unsubscribeApprovals()
+  desktopDeepLinkUnsubscribe?.()
+  desktopDeepLinkUnsubscribe = null
   cronFinishedSubscription?.close()
   cronFinishedSubscription = null
   if (titleDebounce) {

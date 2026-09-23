@@ -43,6 +43,84 @@ def test_parse_payload_accepts_valid_windows_default_payload(tmp_path) -> None:
     assert parsed.run_mode == "safe"
 
 
+def test_helper_import_root_uses_source_package_root_instead_of_process_cwd(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The source checkout's ``src`` directory is a valid helper import root."""
+
+    from opensquilla.sandbox.backend import windows_default_runner as mod
+
+    repo = tmp_path / "checkout"
+    source_root = repo / "src"
+    package_root = source_root / "opensquilla"
+    package_root.mkdir(parents=True)
+    runner_path = package_root / "sandbox" / "backend" / "windows_default_runner.py"
+    runner_path.parent.mkdir(parents=True)
+    runner_path.write_text("", encoding="utf-8")
+    monkeypatch.setattr(mod, "__file__", str(runner_path))
+    monkeypatch.setattr(
+        mod.sys,
+        "executable",
+        str(tmp_path / "python-bin" / "missing-python.exe"),
+    )
+    monkeypatch.chdir(tmp_path)
+
+    assert mod._helper_import_root() == source_root.resolve()
+
+
+def test_helper_import_root_prefers_pyinstaller_meipass(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from opensquilla.sandbox.backend import windows_default_runner as mod
+
+    meipass = tmp_path / "bundle" / "_internal"
+    (meipass / "opensquilla").mkdir(parents=True)
+    source = tmp_path / "checkout" / "src" / "opensquilla"
+    source.mkdir(parents=True)
+    runner_path = source / "sandbox" / "backend" / "windows_default_runner.py"
+    runner_path.parent.mkdir(parents=True)
+    runner_path.write_text("", encoding="utf-8")
+    monkeypatch.setattr(mod, "__file__", str(runner_path))
+    monkeypatch.setattr(mod.sys, "_MEIPASS", str(meipass), raising=False)
+    monkeypatch.setattr(
+        mod.sys,
+        "executable",
+        str(tmp_path / "python-bin" / "missing-python.exe"),
+    )
+
+    assert mod._helper_import_root() == meipass.resolve()
+
+
+def test_helper_import_root_fails_closed_when_all_candidates_are_missing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from opensquilla.sandbox.backend import windows_default_runner as mod
+
+    # A package in the caller's cwd must not become the helper root. This is
+    # the stale worktree failure mode that otherwise reaches CreateProcessWithLogonW.
+    (tmp_path / "opensquilla").mkdir()
+    monkeypatch.chdir(tmp_path)
+    missing_runner = (
+        tmp_path
+        / "deleted-worktree"
+        / "src"
+        / "opensquilla"
+        / "sandbox"
+        / "backend"
+        / "runner.py"
+    )
+    monkeypatch.setattr(mod, "__file__", str(missing_runner))
+    monkeypatch.setattr(mod.sys, "_MEIPASS", str(tmp_path / "deleted-bundle"), raising=False)
+    monkeypatch.setattr(
+        mod.sys,
+        "executable",
+        str(tmp_path / "python-bin" / "missing-python.exe"),
+    )
+
+    with pytest.raises(RuntimeError, match=r"^helper_root_unavailable:"):
+        mod._helper_import_root()
+
+
 def test_helper_error_marker_and_offline_payload_keep_authentication_nonce(
     tmp_path,
     capsys,
@@ -68,6 +146,41 @@ def test_helper_error_marker_and_offline_payload_keep_authentication_nonce(
         "message": "ACL preparation failed",
     }
     assert json.loads(mod._payload_to_json(payload))["helperNonce"] == "nonce-123"
+
+
+def test_timeout_marker_survives_offline_payload_and_preserves_stderr(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from opensquilla.sandbox.backend import windows_default as backend
+    from opensquilla.sandbox.backend import windows_default_runner as mod
+
+    payload = mod.HelperPayload(
+        argv=("cmd", "/c", "exit 124"),
+        cwd=tmp_path,
+        env={},
+        policy={"network": "none", "mounts": []},
+        run_mode="safe",
+        timeout=5,
+        helper_nonce="timeout-test",
+    )
+    offline = mod._parse_payload([mod._payload_to_json(replace(payload, offline_child=True))])
+    assert offline.helper_nonce == payload.helper_nonce
+    assert "helperNonce" not in mod._effective_child_env(offline)
+    stderr = io.BytesIO()
+    monkeypatch.setattr(mod.sys, "stderr", SimpleNamespace(buffer=stderr))
+    user_output = b"unterminated stderr\xff"
+    stderr.write(user_output)
+
+    mod._emit_helper_timeout(offline)
+    mod._emit_helper_timeout(payload)
+
+    assert backend._extract_authenticated_helper_timeout(
+        stderr.getvalue(), expected_nonce=payload.helper_nonce
+    ) == (user_output, True)
+    stderr.seek(0)
+    stderr.truncate()
+    mod._emit_helper_timeout(replace(payload, helper_nonce=""))
+    assert stderr.getvalue() == b""
 
 
 def test_parse_payload_decodes_stdin_base64(tmp_path) -> None:
@@ -692,9 +805,7 @@ def test_live_deny_acl_requires_exact_nonduplicated_managed_aces() -> None:
 
     stored_write_mask = mod.FILE_WRITE_DENY_MASK & ~mod.GENERIC_WRITE
     inherited_children = (
-        mod.OBJECT_INHERIT_ACE_FLAG
-        | mod.CONTAINER_INHERIT_ACE_FLAG
-        | mod.INHERIT_ONLY_ACE_FLAG
+        mod.OBJECT_INHERIT_ACE_FLAG | mod.CONTAINER_INHERIT_ACE_FLAG | mod.INHERIT_ONLY_ACE_FLAG
     )
 
     assert mod._deny_ace_entries_match_expected(
@@ -2420,6 +2531,67 @@ def test_capability_probe_uses_restricted_token_without_shared_offline_acl(
     assert events == ["refresh", "restricted"]
 
 
+def test_safe_noop_uses_offline_identity_reexec_path(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    from opensquilla.sandbox.backend import windows_default_runner as mod
+
+    payload = mod.HelperPayload(
+        argv=("cmd", "/c", "exit", "0"),
+        cwd=tmp_path,
+        env={},
+        policy={
+            "network": "none",
+            "windowsAclPlan": {
+                "autoGrants": [],
+                "capabilitySids": [],
+                "denyWritePaths": [],
+                "denyReadPaths": [],
+                "grantCurrentUserAccess": True,
+            },
+            "windowsNetworkBoundary": {
+                "offlineUserSid": "S-1-5-21-100-200-300-400",
+                "offlineUsername": "OpenSquillaSandbox",
+                "protectedPassword": "base64-dpapi-payload",
+                "allowedProxyPorts": [48123],
+                "allowLocalBinding": False,
+            },
+        },
+        run_mode="safe",
+        timeout=5,
+    )
+    events: list[str] = []
+    monkeypatch.setattr(
+        mod,
+        "_resolve_offline_launch_credentials",
+        lambda _payload: mod.OfflineLaunchCredentials(
+            sid="S-1-test",
+            username="OpenSquillaSandbox",
+            password="plain",
+        ),
+    )
+    monkeypatch.setattr(mod, "_prepare_deny_acl_targets", lambda _plan: None)
+    monkeypatch.setattr(
+        mod,
+        "_apply_acl_refresh",
+        lambda _plan, **_kwargs: events.append("refresh"),
+    )
+    monkeypatch.setattr(
+        mod,
+        "_run_payload_as_offline_identity",
+        lambda *_args, **_kwargs: events.append("offline") or 0,
+    )
+    monkeypatch.setattr(
+        mod,
+        "_run_restricted_process_native",
+        lambda *_args: pytest.fail("Safe execution must use the offline identity"),
+    )
+
+    assert mod._run_windows_default(payload) == 0
+    assert events == ["refresh", "offline"]
+
+
 @pytest.mark.parametrize("failure_stage", ["identity", "decrypt"])
 def test_offline_identity_preflight_fails_before_any_acl_mutation(
     monkeypatch: pytest.MonkeyPatch,
@@ -2600,9 +2772,17 @@ def test_offline_identity_launch_grants_payload_acl_roots_to_offline_user(
     assert grants == [(tmp_path, "RWX", "S-1-5-21-100-200-300-400")]
 
 
+@pytest.mark.parametrize(
+    ("wait_result", "child_exit", "expected_timeout"),
+    [(0, 0, False), (0, 124, False), (0x00000102, 0, True)],
+)
 def test_offline_identity_native_launch_sets_all_stdio_handles(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path,
+    capsys,
+    wait_result: int,
+    child_exit: int,
+    expected_timeout: bool,
 ) -> None:
     import ctypes
     import os
@@ -2633,6 +2813,7 @@ def test_offline_identity_native_launch_sets_all_stdio_handles(
         },
         run_mode="trusted",
         timeout=5,
+        helper_nonce="native-timeout-test",
     )
     captured: dict[str, object] = {}
     events: list[str] = []
@@ -2686,7 +2867,7 @@ def test_offline_identity_native_launch_sets_all_stdio_handles(
         return 1
 
     def _get_exit_code_process(_process, code):
-        code._obj.value = 0
+        code._obj.value = child_exit
         return 1
 
     def _write_file(_handle, data, size, written, _overlapped):
@@ -2704,7 +2885,9 @@ def test_offline_identity_native_launch_sets_all_stdio_handles(
             self.CreatePipe = FakeFunction(_create_pipe)
             self.SetHandleInformation = FakeFunction(lambda *_args: 1)
             self.CloseHandle = FakeFunction(lambda *_args: 1)
-            self.WaitForSingleObject = FakeFunction(lambda *_args: events.append("wait") or 0)
+            self.WaitForSingleObject = FakeFunction(
+                lambda *_args: events.append("wait") or wait_result
+            )
             self.TerminateProcess = FakeFunction(lambda *_args: 1)
             self.CreateJobObjectW = FakeFunction(lambda *_args: _new_handle())
             self.SetInformationJobObject = FakeFunction(lambda *_args: 1)
@@ -2734,14 +2917,17 @@ def test_offline_identity_native_launch_sets_all_stdio_handles(
         lambda _handle, _flags: os.open(os.devnull, os.O_RDONLY),
     )
 
-    assert (
-        mod._run_payload_as_offline_identity_native(
-            payload,
-            username="OpenSquillaSandbox",
-            password="secret",
-        )
-        == 0
-    )
+    assert mod._run_payload_as_offline_identity_native(
+        payload,
+        username="OpenSquillaSandbox",
+        password="secret",
+    ) == (124 if expected_timeout else child_exit)
+    from opensquilla.sandbox.backend import windows_default as backend
+
+    raw_stderr = capsys.readouterr().err.encode()
+    assert backend._extract_authenticated_helper_timeout(
+        raw_stderr, expected_nonce="native-timeout-test"
+    ) == (b"", expected_timeout)
     assert captured["stdin"]
     assert captured["stdout"]
     assert captured["stderr"]

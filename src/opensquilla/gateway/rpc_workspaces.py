@@ -22,6 +22,7 @@ from opensquilla.gateway.session_services import get_session_lock, get_session_s
 from opensquilla.gateway.subagent_announce import (
     quiesce_background_completion_sessions,
 )
+from opensquilla.gateway.workspace_references import read_workspace_reference
 from opensquilla.project_workspaces import (
     adopt_legacy_project_workspaces,
     project_workspace_payload,
@@ -246,14 +247,6 @@ async def _handle_workspaces_history_delete(
                 # tasks above. Let matching work settle naturally: cancelling a
                 # wrapper cannot stop an underlying writer thread.
                 await drain_pending_flushes_for_sessions(candidate_keys)
-                drain_turn_writes = getattr(
-                    ctx.turn_runner,
-                    "drain_session_background_writes",
-                    None,
-                )
-                if callable(drain_turn_writes):
-                    await drain_turn_writes(candidate_keys)
-
                 session_ids: dict[str, str] = {}
                 for session_key in candidate_keys:
                     node = await storage.get_session(session_key)
@@ -299,6 +292,7 @@ async def _handle_workspaces_history_delete(
 
 
 _WORKSPACE_CATALOG_CONTRACT_IMPLEMENTATIONS = {
+    "workspaces.references.read": read_workspace_reference,
     "workspaces.list": _handle_workspaces_list,
     "workspaces.open": _handle_workspaces_open,
     "workspaces.update": _handle_workspaces_update,

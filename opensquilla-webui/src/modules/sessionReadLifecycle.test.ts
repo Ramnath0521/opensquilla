@@ -6,6 +6,7 @@ import {
   createSessionReadLifecycle,
   createSessionReadLifecycleFactory,
   SessionReadLeaseClosedError,
+  SessionReadFailure,
   type SessionReadHistoryPage,
   type SessionReadMetadata,
   type SessionReadPort,
@@ -139,6 +140,63 @@ afterEach(() => {
 })
 
 describe('SessionReadLifecycle', () => {
+  it.each([true, false])('marks remote retirement only after the close result (success=%s)', async success => {
+    const adapter = new InMemorySessionReadPortAdapter([fixture('alpha')])
+    const original = adapter.open.bind(adapter)
+    let resolve!: () => void
+    let reject!: (error: Error) => void
+    const close = new Promise<void>((done, fail) => { resolve = done; reject = fail })
+    vi.spyOn(adapter, 'open').mockImplementation(request => ({ ...original(request), close: () => close }))
+    const retired = vi.fn()
+    const prepareReadRetirement = vi.fn(() => retired)
+    const lifecycle = createSessionReadLifecycleFactory(adapter).create({
+      cursor: createConversationRuntime(),
+      subscriptions: createConversationSubscriptionLifecycle<SessionReadPortLease>(),
+      prepareReadRetirement,
+    })
+    const lease = lifecycle.open({ sessionKey: 'alpha' })
+    await lease.live
+    expect(prepareReadRetirement).toHaveBeenCalledWith('alpha')
+    const closing = lease.close()
+    expect(retired).not.toHaveBeenCalled()
+    if (success) {
+      resolve()
+      await closing
+      expect(retired).toHaveBeenCalledWith()
+    } else {
+      const rejected = expect(closing).rejects.toThrow('release failed')
+      reject(new Error('release failed'))
+      await rejected
+      expect(retired).toHaveBeenCalledWith(false)
+    }
+  })
+
+  it('keeps paged history available when the live snapshot exceeds its recovery budget', async () => {
+    const { adapter, lifecycle } = harness([fixture('alpha', {
+      liveError: new SessionReadFailure('too-large', 'snapshot exceeds budget', false),
+    })])
+    const lease = lifecycle.open({ sessionKey: 'alpha' })
+    await expect(lease.live).rejects.toMatchObject({ kind: 'too-large', retryable: false })
+    expect(lifecycle.current()).toBe(lease)
+    await expect(lease.history.latest()).resolves.toMatchObject({ loadedCount: 1 })
+    expect(adapter.activeLeaseCount).toBe(1)
+    await lease.close()
+  })
+
+  it('coalesces reconciliation while retaining the same lease and subscription owner', async () => {
+    const { adapter, lifecycle } = harness([fixture('alpha')])
+    const lease = lifecycle.open({ sessionKey: 'alpha' })
+    await lease.live
+    const first = lease.reconcile()
+    const second = lease.reconcile()
+    expect(second).toBe(first)
+    await first
+    expect(lifecycle.current()).toBe(lease)
+    expect(adapter.openRecords).toHaveLength(1)
+    expect(adapter.activeLeaseCount).toBe(1)
+    await lease.close()
+  })
+
   it('exposes only the conversation read lease and delegates runtime ownership', async () => {
     const { adapter, lifecycle } = harness([fixture('alpha')])
 
@@ -151,6 +209,7 @@ describe('SessionReadLifecycle', () => {
       'history',
       'live',
       'metadata',
+      'reconcile',
       'retryMetadata',
     ])
     expect(Object.keys(lease.history).sort()).toEqual(['after', 'before', 'latest'])
@@ -337,6 +396,48 @@ describe('SessionReadLifecycle', () => {
     await second.close()
   })
 
+  it.each([
+    ['stream-1', 10],
+    ['restarted-stream', 1],
+    [null, 0],
+  ] as const)('resumes the installed live cursor, including generation/epoch resets (%s/%s)', async (streamGeneration, streamSeq) => {
+    const adapter = new InMemorySessionReadPortAdapter([fixture('alpha')])
+    const runtime = createConversationRuntime()
+    let installed = runtime.createCursor('alpha')
+    const lifecycle = createSessionReadLifecycleFactory(adapter).create({
+      cursor: runtime,
+      subscriptions: createConversationSubscriptionLifecycle<SessionReadPortLease>(),
+      getInstalledCursor: () => installed,
+    })
+    const first = lifecycle.open({ sessionKey: 'alpha' })
+    await first.live
+    // The accepted projection can advance beyond the initial snapshot, or
+    // deliberately reset after a gateway restart / session epoch change.
+    installed = runtime.createCursor('alpha', { streamGeneration, streamSeq })
+    const second = lifecycle.open({ sessionKey: 'alpha' })
+    await second.live
+    expect(adapter.openRecords[1]?.resumeFrom).toEqual({ streamGeneration, streamSeq })
+    await second.close()
+  })
+
+  it('never resumes another session from the installed cursor', async () => {
+    const adapter = new InMemorySessionReadPortAdapter([fixture('alpha'), fixture('beta')])
+    const runtime = createConversationRuntime()
+    const lifecycle = createSessionReadLifecycleFactory(adapter).create({
+      cursor: runtime,
+      subscriptions: createConversationSubscriptionLifecycle<SessionReadPortLease>(),
+      getInstalledCursor: () => runtime.createCursor('alpha', {
+        streamGeneration: 'alpha-stream', streamSeq: 51,
+      }),
+    })
+    const first = lifecycle.open({ sessionKey: 'alpha' })
+    await first.live
+    const second = lifecycle.open({ sessionKey: 'beta' })
+    await second.live
+    expect(adapter.openRecords[1]?.resumeFrom).toEqual({ streamGeneration: null, streamSeq: 0 })
+    await second.close()
+  })
+
   it('finishes the prior generation-pinned release before opening a replacement', async () => {
     const order: string[] = []
     let resolveRelease!: () => void
@@ -351,6 +452,7 @@ describe('SessionReadLifecycle', () => {
         return {
           criticalRequestsQueued: Promise.resolve(),
           live: Promise.resolve(result),
+          reconcile: async () => result,
           metadata: Promise.resolve(hydrated),
           readHistory: async () => page('latest'),
           retryMetadata: async () => hydrated,

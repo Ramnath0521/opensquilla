@@ -1,4 +1,72 @@
 {
+  "processes": {
+    "title": "Procesos en segundo plano",
+    "runningCount": "{count} en ejecución",
+    "refresh": "Actualizar",
+    "logs": "Registros",
+    "stop": "Detener",
+    "close": "Cerrar",
+    "loading": "Cargando…",
+    "loadError": "No se pudieron actualizar los procesos. Inténtalo de nuevo.",
+    "stopError": "No se pudo detener el proceso. Actualiza e inténtalo de nuevo.",
+    "logError": "No se pudo cargar la salida. Inténtalo de nuevo.",
+    "emptyLog": "Todavía no hay salida.",
+    "truncated": "Vista previa limitada de la salida.",
+    "running": "En ejecución",
+    "done": "Finalizado (0)",
+    "failed": "Finalizado ({code})",
+    "killed": "Detenido",
+    "timed_out": "Tiempo agotado"
+  },
+  "imageClipboard": {
+    "copyImage": "Copiar imagen",
+    "copySource": "Copiar código SVG",
+    "imageDescription": "Copiar como PNG al tamaño original. Las imágenes animadas se convierten en imágenes fijas.",
+    "copying": "Copiando…",
+    "copiedImage": "Imagen copiada",
+    "copiedSource": "Código SVG copiado",
+    "unsupported": "No se pueden copiar imágenes en este entorno. Descarga el archivo original.",
+    "failed": "No se pudo copiar. Inténtalo de nuevo o descarga el archivo original.",
+    "invalidImage": "No se puede decodificar esta imagen. Descarga el archivo original.",
+    "invalidSvg": "El SVG no es válido o no tiene dimensiones utilizables. Descarga el archivo original.",
+    "tooLarge": "Este archivo supera el límite de copia. Descarga el original para conservar toda su calidad.",
+    "timedOut": "Se agotó el tiempo de preparación. Inténtalo de nuevo o descarga el archivo original."
+  },
+  "workspaceReference": {
+    "open": "Abrir {path} en el banco de trabajo",
+    "actions": "Acciones del archivo",
+    "copyPath": "Copiar ruta relativa",
+    "copyLocation": "Copiar ruta y líneas",
+    "loading": "Comprobando archivo…",
+    "copied": "Copiado",
+    "copyFailed": "No se pudo copiar. Inténtalo de nuevo.",
+    "stale": "El archivo ha cambiado. Vuelve a leerlo para actualizar la referencia.",
+    "workspaceMismatch": "Este archivo pertenece a otro espacio de trabajo.",
+    "forbidden": "No tienes acceso a este archivo.",
+    "missing": "El archivo o su tarea ya no están disponibles.",
+    "invalid": "La referencia al archivo no es válida.",
+    "unsupported": "Este archivo no se puede mostrar como código fuente.",
+    "unavailable": "No se pudo abrir. Comprueba la conexión e inténtalo de nuevo.",
+    "readonly": "Código de solo lectura",
+    "refresh": "Comprobar de nuevo",
+    "lines": "Líneas {start}–{end} de {total}",
+    "previous": "Mostrar líneas anteriores",
+    "next": "Mostrar más líneas",
+    "search": "Buscar en el código",
+    "searchPlaceholder": "Buscar texto…",
+    "noMatches": "No hay líneas coincidentes",
+    "jumpToLine": "Ir a la línea",
+    "copyContents": "Copiar contenido del archivo"
+  },
+  "resourceActions": {
+    "more": "Acciones de archivo", "preview": "Vista previa en la aplicación", "openSource": "Abrir con la aplicación predeterminada",
+    "reveal": "Mostrar en el gestor de archivos", "revealFinder": "Mostrar en Finder", "revealExplorer": "Mostrar en el Explorador de archivos",
+    "openCopy": "Abrir una copia local", "saveAs": "Guardar como…", "copyPath": "Copiar ruta",
+    "copyGatewayPath": "Copiar ruta del servidor", "copyContents": "Copiar contenido", "saved": "Archivo guardado",
+    "singleFile": "Guardar solo este HTML, sin estilos, imágenes ni páginas vinculadas.",
+    "textOnly": "Solo se puede copiar texto UTF-8 de hasta 1 MiB. Guarda el archivo.",
+    "unavailable": "El archivo fuente no está disponible. Las vistas previas y descargas existentes no cambian.", "failed": "La operación de archivo falló."
+  },
   "workspaces": {
     "projects": "Proyectos",
     "createProject": "Crear proyecto",
@@ -67,6 +135,13 @@
     "viewRelease": "Ver versión",
     "dismiss": "Descartar",
     "desktop": {
+      "installErrorTitle": "No se pudo iniciar la instalación",
+      "quitAndInstall": "Salir e instalar",
+      "signedDownloadedDesc": "OpenSquilla {version} está verificado y listo. «Salir e instalar» cierra los servicios en segundo plano y abre el instalador.",
+      "manualApplyingStatus": "Cerrando servicios en segundo plano",
+      "manualApplyingDesc": "OpenSquilla está cerrando sus servicios en segundo plano. El instalador se abrirá cuando se hayan detenido.",
+      "errorSignatureInvalid": "La firma del instalador no es válida o su editor no coincide con OpenSquilla. Se bloqueó la instalación. Descarga la actualización de nuevo.",
+      "errorSignatureUnavailable": "OpenSquilla no pudo verificar la firma del instalador. Se bloqueó la instalación. Inténtalo más tarde.",
       "indicatorAvailable": "Actualizar {version}",
       "indicatorDownloaded": "Actualización lista",
       "indicatorInstallerReady": "Instalador verificado",
@@ -77,7 +152,7 @@
       "availableDesc": "Descárgala cuando estés listo. OpenSquilla la instalará solo después de reiniciar.",
       "manualAvailableDesc": "Descarga el instalador de Windows correspondiente a esta versión. Windows te guiará para completar la instalación.",
       "manualDownloadedTitle": "Instalador verificado listo",
-      "manualDownloadedDesc": "OpenSquilla {version} se verificó con la suma de comprobación oficial de GitHub y se mostró en su carpeta. Ejecuta el instalador cuando estés listo.",
+      "manualDownloadedDesc": "El instalador de OpenSquilla {version} se ha verificado. Selecciona Mostrar instalador para localizar el archivo y ejecútalo manualmente cuando estés listo.",
       "downloadedTitle": "Lista para instalar",
       "downloadedDesc": "Reinicia OpenSquilla para terminar la actualización a {version}.",
       "downloadingTitle": "Descargando actualización",
@@ -88,8 +163,8 @@
       "errorFallback": "Vuelve a intentarlo desde Ajustes.",
       "errorSourceUnreachable": "Las fuentes de actualización no están disponibles temporalmente. Inténtalo de nuevo más tarde.",
       "errorManifestInvalid": "Los datos del canal de versiones no son válidos, por lo que OpenSquilla no puede confirmar la actualización de forma segura.",
-      "errorChecksumUnavailable": "No se puede verificar el instalador porque la suma de comprobación oficial de GitHub no está disponible. No se abrió ningún instalador.",
-      "errorIntegrityFailed": "El instalador descargado no superó la verificación de integridad y se eliminó.",
+      "errorChecksumUnavailable": "No se puede verificar el instalador porque la suma de comprobación oficial de la actualización no está disponible. No se abrió ningún instalador.",
+      "errorIntegrityFailed": "El instalador no superó la verificación de integridad. Descarga la actualización de nuevo.",
       "errorDownloadFailed": "OpenSquilla no pudo descargar la actualización. Comprueba la conexión e inténtalo de nuevo.",
       "errorInstallFailed": "OpenSquilla no pudo preparar o abrir el instalador. Inténtalo de nuevo o usa la página de la versión.",
       "idleDesc": "Busca una nueva versión de escritorio.",
@@ -124,6 +199,8 @@
     }
   },
   "common": {
+    "more": "Más",
+    "saving": "Guardando…",
     "close": "Cerrar",
     "save": "Guardar",
     "discard": "Descartar",
@@ -166,11 +243,33 @@
       "failedDetail": "Vuelve a cargar el navegador aislado para continuar."
     },
     "artifactAnnotation": {
-      "start": "Anotar vista previa", "stop": "Dejar de anotar", "selectElement": "Selecciona un elemento de la página para anotar", "selectElementShort": "Selecciona elemento", "unavailable": "La anotación de vista previa no está disponible.", "desktopEditingOnly": "Selecciona y edita elementos de la página con IA en la aplicación de escritorio.",
-      "createFailed": "No se pudo adjuntar el elemento seleccionado.", "elementChanged": "El elemento seleccionado cambió antes de adjuntarse. Vuelva a seleccionarlo en la vista previa actual.", "rearmFailed": "El modo de anotación se detuvo porque no se pudo reiniciar el selector. Vuelva a activarlo para intentarlo de nuevo.", "updateFailed": "No se pudo guardar el borrador de anotación.", "discardFailed": "No se pudo descartar la anotación. Seguirá abierta para volver a intentarlo.", "closeFailed": "No se pudo cerrar el editor de anotaciones. Inténtelo de nuevo.", "replacementCleanupFailed": "Se conservó la anotación nueva, pero no se pudo eliminar el borrador anterior.",
+      "start": "Anotar vista previa",
+      "stop": "Dejar de anotar",
+      "selectElement": "Selecciona un elemento de la página para anotar",
+      "selectElementShort": "Selecciona elemento",
+      "unavailable": "La anotación de vista previa no está disponible.",
+      "desktopEditingOnly": "Selecciona y edita elementos de la página con IA en la aplicación de escritorio.",
+      "createFailed": "No se pudo adjuntar el elemento seleccionado.",
+      "elementChanged": "El elemento seleccionado cambió antes de adjuntarse. Vuelva a seleccionarlo en la vista previa actual.",
+      "rearmFailed": "El modo de anotación se detuvo porque no se pudo reiniciar el selector. Vuelva a activarlo para intentarlo de nuevo.",
+      "updateFailed": "No se pudo guardar el borrador de anotación.",
+      "discardFailed": "No se pudo descartar la anotación. Seguirá abierta para volver a intentarlo.",
+      "closeFailed": "No se pudo cerrar el editor de anotaciones. Inténtelo de nuevo.",
+      "replacementCleanupFailed": "Se conservó la anotación nueva, pero no se pudo eliminar el borrador anterior.",
       "overlayFallback": "Continúa la anotación a continuación.",
-      "fallbackTitle": "Continuar anotación", "fallbackDetail": "La vista previa está oculta temporalmente. Tu anotación sigue aquí.", "frozenPreview": "Vista previa de la zona seleccionada",
-      "placeholder": "Describe el cambio para esta zona…", "newlineHint": "{shortcut} para una línea nueva", "keepDraft": "Conservar anotación", "submit": "Añadir anotación", "contextLabel": "Selección actual", "bodyLabel": "Anotación de página", "emptyBody": "Describe el cambio solicitado.", "reselectHint": "Selecciona la zona correspondiente de la página.", "reuseHint": "Se copió la solicitud de cambio. Selecciona la zona correspondiente de la página."
+      "fallbackTitle": "Continuar anotación",
+      "fallbackDetail": "La vista previa está oculta temporalmente. Tu anotación sigue aquí.",
+      "frozenPreview": "Vista previa de la zona seleccionada",
+      "placeholder": "Describe el cambio para esta zona…",
+      "newlineHint": "{shortcut} para una línea nueva",
+      "keepDraft": "Conservar anotación",
+      "submit": "Añadir anotación",
+      "contextLabel": "Selección actual",
+      "bodyLabel": "Anotación de página",
+      "emptyBody": "Describe el cambio solicitado.",
+      "reselectHint": "Selecciona la zona correspondiente de la página.",
+      "reuseHint": "Se copió la solicitud de cambio. Selecciona la zona correspondiente de la página.",
+      "screenshotUploadFailed": "No se pudo adjuntar la captura. La anotación se conserva; puedes añadir una imagen manualmente."
     },
     "artifactPreview": {
       "refresh": "Actualizar vista previa",
@@ -180,7 +279,6 @@
       "readyWithWarnings": "La vista previa se está ejecutando con advertencias.",
       "warningsShort": "Advertencias",
       "suspended": "Vista previa en pausa",
-      "agentEditInProgress": "La edición continúa en segundo plano.",
       "nativePreview": "Vista previa interactiva",
       "allowRemoteResources": "Permitir imágenes, estilos y contenido multimedia en línea",
       "blockRemoteResources": "Bloquear imágenes, estilos y contenido multimedia en línea",
@@ -199,8 +297,8 @@
       "setDefaultMode": "Usar este modo de forma predeterminada",
       "restoreDefaultMode": "Restaurar el modo de vista previa predeterminado",
       "defaultModeSaved": "Modo de vista previa predeterminado guardado.",
-      "fullModeNotice": "La vista previa interactiva puede cargar contenido en línea, pero no comparte la identidad de OpenSquilla, archivos locales ni sesiones del navegador.",
       "offlineWebLimits": "Es posible que algunos contenidos externos y funciones web avanzadas no estén disponibles en la vista previa restringida.",
+      "pdfViewerUnavailable": "El entorno actual no puede mostrar PDF dentro de la aplicación. Ábrelo externamente o descárgalo.",
       "compatibilityFallback": "Esta versión de Desktop solo admite la vista previa antigua de un solo archivo.",
       "upgradeDesktopShort": "Actualizar Desktop",
       "permissionTitle": "¿Permitir el acceso de la página?",
@@ -222,7 +320,6 @@
     },
     "artifactErrors": {
       "documentChanged": "La página cambió. Actualízala antes de volver a intentarlo.",
-      "editSessionRenewalRequired": "La edición se está reconectando. Tus cambios sin guardar siguen disponibles.",
       "writeBusy": "La página se está actualizando. Espera un momento y vuelve a intentarlo.",
       "mutationNotApplied": "La página no se actualizó. Puedes volver a intentarlo.",
       "mutationOutcomePending": "No se puede confirmar el resultado de la actualización. Abre la página para comprobarlo.",
@@ -231,10 +328,12 @@
       "permissionDenied": "No tienes permiso para actualizar esta página.",
       "previewCapabilityExpired": "Es necesario volver a abrir la vista previa.",
       "previewRendererFailed": "No se pudo mostrar la vista previa. Intenta volver a abrirla.",
+      "previewPageUnsupported": "Este cliente o Gateway no permite abrir esta subpágina directamente. Actualiza el software y vuelve a intentarlo.",
       "annotationUnavailable": "Esta anotación no está disponible temporalmente.",
       "annotationBusy": "Las anotaciones se están actualizando. Espera un momento y vuelve a intentarlo.",
       "invalidRequest": "No se pudo completar la solicitud. Revisa la entrada y vuelve a intentarlo.",
-      "internalError": "No se pudo completar la operación. Vuelve a intentarlo."
+      "internalError": "No se pudo completar la operación. Vuelve a intentarlo.",
+      "documentEditingRetired": "Actualiza el cliente y vuelve a abrir la página para enviar anotaciones como mensajes."
     },
     "artifactDocument": {
       "sections": "Secciones del documento del artefacto",
@@ -283,16 +382,7 @@
       "revertFailed": "No se pudo revertir este cambio. Revisa la versión más reciente y vuelve a intentarlo.",
       "commentCreateFailed": "No se pudo añadir el comentario. Revisa el estado actual del documento y vuelve a intentarlo.",
       "commentResolveFailed": "No se pudo resolver el comentario. Revisa su estado actual y vuelve a intentarlo.",
-      "noElementSelected": "Coloca el cursor dentro de un elemento HTML",
-      "saving": "Guardando…",
-      "saveSource": "Guardar",
-      "sourceUnavailable": "El código HTML no está disponible.",
-      "sourceConflict": "El documento cambió en otro lugar. Revísalo o recárgalo antes de guardar.",
-      "copyUnsavedSource": "Copiar código sin guardar",
-      "unsavedSourceCopied": "Código sin guardar copiado",
-      "copyUnsavedSourceFailed": "No se pudo copiar el código sin guardar.",
-      "discardAndLoadLatest": "Descartar y cargar la última versión",
-      "sourceStatus": {"ready":"Listo","saving":"Guardando…","dirty":"Sin guardar","saved":"Guardado","error":"Requiere atención"}
+      "sourceUnavailable": "El código HTML no está disponible."
     }
   },
   "nav": {
@@ -349,6 +439,9 @@
     "connectionState": {
       "connected": "Conectado",
       "connecting": "Conectando",
+      "checking": "Comprobando la conexión con Gateway",
+      "suspect": "Conexión inestable",
+      "reconnecting": "Reconectando con Gateway",
       "disconnected": "Desconectado"
     },
     "bgm": {
@@ -372,6 +465,13 @@
     }
   },
   "settings": {
+    "search": {
+      "label": "Buscar ajustes",
+      "results": "Resultados de ajustes",
+      "empty": "No hay ajustes coincidentes",
+      "defaultModel": "Modelo predeterminado",
+      "permissions": "Permisos"
+    },
     "appearance": {
       "title": "Interfaz",
       "desc": "Tema y preferencias de interfaz locales de este navegador. Los preajustes se aplican al instante; usa Aplicar para un ancho personalizado.",
@@ -701,6 +801,47 @@
     }
   },
   "setup": {
+    "capacity": {
+      "customOpenAI": "Personalizado · compatible con OpenAI",
+      "customAnthropic": "Personalizado · compatible con Anthropic",
+      "partialSaved": "Guardado: {saved}. Sin guardar: {pending}. Se conservan los valores pendientes.",
+      "providerPartialSaved": "Se guardó el proveedor. Los límites del modelo no se guardaron; se conservan los datos introducidos.",
+      "backToRouting": "Volver al enrutamiento inteligente de modelos",
+      "editSharedEnsemble": "Editar conjunto compartido",
+      "sharedEnsemble": "C3 y la fusión de modelos comparten este conjunto.",
+      "title": "Ajustes del modelo",
+      "forModel": "Ajustes del modelo — {model}",
+      "unknown": "Límites sin confirmar",
+      "contextWindow": "Ventana de contexto",
+      "maxOutputTokens": "Longitud máxima de salida",
+      "scope": "Se aplica donde se utilice este modelo con este proveedor.",
+      "current": "Actual: {value} tokens · {source}",
+      "source": {
+        "catalog": "Catálogo de modelos",
+        "default": "Valor predeterminado del sistema",
+        "config": "Configuración global",
+        "override": "Valor manual"
+      },
+      "autoValue": "Automático ({value})",
+      "autoHint": "Deja vacío para usar el valor automático; introduce un entero positivo para cambiarlo.",
+      "requestHint": "Límite de salida del modelo; las respuestas pueden ser más cortas.",
+      "localHint": "Este valor debe coincidir con el contexto configurado en tu servidor de modelos local.",
+      "serverControlled": "El servidor controla la longitud de salida.",
+      "restore": "Restaurar valores automáticos",
+      "positiveInteger": "Introduce un entero positivo o deja el campo vacío para usar el valor automático.",
+      "upgrade": "Actualiza el Gateway para ver y editar los límites. La configuración existente sigue disponible.",
+      "loadFailed": "No se pudo cargar los límites del modelo. Se conservan tus cambios.",
+      "retry": "Reintentar",
+      "draftHint": "Después de Listo, selecciona Guardar cambios en la página de ajustes.",
+      "done": "Listo",
+      "invalid": "Revisa los límites del modelo antes de guardar.",
+      "saved": "Límites del modelo guardados.",
+      "saveFailed": "No se pudo guardar los límites del modelo. Se conservan los valores pendientes.",
+      "unknownHint": "Uno o ambos límites del modelo están sin confirmar. Se usan los valores predeterminados; puedes configurar los límites aquí.",
+      "automaticSource": "Automático · {source}",
+      "unsaved": "Sin guardar",
+      "effective": "Límite efectivo: {value} tokens"
+    },
     "cli": {
       "advancedTitle": "Avanzado · CLI integrada",
       "hintBundled": "Estos comandos usan la CLI integrada en la aplicación; pégalos en una terminal para ejecutarlos.",
@@ -758,6 +899,11 @@
       "memoryOptions": "Opciones de memoria"
     },
     "provider": {
+      "moreActions": "Más acciones de {provider}",
+      "routerOutcomeSynchronized": "Las recomendaciones del Router siguen al proveedor principal guardado.",
+      "routerOutcomePreserved": "Se conservaron los niveles guardados del Router.",
+      "routerOutcomeDisabled": "El enrutamiento de modelos está desactivado; se conservaron los niveles guardados.",
+      "primarySavedAdditionalFailed": "El proveedor se guardó, pero otros ajustes no pudieron guardarse. Revísalos antes de reintentar.",
       "title": "Proveedor",
       "pageTitle": "Servicio de modelos",
       "pageDesc": "Conecta proveedores y gestiona sus credenciales y modelos.",
@@ -766,13 +912,14 @@
       "configuredSummary": "{ready} de {count} listos. La prueba envía una pequeña solicitud.",
       "configuredDesc": "Los proveedores guardados siguen disponibles para el enrutamiento hasta que los elimines. La verificación de la configuración envía una solicitud breve al modelo con los ajustes guardados; el proveedor puede aplicar cargos.",
       "activeBadge": "Activo",
+      "currentPrimary": "Proveedor principal actual",
       "editingBadge": "Editando",
       "profileReady": "Credenciales listas",
       "profileNeedsCredentials": "Necesita credenciales",
       "profileStatusUnavailable": "Estado no disponible",
       "emptyTitle": "Añade tu primer proveedor de modelos",
       "configuredEmpty": "Conecta un proveedor para verificar credenciales y elegir modelos disponibles.",
-      "emptyRoutingHint": "Después podrás configurar el enrutamiento inteligente; un solo proveedor también puede enrutar entre varios modelos.",
+      "emptyRoutingHint": "Después podrás configurar el enrutamiento inteligente de modelos; un solo proveedor también puede enrutar entre varios modelos.",
       "addProvider": "Añadir proveedor",
       "catalogTitle": "Añadir proveedor",
       "catalogDesc": "Elige un proveedor. Su configuración se abrirá justo debajo.",
@@ -810,10 +957,10 @@
       "openModelRouting": "Abrir Enrutamiento de modelos →",
       "modelUsageTitle": "Uso de modelos",
       "modelUsageRouter": "Enrutamiento inteligente de modelos",
-      "modelUsageEnsemble": "Colaboración multimodelo",
+      "modelUsageEnsemble": "Ensamble de modelos",
       "modelUsageFixed": "Modelo fijo",
       "modelUsageRouterDesc": "Elige un modelo configurado adecuado para cada solicitud.",
-      "modelUsageEnsembleDesc": "Genera con varios modelos y después combina sus resultados.",
+      "modelUsageEnsembleDesc": "Los modelos candidatos responden en paralelo y un modelo agregador combina sus respuestas para producir la respuesta final.",
       "modelUsageFixedDesc": "Envía cada solicitud al modelo directo actual.",
       "crossProviderActive": "Incluye enrutamiento entre proveedores",
       "configureModelRouting": "Configurar enrutamiento",
@@ -887,7 +1034,7 @@
       "choose": "Elige un proveedor",
       "chooseProviderShort": "elegir proveedor",
       "routerTiers": "Enrutamiento de modelos",
-      "routingDesc": "Configura niveles, ensemble y modelo único en Enrutamiento de modelos.",
+      "routingDesc": "Configura niveles, ensemble y modelo fijo en Enrutamiento de modelos.",
       "routerReady": "SquillaRouter listo",
       "directOnly": "Solo directo",
       "chooseToSeeFields": "Elige un proveedor para ver los campos requeridos.",
@@ -918,7 +1065,7 @@
       "configuredModelFallbackLabel": "Modelo de reserva",
       "configuredModelDescFixed": "Modo de modelo fijo: cada solicitud usa el modelo de abajo.",
       "configuredModelDescRouter": "Modo de enrutamiento inteligente de modelos: cada solicitud se dirige a un modelo adecuado y vuelve al modelo de abajo si el enrutamiento no está disponible.",
-      "configuredModelDescEnsemble": "Modo de colaboración multimodelo: varios modelos generan juntos y se vuelve al modelo de abajo si el conjunto no puede completarse.",
+      "configuredModelDescEnsemble": "Ensamble de modelos: Los modelos candidatos responden en paralelo y un modelo agregador combina sus respuestas para producir la respuesta final. Si el ensamble no puede completarse, se usa el modelo de abajo como respaldo.",
       "defaultModelDesc": "Para solicitudes directas y respaldo principal. Los modelos de ruta se configuran en Enrutamiento de modelos.",
       "defaultModelSemantics": "A recommended model is prefilled when available. Choose or enter another model, then verify it before relying on it.",
       "profileModelTitle": "Modelo directo y de reserva para {provider}",
@@ -929,7 +1076,7 @@
       "runtimeDefaultsDesc": "Comportamiento global de la puerta de enlace para solicitudes normales.",
       "timeoutLabel": "Tiempo de espera de la solicitud (segundos)",
       "timeoutDesc": "Cuánto esperar la respuesta de un modelo antes de agotar el tiempo de espera; aumenta este valor para modelos locales lentos (Ollama, vLLM, LM Studio).",
-      "timeoutGlobalDesc": "Tiempo de espera global para solicitudes normales de todos los proveedores. La verificación de configuración usa 30 segundos aparte.",
+      "timeoutGlobalDesc": "Tiempo de espera global para solicitudes normales de todos los proveedores. Las comprobaciones de conexión y las pruebas del modelo usan límites fijos independientes.",
       "contextWindowLabel": "Anulación de la ventana de contexto (tokens)",
       "contextWindowDesc": "Limita el presupuesto de ensamblado del prompt para este modelo. Déjalo en blanco para usar la ventana detectada automáticamente.",
       "contextWindowIdentityLabel": "Ventana de contexto · {provider} / {model}",
@@ -980,7 +1127,14 @@
       "credentialSourceOptions": "Fuente de credenciales",
       "credentialRevealUnavailable": "Couldn't reveal the saved API key.",
       "connectionLabel": "Configuración actual",
-      "connectionDesc": "Envía una solicitud breve al modelo con la clave, el endpoint y el modelo de verificación actuales y confirma que el flujo finaliza. El proveedor puede cobrarla.",
+      "connectionDesc": "Comprueba rápidamente el acceso al endpoint y, cuando sea necesario, prueba una llamada real al modelo por streaming. El proveedor puede cobrar las pruebas del modelo.",
+      "checkConnection": "Comprobar conexión",
+      "checkingConnection": "Comprobando conexión…",
+      "cancelConnectionCheck": "Cancelar comprobación",
+      "testModel": "Probar modelo",
+      "testingModel": "Probando modelo…",
+      "cancelTest": "Cancelar prueba",
+      "testSavedModel": "Probar modelo guardado",
       "testConnection": "Verificar configuración",
       "testCurrentSettings": "Verificar configuración actual",
       "testing": "Verificando configuración…",
@@ -990,6 +1144,11 @@
       "lastVerifyFailedAgo": "Última verificación fallida · {ago}",
       "currentSettingsNotTested": "Configuración actual sin verificar",
       "endpointVerified": "Configuración verificada",
+      "reachableNotModelTested": "Endpoint accesible · modelo sin probar",
+      "endpointResponded": "El endpoint respondió — {reason}",
+      "modelVerified": "Llamada al modelo correcta",
+      "modelTimedOut": "La respuesta del modelo agotó el tiempo · verificación incompleta",
+      "reachabilityTimedOut": "La comprobación agotó el tiempo · accesibilidad sin confirmar",
       "probeMissingRequired": "Completa los campos obligatorios antes de verificar: {fields}.",
       "requiredFieldJoiner": ", ",
       "connected": "✓ Configuración verificada",
@@ -1008,6 +1167,7 @@
       "failureModelNotFound": "El proveedor no reconoce este id de modelo.",
       "failureUnreachable": "No se pudo alcanzar el endpoint.",
       "failureBadRequest": "El proveedor rechazó la solicitud.",
+      "failureProbeTimeout": "Se agotó el plazo de verificación.",
       "failureGeneric": "La verificación de configuración falló.",
       "modelListLabel": "Modelos descubiertos",
       "modelOptionsToggle": "Catálogo de modelos · {count}",
@@ -1039,12 +1199,47 @@
       "modelNoMatches": "No hay modelos coincidentes — puedes usar lo que escribiste.",
       "modelListTruncated": "Mostrando {shown} de {total} modelos — sigue escribiendo para acotar.",
       "modelProvenance": "Lista del proveedor en vivo · fuente de capacidades: {sources}",
-      "modelMetadataProvenance": "Lista del proveedor en vivo · valores oficiales si están disponibles; si no, valores del catálogo"
+      "modelMetadataProvenance": "Lista del proveedor en vivo · valores oficiales si están disponibles; si no, valores del catálogo",
+      "modelMultimodal": "Multimodal",
+      "modelMultimodalTitle": "Admite entradas de imagen",
+      "saveAndStart": "Guardar y empezar",
+      "saveAndMakeActive": "Guardar y establecer como principal",
+      "saveActivateUpgradeHint": "Actualiza el Gateway para guardar y activar el proveedor en una sola operación.",
+      "primaryRoleHint": "El proveedor principal gestiona las solicitudes directas predeterminadas y el respaldo. Al establecer OpenRouter o TokenRhythm como principal, también se aplican sus niveles de enrutamiento recomendados. Se conserva la configuración del conjunto.",
+      "activationCredentialRequired": "Añade credenciales válidas antes de establecer este proveedor como principal.",
+      "routerConflictTitle": "Elige cómo gestionar las rutas existentes",
+      "routerConflictBody": "El Router guardado usa {conflicts}, en conflicto con {provider}. Las recomendaciones de {provider} reemplazan los niveles guardados y sin guardar. Si se ofrece, puedes desactivar el enrutamiento conservando los niveles. Cancelar mantiene el modo y los borradores.",
+      "routerUseRecommended": "Usar las rutas recomendadas del proveedor de destino",
+      "routerDisablePreserve": "Conservar las rutas y desactivar Router",
+      "alreadyActive": "El proveedor de destino ya es el principal. Este cambio de credenciales no se guardó.",
+      "primarySaveUncertain": "No se pudo confirmar el guardado. Se conservó el borrador. Comprueba la configuración antes de reintentar; un proveedor activo no confirma que se hayan guardado las credenciales."
     },
     "preset": {
       "modeCustom": "personalizado"
     },
     "modelStrategy": {
+      "summaryPrimary": "Proveedor principal guardado",
+      "summaryRouter": "Enrutamiento de modelos",
+      "summaryOn": "Activado",
+      "summaryOff": "Desactivado",
+      "bindingFollowPrimary": "Recomendado · sigue al proveedor principal",
+      "bindingCustom": "Niveles personalizados",
+      "bindingLegacy": "Niveles existentes · seguimiento no definido",
+      "resetRecommended": "Usar niveles recomendados de {provider}",
+      "resettingRecommended": "Actualizando niveles recomendados…",
+      "resetKeepsOff": "Actualiza los niveles; el enrutamiento sigue desactivado.",
+      "resetKeepsMode": "Reemplaza los niveles y mantiene el modo actual.",
+      "retainedDrafts": "Cambios de enrutamiento sin guardar",
+      "crossProviderDisabledMismatch": "Los niveles guardados usan otros proveedores; la ejecución entre proveedores está desactivada.",
+      "resetUpgradeHint": "Actualiza el Gateway para aplicar los niveles recomendados en una sola operación.",
+      "operationPending": "Hay otra operación de proveedor o enrutamiento en curso.",
+      "activationUpgradeHint": "Este Gateway no puede confirmar una activación segura del Router. Actualízalo para revisar y resolver los conflictos de proveedores.",
+      "savedRefreshFailed": "Guardado, pero no se pudieron actualizar los ajustes. Recárgalos antes de hacer otro cambio.",
+      "resultUncertain": "Se desconoce el resultado del guardado. Revisa los ajustes actualizados antes de reintentar.",
+      "resetTitle": "¿Usar niveles recomendados de {provider}?",
+      "resetBody": "¿Reemplazar las ediciones guardadas y sin guardar de los niveles del Router por las recomendaciones de {provider}? El modo y el interruptor del Router no cambian. Los demás ajustes sin guardar se conservan.",
+      "resetConfirm": "Reemplazar por recomendaciones",
+      "resetSaved": "Niveles recomendados de {provider} guardados; el modo no ha cambiado.",
       "title": "Enrutamiento de modelos",
       "desc": "Elige cómo se selecciona el modelo para cada solicitud.",
       "newSessionDefault": "Este es el valor predeterminado de los chats nuevos. Los chats existentes conservan su propio modo de enrutamiento.",
@@ -1063,7 +1258,7 @@
       "advancedDesc": "Nivel de respaldo y presentación del enrutado en el chat.",
       "visualModeLabel": "Estilo del panel de decisión de enrutamiento",
       "visualModeDesc": "Cómo se muestra la decisión de enrutado en las respuestas.",
-      "crossProviderNotice": "El routing entre proveedores está activo. Revisa cada nivel antes de guardar.",
+      "crossProviderNotice": "La ejecución entre proveedores está activada.",
       "cards": {
         "router": {
           "title": "Enrutamiento inteligente de modelos",
@@ -1082,7 +1277,7 @@
         }
       },
       "routerDependency": "Elige un modelo para cada nivel de solicitud. Un solo proveedor puede cubrirlos todos.",
-      "ensembleTitle": "Colaboración entre varios modelos",
+      "ensembleTitle": "Ensamble de modelos",
       "ensembleDependency": "Usa credenciales de {provider}; el modelo predeterminado del proveedor es {model}.",
       "ensembleMinimum": "Agrega al menos otro candidato para aprovechar el enrutamiento agregado.",
       "ensembleFailure": "Si la fusión no puede completarse, usa el modelo fijo y de respaldo: {provider} · {model}.",
@@ -1097,7 +1292,7 @@
       "openrouterFixedDesc": "Cuando el servicio de modelos usa {provider}, el enrutamiento agregado usa cuatro modelos proponentes y un agregador.",
       "openrouterFixedProposer": "Modelo proponente",
       "openrouterFixedAggregator": "Agregador",
-      "credentialReady": "Conectado",
+      "credentialReady": "Credenciales disponibles",
       "credentialNeeded": "Se necesitan credenciales de {provider}",
       "credentialMissingEnv": "Se necesita {envKey}",
       "credentialUnknown": "Credenciales no comprobadas",
@@ -1109,6 +1304,7 @@
       "removeCandidateAria": "Quitar {model}",
       "ensembleEmpty": "Aún no hay modelos candidatos. Guarda la configuración del servicio de modelos para generar niveles de enrutamiento, o agrega candidatos manualmente.",
       "ensemblePipeline": "Cómo funciona: los modelos proponentes redactan en paralelo y el agregador fusiona los borradores en la respuesta final. Solo el agregador puede invocar herramientas.",
+      "candidateModelHint": "El ensamble de modelos aún no admite el análisis de imágenes. Para analizar imágenes, cambia a «Enrutamiento inteligente de modelos» y configura un modelo compatible con imágenes, o selecciona uno en «Modelo fijo».",
       "ensembleFlowDesc": "Varios modelos redactan en paralelo y un agregador las combina en una respuesta. Usa más llamadas.",
       "legacyDynamicNotice": "Este plan de fusión heredado sigue los niveles de modelo guardados. Conviértelo en una alineación personalizada para editar sus miembros.",
       "legacyDynamicMigrate": "Convertir en alineación personalizada",
@@ -1127,7 +1323,7 @@
       "aggregatorNote": "Fusiona todos los borradores en la respuesta final; el único miembro que puede invocar herramientas",
       "aggregatorSectionLabel": "Agregador",
       "aggregatorSectionDesc": "Exactamente un agregador produce la respuesta final. Elige el modelo más potente de tu alineación.",
-      "aggregatorInheritedNote": "Sin agregador asignado — el modelo de chat actual fusiona los borradores",
+      "aggregatorInheritedNote": "Usa el modelo actual",
       "proposerSectionLabel": "Proponentes",
       "proposerRoleLabel": "Proponente",
       "aggregatorRoleLabel": "Agregador",
@@ -1145,7 +1341,7 @@
       "replaceCandidateConfirm": "Reemplazar",
       "candidateDuplicate": "Este modelo ya está en la lista de proponentes.",
       "addProposer": "Agregar proponente",
-      "chooseAggregator": "Elegir agregador",
+      "chooseAggregator": "Cambiar modelo",
       "aggregatorPickerTitle": "Elegir el agregador",
       "aggregatorFromProposers": "Usar un proponente existente",
       "aggregatorOtherModel": "O elegir otro modelo",
@@ -1164,7 +1360,8 @@
       "proposerRetriesDesc": "Solo fallos reintentables; la solicitud inicial no cuenta como reintento.",
       "proposerRetriesOption": "Como máximo {count} reintentos tras la solicitud inicial",
       "runtimeLimitsLabel": "Límites de tiempo",
-      "runtimeLimits": "Proponentes {proposerTimeout}s en total · inactividad del agregador entre eventos {aggregatorTimeout}s (configurado {configuredAggregatorTimeout}s) · límite total del turno separado"
+      "runtimeLimits": "Proponentes {proposerTimeout}s en total · inactividad del agregador entre eventos {aggregatorTimeout}s (configurado {configuredAggregatorTimeout}s) · límite total del turno separado",
+      "fallbackModelLabel": "Modelo de respaldo"
     },
     "behavior": {
       "title": "Comportamiento de la sesión",
@@ -1177,12 +1374,12 @@
     "router": {
       "title": "Niveles de modelo",
       "mode": "Modo",
-      "modeModelRouting": "Enrutamiento IA de un solo modelo",
+      "modeModelRouting": "Enrutamiento inteligente de modelos",
       "modeSingleModel": "Desactivado",
       "modeRecommended": "Seguir niveles del proveedor actual",
       "modeDisabled": "Desactivado",
-      "routingDisabledHint": "Activa el enrutamiento IA de un solo modelo para editar niveles de modelo.",
-      "routingEnsembleReadOnlyHint": "El enrutamiento IA agregado está activo. La configuración estándar de niveles de modelo está temporalmente inactiva.",
+      "routingDisabledHint": "Activa el modo «Enrutamiento inteligente de modelos» para editar los niveles de modelo.",
+      "routingEnsembleReadOnlyHint": "El modo «Ensamble de modelos» está activo. La configuración estándar de niveles de modelo está temporalmente inactiva.",
       "defaultTextModel": "Nivel de modelo predeterminado",
       "panelLabel": "Tabla de niveles de modelo",
       "panelDesc": "Los modelos de la tabla de niveles se envían mediante el proveedor de cada fila, por lo que todos los proveedores usan la misma estructura de tabla de enrutamiento.",
@@ -1191,6 +1388,7 @@
       "colModel": "Modelo",
       "colThinking": "Razonamiento",
       "colImage": "Imagen",
+      "imageCapabilityAutomatic": "La capacidad de imagen se detecta automáticamente a partir de los metadatos del proveedor y los resultados de las solicitudes; no requiere ajustes manuales.",
       "tierProviderAria": "Entrada de solicitud de {tier}",
       "tierProviderManagedByEnsemble": "Determinada por la fusión multimodelo",
       "tierProviderManagedByEnsembleAria": "La entrada de solicitud de {tier} la determina el plan de fusión multimodelo",
@@ -1221,7 +1419,8 @@
       "tierLegacyDynamicEnsembleSummaryGeneric": "Usa el plan de fusión guardado que sigue los niveles de modelo; si falla, usa el modelo fijo y de respaldo.",
       "tierLegacyDynamicEnsembleFallbackMissingSummary": "Usa el plan de fusión guardado que sigue los niveles de modelo; todavía no hay un modelo fijo y de respaldo utilizable configurado.",
       "tierSingleModelAnnouncement": "C3 usa un solo modelo: {model}.",
-      "tierEnsembleImageRouting": "La fusión C3 no procesa imágenes; las solicitudes de imagen siguen usando la configuración del modelo de imagen.",
+      "tierEnsembleImageRouting": "La fusión C3 recibe indicaciones de texto para las imágenes. Router solo utiliza los modelos C0–C3 configurados para procesar imágenes.",
+      "tierLegacyImageRouting": "Configuración antigua de compatibilidad: este modelo se conserva, pero no se utiliza para las imágenes de entrada. Configure un modelo compatible con imágenes en C0–C3.",
       "tierThinkingManagedByEnsemble": "Determinada por el plan de fusión",
       "tierThinkingManagedByEnsembleAria": "El razonamiento de {tier} lo determina el plan de fusión multimodelo",
       "tierThinkingAria": "Nivel de razonamiento de {tier}",
@@ -1230,9 +1429,9 @@
       "save": "Guardar enrutador",
       "chooseProviderFirst": "elige primero un proveedor",
       "summaryDisabled": "desactivado",
-      "summaryEnsemble": "Enrutamiento IA agregado",
-      "ensembleProfileTitle": "Enrutamiento IA agregado",
-      "ensembleProfileDesc": "La tabla de niveles de modelo aporta modelos candidatos para el enrutamiento IA agregado.",
+      "summaryEnsemble": "Ensamble de modelos",
+      "ensembleProfileTitle": "Ensamble de modelos",
+      "ensembleProfileDesc": "La tabla de niveles de modelo aporta modelos candidatos para el modo «Ensamble de modelos».",
       "visualMode": {
         "real_candidates": "Candidatos de enrutamiento reales",
         "legacy_grid": "Panel visual de tres niveles"
@@ -1247,8 +1446,8 @@
       }
     },
     "ensemble": {
-      "statusOn": "El enrutamiento IA agregado está activo: varios modelos responden y un modelo sintetiza la respuesta final.",
-      "statusOff": "El enrutamiento IA agregado está desactivado.",
+      "statusOn": "El modo «Ensamble de modelos» está activo. Los modelos candidatos responden en paralelo y un modelo agregador combina sus respuestas para producir la respuesta final.",
+      "statusOff": "El modo «Ensamble de modelos» está desactivado.",
       "allFailedFallback": "Recurrir a un solo modelo",
       "allFailedError": "Detener e informar de un error"
     },
@@ -1439,6 +1638,8 @@
       "tokenLabel": "Token",
       "optional": "opcional",
       "tokenDesc": "Token de portador para puertas de enlace que requieren autenticación. Se almacena solo en esta pestaña.",
+      "tokenRequired": "Se requiere un token",
+      "reasonTokenRequired": "La autenticación falló. Los reintentos automáticos están en pausa. Introduce un token de pasarela válido y selecciona Conectar.",
       "reconnect": "Reconectar",
       "connect": "Conectar",
       "disconnect": "Desconectar"
@@ -1658,12 +1859,19 @@
       "dataMaintenanceAria": "Abrir el mantenimiento de datos",
       "runTraceLabel": "Panel de traza de ejecución en Registros",
       "runTraceDesc": "Hace que las líneas de registro sean interactivas y abre un panel de detalle de pasos por nodo para cada línea en la vista de Registros.",
-      "runTraceAria": "Panel de traza de ejecución en Registros (surte efecto tras recargar)"
+      "runTraceAria": "Panel de traza de ejecución en Registros (surte efecto tras recargar)",
+      "configFileLabel": "Archivo de configuración",
+      "configFileDesc": "Puedes ajustar más opciones en el archivo de configuración."
     },
     "privacy": {
       "statusDisabledByEnv": "Desactivados por una configuración del entorno.",
-      "networkReportingLabel": "Diagnóstico y actualizaciones",
-      "networkReportingDesc": "Comparte datos limitados de diagnóstico del producto y busca actualizaciones. No se suben conversaciones, archivos ni el contenido de solicitudes al modelo."
+      "statusNotChosen": "Todavía no se ha guardado ninguna elección. No se envían datos hasta que se active.",
+      "reliabilityDiagnosticsLabel": "Diagnósticos de estabilidad",
+      "reliabilityDiagnosticsDesc": "Comparte resultados de operaciones, duraciones y huellas de error que preservan la privacidad para diagnosticar cierres y fallos. Nunca se incluye el contenido de conversaciones o archivos.",
+      "productAnalyticsLabel": "Análisis de producto y crecimiento",
+      "productAnalyticsDesc": "Comparte hitos de activación y el número de ejecuciones de MetaSkill y del modo de programación una vez iniciadas realmente, para medir la conversión y el uso de funciones. Nunca se incluyen el contenido de las conversaciones, los parámetros de tareas, los archivos ni los ID de cuenta sin transformar; se utiliza un identificador analítico aleatorio y específico.",
+      "networkReportingLabel": "Envío de diagnósticos y estadísticas de uso",
+      "networkReportingDesc": "Envía diagnósticos y estadísticas de uso anónimos, incluido el número de ejecuciones reales de MetaSkill y del modo de programación. También controla la búsqueda de actualizaciones. No incluye conversaciones, parámetros de tareas ni archivos."
     },
     "toast": {
       "loadFailed": "No se pudieron cargar los ajustes: {error}",
@@ -1715,7 +1923,10 @@
       "channelEnabled": "Canal activado. Se requiere reiniciar.",
       "channelEnabledLive": "Canal habilitado e iniciado.",
       "channelDisabled": "Canal desactivado. Se requiere reiniciar.",
-      "channelDisabledLive": "Canal deshabilitado y detenido."
+      "channelDisabledLive": "Canal deshabilitado y detenido.",
+      "providerSavedAndActivated": "Se guardó {provider} y se estableció como principal.",
+      "modelStrategyPartialSaved": "Se guardaron algunos ajustes. El cambio del proveedor principal no se completó; los cambios pendientes siguen en el formulario.",
+      "modelStrategyPartialSaveUncertain": "Se guardaron algunos ajustes. No se pudo confirmar el cambio del proveedor principal; comprueba el estado guardado. Los cambios pendientes siguen en el formulario."
     },
     "needs": {
       "noApiKey": "No se requiere clave API.",
@@ -1846,10 +2057,98 @@
           "label": "Ventana de agrupación (s)"
         },
         "transport_name": {
+          "label": "Modo de conexión",
           "choices": {
             "polling": "Sondeo (polling)",
             "webhook": "Webhook"
           }
+        },
+        "access_token": {
+          "label": "Token de acceso"
+        },
+        "agent_id_int": {
+          "label": "ID de agente (entero)"
+        },
+        "app_password": {
+          "label": "Contraseña de aplicación"
+        },
+        "app_token": {
+          "label": "Token a nivel de aplicación (xapp-...)"
+        },
+        "application_id": {
+          "label": "ID de aplicación"
+        },
+        "cool_app_code": {
+          "label": "Cool App Code"
+        },
+        "corp_id": {
+          "label": "ID de organización"
+        },
+        "default_channel_id": {
+          "label": "ID de canal predeterminado"
+        },
+        "device_id": {
+          "label": "ID de dispositivo"
+        },
+        "domain": {
+          "label": "Dominio"
+        },
+        "drop_pending_updates": {
+          "label": "Descartar actualizaciones pendientes"
+        },
+        "encoding_aes_key": {
+          "label": "Clave AES de codificación"
+        },
+        "encrypt_key": {
+          "label": "Clave de cifrado"
+        },
+        "encryption": {
+          "label": "Cifrado"
+        },
+        "gateway_url": {
+          "label": "URL de la pasarela"
+        },
+        "intents": {
+          "label": "Máscara de bits de intents"
+        },
+        "password": {
+          "label": "Contraseña"
+        },
+        "poll_idle_sleep_s": {
+          "label": "Espera inactiva de sondeo (s)"
+        },
+        "poll_limit": {
+          "label": "Límite de sondeo"
+        },
+        "poll_timeout_s": {
+          "label": "Tiempo de espera de sondeo (s)"
+        },
+        "reply_in_thread": {
+          "label": "Responder en hilo"
+        },
+        "robot_code": {
+          "label": "Código de robot"
+        },
+        "slack_channel_id": {
+          "label": "ID de canal predeterminado"
+        },
+        "token": {
+          "label": "Token de bot (xoxb-...)"
+        },
+        "verification_token": {
+          "label": "Token de verificación"
+        },
+        "webhook_path": {
+          "label": "Ruta del webhook"
+        },
+        "webhook_secret_token": {
+          "label": "Token secreto del webhook"
+        },
+        "webhook_url": {
+          "label": "URL de webhook (solo webhook)"
+        },
+        "websocket_url": {
+          "label": "URL de WebSocket"
         }
       },
       "groups": {
@@ -2285,6 +2584,13 @@
       "enable": "Activar",
       "disable": "Desactivar",
       "notReported": "No informado",
+      "transport": {
+        "polling": "Sondeo (polling)",
+        "webhook": "Webhook",
+        "websocket": "WebSocket",
+        "http_sync": "Sincronización HTTP",
+        "mixed": "Múltiples modos de conexión"
+      },
       "tabs": {
         "overview": "Resumen",
         "pairings": "Miembros",
@@ -2703,6 +3009,9 @@
       ,"workspaceOptionalHint": "Opcional. Elige «Sin espacio de proyecto» para tareas generales o un proyecto cuando necesite sus archivos."
     },
     "form": {
+      "invalidTimezone": "Introduce una zona horaria válida, como Europe/Madrid.",
+      "discardBody": "Se perderán los cambios sin guardar. Cancela para seguir editando.",
+      "discardTitle": "¿Descartar los cambios?",
       "cronPreviewPlaceholder": "Introduce una expresión cron de 5 campos para previsualizar",
       "cronParseError": "No se pudo analizar la expresión; se esperaban 5 campos (m h dom mon dow).",
       "cronCustomCadence": "coincide con una cadencia personalizada",
@@ -2921,6 +3230,18 @@
       "add": "Añadir"
     },
     "skillDetail": {
+      "useUnavailable": "Esta habilidad no está disponible para una nueva tarea. Revisa su estado e inténtalo de nuevo.",
+      "useInTaskHint": "Prepara un borrador con esta habilidad. No se enviará nada hasta que lo decidas.",
+      "useInTask": "Usar en una nueva tarea",
+      "allowUse": "Allow use",
+      "allowUseHelp": "Applies to every skill with this name. Dependencies are installed separately.",
+      "enable": "Allow use",
+      "disable": "Disable use",
+      "saving": "Saving…",
+      "enabledSaved": "Skill use allowed.",
+      "disabledSaved": "Skill use disabled.",
+      "refreshPending": "Saved, but live refresh failed. Restart the Gateway before using this skill.",
+      "disabledContent": "Use is disabled. Allow use to read the skill instructions.",
       "dialogLabel": "Detalles de la habilidad: {name}",
       "triggers": "Disparadores",
       "composition": "Composición ({kind}, {count} subhabilidades)",
@@ -2962,6 +3283,7 @@
       "sourceLabel": "Fuente del Skill de la comunidad",
       "sourceClawHub": "Catálogo ClawHub",
       "sourceGitHub": "Repositorio GitHub",
+      "sourceSkillHub": "Catálogo SkillHub",
       "githubReferencesLabel": "Referencias de GitHub",
       "githubReferencesPlaceholder": "Una URL o referencia exacta de Skill de GitHub por línea",
       "githubReferencesHint": "Una referencia por línea. Las comas, los puntos y coma y los espacios no separan referencias. El Gateway resuelve las ramas mutables antes de instalar.",
@@ -2979,7 +3301,16 @@
       "clearActivity": "Borrar actividad",
       "expandActivity": "Expandir actividad de instalación",
       "collapseActivity": "Contraer actividad de instalación",
+      "selectSkillDirectory": "Selecciona un directorio de habilidades",
+      "installPhase": {
+        "resolving": "Resolviendo la fuente",
+        "downloading": "Descargando archivos",
+        "scanning": "Analizando el contenido",
+        "committing": "Guardando la instalación"
+      },
       "queueStatus": {
+        "waiting": "Esperando el resultado de instalación",
+        "selection_required": "Elegir directorio",
         "queued": "En cola",
         "installing": "Instalando",
         "cancelling": "Cancelando",
@@ -3003,6 +3334,7 @@
       "retryAfter": "Reintentar después de: {value}",
       "installResultUnknown": "Resultado de instalación desconocido",
       "viewDetails": "Ver detalles",
+      "viewInstallDetails": "Ver detalles de la instalación",
       "notInstalled": "No instalado",
       "existingInstallPreserved": "Se conservó la instalación existente",
       "diagnostics": "Diagnósticos ({count})",
@@ -3017,6 +3349,7 @@
       "installGithub": "Instalar desde URL de GitHub",
       "searching": "Buscando en ClawHub...",
       "hintBrowse": "Busca habilidades de ClawHub para explorarlas e instalarlas.",
+      "hintBrowseSkillHub": "Busca habilidades de SkillHub para explorarlas e instalarlas.",
       "hintGithub": "Pega arriba una URL de habilidad de GitHub para instalarla directamente.",
       "colName": "Nombre",
       "colDescription": "Descripción",
@@ -3309,12 +3642,116 @@
     }
   },
   "chat": {
+    "modelSetup": {
+      "notice": "Configura un servicio de modelos antes de chatear.",
+      "configure": "Configurar modelo"
+    },
+    "skillPalette": {
+      "title": "Commands and skills",
+      "command": "Commands",
+      "skill": "Skills",
+      "meta": "Workflows",
+      "empty": "No matching commands or skills",
+      "loading": "Loading skills…",
+      "autoHint": "Desplázate o busca por nombre · Selección automática de habilidades",
+      "upgrade": "Update the Gateway to select skills for a message.",
+      "loadFailed": "Skills could not be loaded. Close and reopen the menu to retry.",
+      "disabled": "Disabled · Manage",
+      "needsSetup": "Needs setup · Manage",
+      "manualOnly": "Manual use only",
+      "thisMessage": "This message",
+      "remove": "Remove {name} from this message",
+      "queuedHint": "This message will run after the current task.",
+      "limit": "Select up to 16 skills per message.",
+      "metaTextOnly": "This workflow accepts text. Keep attachments and selected skills in a separate message.",
+      "commandAtStart": "Use this command at the start of a message.",
+      "usage": "Usage: {tokens} tokens",
+      "usageFailed": "Unable to load usage. Try again.",
+      "workflowTitle": "Start {name}",
+      "workflowRequest": "What would you like this workflow to do?",
+      "loaded": "Loaded",
+      "failed": "Load failed",
+      "loadingSkill": "Loading",
+      "user": "User selected",
+      "auto": "Automatic",
+      "selected": "Selected",
+      "unsupported": "Update the Gateway before sending a message with selected skills.",
+      "continue": "Continue",
+      "commandWithSkills": "Selected skills apply to a chat message. Remove the skill labels before running a command.",
+      "commandDescriptions": {
+        "new": "Iniciar un chat nuevo",
+        "compact": "Reducir el contexto actual",
+        "goal": "Establecer un objetivo continuo",
+        "meta": "Elegir un flujo de trabajo",
+        "plan": "Planificar la tarea actual",
+        "reset": "Restablecer la conversación",
+        "usage": "Ver el uso de tokens"
+      },
+      "items": {
+        "xlsx": {
+          "name": "Excel spreadsheets",
+          "description": "Create, edit, and analyze spreadsheets"
+        },
+        "docx": {
+          "name": "Word documents",
+          "description": "Create and edit documents"
+        },
+        "pptx": {
+          "name": "PowerPoint slides",
+          "description": "Create and edit presentations"
+        },
+        "pdf": {
+          "name": "PDF tools",
+          "description": "Read, merge, and edit PDFs"
+        },
+        "github": {
+          "name": "GitHub",
+          "description": "Work with issues and pull requests"
+        },
+        "html": {
+          "name": "Web pages",
+          "description": "Build and edit HTML pages"
+        },
+        "webpage": {
+          "name": "Website builder",
+          "description": "Build a complete website"
+        },
+        "kidsProject": {
+          "name": "Kids’ projects",
+          "description": "Plan a creative project for children"
+        },
+        "shortDrama": {
+          "name": "Short drama",
+          "description": "Turn an idea into a video"
+        },
+        "skillCreator": {
+          "name": "Workflow builder",
+          "description": "Combine skills into a workflow"
+        },
+        "paperWriting": {
+          "name": "Academic writing",
+          "description": "Research and draft a paper"
+        }
+      }
+    },
     "sessionCreated": {
       "title": "Chat creado",
       "open": "Abrir chat",
       "fallbackTitle": "Chat {suffix}",
       "deleted": "Eliminado",
       "missing": "La sesión se eliminó o no existe"
+    },
+    "sessionReference": {
+      "open": "Abrir chat",
+      "unavailable": "Sesión no disponible",
+      "status": {
+        "queued": "En cola",
+        "running": "En ejecución",
+        "idle": "Inactiva",
+        "failed": "Fallida",
+        "missing": "No encontrada",
+        "checking": "Comprobando…"
+      }
     },
     "promptCacheKeepalive": {
       "action": "Mantener caché del prompt",
@@ -3339,6 +3776,7 @@
       "autoPauseLabel": "Pausa automática",
       "states": { "off": "Desactivado", "waiting": "Esperando un prefijo estable", "scheduled": "Programado", "probing": "Sondeando", "paused": "Límite de inactividad alcanzado; esperando el siguiente mensaje", "stopped": "Detenido tras fallo" }
     },
+    "sendPending": "Enviando…",
     "send": "Enviar",
     "sendQueues": "Enviar (se pone en cola hasta después de la respuesta actual)",
     "sendSteers": "Enviar (redirige la respuesta actual ahora)",
@@ -3368,6 +3806,10 @@
     "aiGeneratedLabel": "Contenido generado por IA, solo como referencia.",
     "removeAttachment": "Quitar adjunto",
     "remove": "Quitar",
+    "projectFileTarget": "Archivo del proyecto: {path}",
+    "importedFileTarget": "Copia importada",
+    "projectFileLiveTarget": "Archivo actual del proyecto: {path}",
+    "importedFileWorkingTarget": "Archivo importado; los cambios usan una copia de trabajo",
     "fileLabel": "Archivo",
     "add": "Añadir",
     "attachFiles": "Adjuntar archivos",
@@ -3401,7 +3843,7 @@
     "loadingSession": "Restaurando el historial de la conversación…",
     "loadingSessionDescription": "Puedes seguir usando la conversación mientras se carga el historial.",
     "loadSessionFailed": "Historial de la conversación no disponible temporalmente",
-    "loadSessionDescription": "Es posible que la conexión se haya interrumpido o que el servicio de historial no esté disponible temporalmente. Vuelve a cargar para intentarlo de nuevo.",
+    "loadSessionDescription": "El historial de la conversación no está disponible temporalmente.",
     "reloadSession": "Volver a cargar el historial",
     "retryingSession": "Volviendo a cargar el historial…",
     "retryingSessionDescription": "Restaurando el historial de la conversación…",
@@ -3409,18 +3851,21 @@
     "liveConnecting": "Restaurando las actualizaciones en tiempo real…",
     "liveConnectingConnected": "Gateway conectado. Restaurando las actualizaciones en tiempo real de esta sesión…",
     "gatewayReconnecting": "Reconectando con el Gateway…",
+    "automaticRecoveryDescription": "La recuperación es automática. Puedes seguir editando; el texto y los archivos sin enviar se conservan aquí.",
     "liveUnavailable": "Las actualizaciones en tiempo real no están disponibles temporalmente",
-    "liveUnavailableDescription": "El historial sigue disponible. Vuelve a conectarte antes de enviar.",
-    "liveUnavailableConnectedDescription": "El Gateway está conectado y el historial sigue disponible. El envío se reanudará cuando se recuperen las actualizaciones en tiempo real.",
+    "liveUnavailableDescription": "El historial sigue disponible. El envío se reanudará cuando se recuperen las actualizaciones en tiempo real.",
+    "liveUnavailableConnectedDescription": "La pasarela está conectada. Las actualizaciones en tiempo real de esta sesión no están disponibles temporalmente.",
     "reconnectLive": "Volver a conectar",
     "liveSendBlockedConnecting": "Se están restaurando las actualizaciones en tiempo real. Tu borrador está guardado.",
-    "liveSendBlockedDegraded": "Vuelve a conectar las actualizaciones en tiempo real antes de enviar. Tu borrador está guardado.",
+    "liveSendBlockedDegraded": "Las actualizaciones en tiempo real no están disponibles temporalmente. Tu borrador está guardado.",
     "noMessagesYet": "Aún no hay mensajes.",
     "newChat": "Nueva tarea",
     "chatWithSuffix": "Chat {suffix}",
     "copied": "Copiado",
     "copy": "Copiar",
     "copySessionKey": "Copiar ID de sesión",
+    "copySessionAppLink": "Copiar enlace de la aplicación",
+    "copySessionGatewayLink": "Copiar enlace web del Gateway",
     "sessionActions": "Acciones de la sesión",
     "share": "Compartir",
     "shareSendFirst": "Envía un mensaje primero para compartir",
@@ -3457,7 +3902,7 @@
     "audioUnsupported": "Este navegador no puede reproducir este formato de audio. Descarga el archivo en su lugar.",
     "playVideo": "Reproducir vídeo",
     "videoLoadFailed": "No se pudo cargar el vídeo.",
-    "videoUnsupported": "Este navegador no puede reproducir este formato de vídeo. Descarga el archivo en su lugar.",
+    "videoUnsupported": "Este navegador no puede reproducir este vídeo. Descárgalo en su lugar.",
     "previewOf": "Vista previa: {title}",
     "closePreview": "Cerrar vista previa",
     "previousImage": "Imagen anterior",
@@ -3466,7 +3911,6 @@
     "previewDownload": "Descargar vista previa",
     "previewTimedOut": "Se agotó el tiempo de la vista previa.",
     "previewFailed": "No se pudo cargar la vista previa.",
-    "videoUnsupported": "Este navegador no puede reproducir este vídeo. Descárgalo en su lugar.",
     "loadVideoPreview": "Cargar vista previa del vídeo",
     "loadVideoPreviewFor": "Cargar vista previa del vídeo {title}",
     "videoPreviewLoading": "Cargando la vista previa del vídeo. Puedes cancelar la descarga.",
@@ -3493,11 +3937,60 @@
     "thinkingForSeconds": "Razonando · {seconds} s",
     "thoughtForSeconds": "Razonó durante {seconds} s",
     "thoughtForMinutes": "Razonó durante {minutes} min {seconds} s",
-    "activityTechnicalDetails": "Detalles técnicos",
     "toolResult": "Resultado de la herramienta",
     "subagentPrefix": "Subagente: ",
     "subagentCompletion": "Finalización del subagente",
     "turnFailed": "El turno falló",
+    "copyDiagnosticId": "Copiar ID de diagnóstico",
+    "copiedDiagnosticId": "ID de diagnóstico copiado",
+    "copyDiagnosticFailed": "No se pudo copiar. Selecciona el ID de arriba y cópialo manualmente.",
+    "errorMessage": {
+      "unknown": "La tarea no terminó. Inténtalo de nuevo más tarde.",
+      "noProvider": "No hay ningún modelo disponible.",
+      "credentials": "Las credenciales del modelo no son válidas.",
+      "credits": "La cuenta del modelo no tiene saldo suficiente.",
+      "modelUnavailable": "El modelo seleccionado no está disponible.",
+      "contextLimit": "La entrada supera el límite del modelo.",
+      "unsupported": "Este modelo no admite esta solicitud.",
+      "imageUnsupported": "Este modelo no admite imágenes.",
+      "ensembleImageUnsupported": "Este modo no admite imágenes.",
+      "busy": "El servicio del modelo está ocupado. Inténtalo más tarde.",
+      "unavailable": "El servicio del modelo no está disponible. Inténtalo más tarde.",
+      "refused": "El modelo no puede procesar esta solicitud.",
+      "responseIncomplete": "La respuesta del modelo no terminó. Inténtalo más tarde.",
+      "invalidRequest": "El modelo no pudo aceptar esta solicitud.",
+      "runLimit": "Este turno alcanzó su límite de ejecución.",
+      "needsConfirmation": "Se necesita confirmación para continuar.",
+      "toolDenied": "Una herramienta necesaria no está permitida.",
+      "toolFailed": "Una herramienta no pudo completar su trabajo.",
+      "contextUnavailable": "No se pudo procesar la conversación actual.",
+      "timeout": "La tarea no terminó dentro del tiempo disponible.",
+      "stopped": "La tarea se detuvo.",
+      "interrupted": "La tarea se interrumpió.",
+      "approvalRequired": "Esperando tu autorización."
+    },
+    "errorAction": {
+      "openModelSettings": "Abrir ajustes del modelo",
+      "openProviderSettings": "Abrir ajustes del proveedor",
+      "chooseModel": "Elegir otro modelo",
+      "resumeSandbox": "Continuar",
+      "retryUsageReplay": "Reintentar"
+    },
+    "partialFailureNote": "Se conservaron los resultados parciales.",
+    "providerFailure": {
+      "rate_limited": "El proveedor está limitando las solicitudes. Inténtalo más tarde.",
+      "provider_overloaded": "El proveedor del modelo está ocupado temporalmente. Inténtalo más tarde.",
+      "auth_invalid": "El proveedor rechazó las credenciales. Compruébalas en los ajustes del proveedor.",
+      "context_overflow": "La solicitud supera el contexto del modelo. Acórtala o elige un modelo con un contexto mayor.",
+      "unsupported_feature": "El proveedor no admite esta solicitud. Comprueba las capacidades del modelo seleccionado.",
+      "insufficient_credits": "La cuenta del proveedor no tiene saldo suficiente. Comprueba el saldo o los ajustes de facturación.",
+      "model_not_found": "El modelo configurado no está disponible. Comprueba su nombre y tus permisos de acceso.",
+      "transport_transient": "Se interrumpió la conexión con el proveedor. Comprueba tu conexión y el estado del proveedor.",
+      "policy_refusal": "El proveedor rechazó la solicitud por su política. Revisa la solicitud y la política del proveedor.",
+      "empty_response": "El proveedor no devolvió una respuesta. Inténtalo de nuevo o elige otro modelo.",
+      "malformed_response": "El proveedor devolvió una respuesta no válida. Inténtalo de nuevo o elige otro modelo.",
+      "bad_request": "El proveedor rechazó la solicitud. Comprueba la solicitud y los ajustes del modelo."
+    },
     "restartInterruptedTitle": "El reinicio de OpenSquilla interrumpió esta tarea.",
     "restartInterruptedGuidance": "Esta tarea no continuará automáticamente. Revisa los resultados existentes o las acciones de las herramientas y, después, edita la solicitud original o continúa la conversación.",
     "usageAccountingBlockedTitle": "La contabilidad de uso no está disponible temporalmente",
@@ -3512,6 +4005,7 @@
     "provenance": {
       "cron": "Cron",
       "scheduled": "Programado",
+      "scheduledTrigger": "Activación programada",
       "cronSource": "Programado por {tool}"
     },
     "sandboxSetup": {
@@ -3543,14 +4037,16 @@
     },
     "addToShare": "Añadir a la imagen para compartir",
     "removeFromShare": "Quitar de la imagen para compartir",
-    "aiModelRouter": "Enrutador de modelos de IA",
-    "aiModelEnsembleRouter": "Enrutador agregado de modelos de IA",
+    "aiModelRouter": "Enrutamiento inteligente de modelos",
+    "aiModelEnsembleRouter": "Ensamble de modelos",
     "routerFx": {
       "selectedModel": "El enrutador seleccionó {model}",
-      "ensembleModel": "Fusión multimodelo",
-      "ensembleSelecting": "Enrutador agregado de modelos de IA · seleccionando candidatos",
-      "ensembleHandedOff": "Enrutador agregado de modelos de IA · entregado al agente",
-      "ensembleRunning": "Enrutador agregado de modelos de IA · {count} candidatos sintetizando",
+      "executionModel": "Modelo en ejecución: {model}",
+      "executionModelCompleted": "Ejecutado por {model}",
+      "ensembleModel": "Ensamble de modelos",
+      "ensembleSelecting": "Ensamble de modelos · seleccionando candidatos",
+      "ensembleHandedOff": "Ensamble de modelos · entregado al agente",
+      "ensembleRunning": "Ensamble de modelos · {count} candidatos sintetizando",
       "ensembleDone": "{count} candidatos sintetizados",
       "ensembleMode": "conjunto",
       "ensembleViewTrace": "ver traza",
@@ -3587,6 +4083,7 @@
       "lifecycle": {
         "working": "En curso",
         "answering": "Redactando la respuesta",
+        "preparingToolCall": "Preparando llamada a herramienta",
         "answerPrepared": "Preparación de la respuesta",
         "settled": "Completado",
         "interrupted": "Interrumpido",
@@ -3599,6 +4096,7 @@
         "rateLimited": "Límite de solicitudes · reintento en {seconds}s",
         "retryWait": "Reintento en {seconds}s",
         "retrying": "Reintentando {attempt}/{limit}",
+        "retryingWithoutLimit": "Reintentando · intento {attempt}",
         "fallback": "Cambiando al modelo alternativo"
       },
       "purpose": {
@@ -3635,6 +4133,7 @@
       "more": "{count} más",
       "stale": "Sigue trabajando — sin señal reciente",
       "liveStep": "paso {n}",
+      "phaseElapsed": "Paso actual: {duration}",
       "recordIncomplete": "El registro de actividad está incompleto; se muestra la vista de historial compatible."
     },
     "suggestedTasks": "Tareas sugeridas",
@@ -3660,11 +4159,23 @@
       "cancelled": "Cancelado"
     },
     "toolModal": {
+      "retry": "Reintentar",
+      "logPending": "El registro de ejecución aún se está guardando. Vuelva a intentarlo cuando termine el comando.",
+      "copyPage": "Copiar esta página",
       "tree": "Árbol",
       "raw": "Crudo",
       "wrapLines": "Ajustar líneas",
       "preserveLines": "Conservar ancho de línea",
-      "contentMeta": "{type} · {lines} líneas · {chars} caracteres"
+      "contentMeta": "{type} · {lines} líneas · {chars} caracteres",
+      "executionLog": "Ver registro de ejecución",
+      "toolResult": "Resultado de la herramienta",
+      "characterOffset": "Posición del carácter",
+      "go": "Ir",
+      "previous": "Anterior",
+      "next": "Siguiente",
+      "logRange": "Caracteres {start}–{end} de {total}",
+      "logReadFailed": "No se pudo cargar el registro de ejecución. Inténtalo de nuevo.",
+      "logIncomplete": "El registro está incompleto. Solo está disponible la salida guardada."
     },
     "approval": {
       "required": "Aprobación requerida",
@@ -3709,6 +4220,8 @@
       }
     },
     "plan": {
+      "hidePlan": "Ocultar plan",
+      "showPlan": "Mostrar plan",
       "label": "Plan",
       "process": "Proceso de planificación",
       "revision": "Revisión {id}",
@@ -3747,7 +4260,7 @@
         "running": "En ejecución",
         "paused": "En pausa",
         "blocked": "Bloqueado",
-        "completed": "Completado",
+        "completed": "Ejecución finalizada",
         "cancelled": "Cancelado",
         "superseded": "Sustituido por un plan más reciente"
       },
@@ -3761,7 +4274,7 @@
     },
     "planMode": {
       "label": "Modo de plan",
-      "readOnly": "El agente investiga y propone un plan sin modificar archivos.",
+      "readOnly": "Investigar y discutir el plan antes de implementarlo. Las pruebas y compilaciones siguen los permisos habituales.",
       "nextTurn": "Se aplica al siguiente turno",
       "updating": "Actualizando…",
       "turnOff": "Desactivar modo de plan",
@@ -3782,11 +4295,13 @@
       "answerPlanQuestionnaire": "Responde la pregunta del plan de arriba",
       "previousQuestion": "Anterior",
       "nextQuestion": "Siguiente",
-      "outcomeDoneTitle": "Respuesta enviada · ejecución reanudada",
+      "outcomeDoneTitle": "Respuesta recibida",
       "outcomeBusyDetail": "Tu respuesta se está procesando ahora.",
-      "outcomeDoneDetail": "El agente ha aceptado esta respuesta y ha continuado.",
+      "outcomeDoneDetail": "El agente ha recibido tu respuesta.",
       "replyReceived": "Respuesta recibida · continuando la ejecución…",
       "sendingReply": "Enviando respuesta…",
+      "expiredTitle": "Pregunta caducada",
+      "expiredDetail": "Esta pregunta ya no está activa. Puedes enviar un nuevo mensaje.",
       "sendReply": "Enviar respuesta",
       "sendingContinuing": "Enviando respuesta · continuando la ejecución…"
     },
@@ -3805,6 +4320,7 @@
       }
     },
     "goal": {
+      "emptyContinuations": "En pausa tras varios turnos sin salida ni actividad de herramientas. Revisa el objetivo y reanúdalo cuando estés listo.",
       "placeholder": "Describe el objetivo y envía para empezar a trabajar en él",
       "modeLabel": "Modo objetivo",
       "modeDescription": "Iniciar un objetivo de larga duración",
@@ -3872,7 +4388,7 @@
         "busy": "El estado del objetivo aún se está consolidando. Arriba se muestra el estado más reciente.",
         "notResumable": "Este objetivo no se puede reanudar desde su estado actual.",
         "executionDisabled": "La ejecución de objetivos está desactivada en este espacio de trabajo.",
-        "connectionRequired": "Vuelve a conectar esta tarea antes de continuar el objetivo.",
+        "connectionRequired": "Esta tarea aún no está lista para continuar.",
         "planModeActive": "El objetivo esperará hasta que termine el modo Plan.",
         "planRunActive": "El objetivo esperará a que termine la ejecución activa del Plan.",
         "requestConflict": "Esta acción ya se usó para otra solicitud. Inténtalo de nuevo."
@@ -3889,6 +4405,8 @@
       "disableLabel": "Desactivar Coding mode"
     },
     "composer": {
+      "workStyleGroup": "Forma de trabajo",
+      "contentGroup": "Contenido",
       "executionMode": "Modo de ejecución",
       "ownerOnlyUnavailable": "El modo solo para el propietario no está disponible para esta sesión del navegador.",
       "enabled": "Activado",
@@ -3898,16 +4416,16 @@
       "modelRouting": "Enrutamiento de modelos",
       "sessionModelRouting": "Enrutamiento de modelos de este chat",
       "modelRoutingSessionScope": "Los cambios solo se aplican a este chat. Un turno en curso conserva su modo actual.",
-      "ensembleImageUnsupported": "Ensemble aún no admite entradas de imagen. En «Enrutamiento de modelos», usa «Enrutador monomodelo con IA» configurado para imágenes o «Desactivado» con un modelo compatible con imágenes.",
+      "ensembleImageUnsupported": "El modo «Ensamble de modelos» aún no admite entradas de imagen. En «Enrutamiento de modelos», elige «Enrutamiento inteligente de modelos» con un nivel compatible con imágenes, o «Modelo fijo» con un modelo compatible.",
       "imageInputUnsupported": "El modelo seleccionado no puede procesar imágenes. Elige un modelo compatible o elimina la imagen.",
       "routingUpdateBlocked": "El enrutamiento de modelos se está actualizando. Espera antes de enviar.",
       "routingUpdateImageBlocked": "El enrutamiento de modelos se está actualizando. Espera antes de enviar imágenes.",
-      "modelRoutingOff": "Desactivado",
+      "modelRoutingOff": "Modelo fijo",
       "modelRoutingOffDesc": "Envía cada turno al modelo seleccionado.",
-      "modelRoutingSquillaRouter": "Enrutador monomodelo con IA",
+      "modelRoutingSquillaRouter": "Enrutamiento inteligente de modelos",
       "modelRoutingSquillaRouterDesc": "La IA elige un modelo adecuado por turno para reducir costos.",
-      "modelRoutingEnsemble": "Enrutador de conjunto con IA",
-      "modelRoutingEnsembleDesc": "La IA coordina varios modelos para mejorar la capacidad en tareas complejas. Aún no admite entradas de imagen.",
+      "modelRoutingEnsemble": "Ensamble de modelos",
+      "modelRoutingEnsembleDesc": "Los modelos candidatos responden en paralelo y un modelo agregador combina sus respuestas para producir la respuesta final. Aún no se admiten entradas de imagen.",
       "runMode": "Modo de ejecución",
       "runModeSafe": "Seguro",
       "runModeSafeDesc": "Usa el sandbox y tus reglas de archivos, comandos y red.",
@@ -3953,7 +4471,11 @@
         "generic": "La redirección no está disponible para la tarea actual. El mensaje permanece en cola."
       },
       "clearQueue": "Vaciar cola",
-      "removeMessage": "Quitar el mensaje pendiente {index}"
+      "removeMessage": "Quitar el mensaje pendiente {index}",
+      "offlineRejected": "El mensaje no fue aceptado. Edítalo para volver a intentarlo o elimínalo.",
+      "offlineQueued": "Guardado localmente. Se enviará cuando se restablezca la conexión.",
+      "identityChanged": "La identidad de la conexión ha cambiado. Vuelve a conectarte a la puerta de enlace y la cuenta originales para enviar este mensaje.",
+      "annotationUpgradeRequired": "Esta anotación pendiente usa el editor anterior. Edita el mensaje y vuelve a seleccionar la página antes de enviarlo."
     },
     "metaRuns": {
       "draft": "Borrador",
@@ -4025,13 +4547,25 @@
       "launchFailed": "La cadena de herramientas se instaló, pero no se pudo iniciar la MetaSkill."
     },
     "compact": {
+      "failureIntegrity": "El resumen no superó la comprobación de integridad",
+      "failureCapacity": "El resumen supera la capacidad de contexto del modelo actual",
+      "failureUnavailable": "El modelo de resumen no está disponible",
+      "failureProvider": "El modelo no pudo generar un resumen utilizable",
+      "failureTimeout": "La organización del contexto agotó el tiempo de espera",
+      "failureRejectedDetail": "El resumen no se aplicó; el contexto original se conserva. Inténtalo de nuevo o copia el identificador de diagnóstico si vuelve a fallar.",
+      "failureUnavailableDetail": "Comprueba la configuración del modelo y la conexión y vuelve a intentarlo. Puedes copiar el identificador de diagnóstico.",
+      "failureRetryDetail": "Puedes volver a organizar el contexto. Si vuelve a fallar, copia el identificador de diagnóstico.",
       "compacting": "Compactando el contexto",
       "compacted": "Contexto compactado",
+      "temporarilyReduced": "Historial reducido temporalmente; continuando",
+      "summarySaved": "Resumen guardado",
       "historyPreserved": "Contexto anterior resumido; los mensajes originales siguen disponibles en el historial",
       "historyIncomplete": "Contexto anterior resumido; algunos mensajes originales no están disponibles",
       "historySummarized": "Contexto anterior resumido",
       "failed": "Error al compactar",
       "withinBudget": "Contexto dentro del presupuesto.",
+      "noSafeHistory": "Actualmente no hay historial que se pueda resumir de forma segura",
+      "alreadyConcise": "El contexto actual ya es suficientemente conciso",
       "skipped": "No se aplicó la compactación del contexto.",
       "cancelled": "Compactación cancelada",
       "requestScoped": "Solo para esta solicitud; no se reescribió el historial de la sesión"
@@ -4141,6 +4675,7 @@
       "waitCompactionBeforeCommand": "Espera a que termine la compactación del contexto antes de ejecutar {command}.",
       "waitResponseBeforeCommand": "Espera a la respuesta actual antes de ejecutar {command}.",
       "promptAnnotationBusy": "Espera a que termine la respuesta actual antes de enviar instrucciones del artefacto.",
+      "offlineQueueFailed": "No se pudo poner este mensaje en cola. Se conservó el borrador.",
       "queueFull": "La cola está llena — espera a que termine la respuesta actual.",
       "queuePersistenceUnavailable": "Conserva este mensaje en el editor hasta que termine la bifurcación; la recuperación duradera no está disponible.",
       "messageStillSaving": "Este mensaje aún no se ha guardado — inténtalo de nuevo en un momento.",
@@ -4180,9 +4715,35 @@
       "usageIncompleteUnknown": "Incompleto · total exacto de uso no disponible",
       "unknownProviderCalls": "{count} llamada al proveedor tiene uso desconocido | {count} llamadas al proveedor tienen uso desconocido"
     },
+    "newTaskModel": {
+      "showAll": "Ver todos los modelos",
+      "title": "Modelo de la nueva tarea",
+      "catalog": "Catálogo de la pasarela",
+      "gatewayDefault": "Modelo predeterminado",
+      "gatewayDefaultHint": "Usar el modelo predeterminado de los ajustes",
+      "defaultBadge": "Predeterminado",
+      "search": "Buscar modelos o proveedores…",
+      "loading": "Cargando modelos…",
+      "empty": "No hay modelos coincidentes",
+      "retry": "Reintentar",
+      "scope": "Solo se aplica a esta nueva tarea. No cambia la configuración global.",
+      "partialFailure": "No se pudieron cargar algunos proveedores: {providers}",
+      "routingConflict": "Un modelo específico requiere el modo «Modelo fijo». Borra la selección o elige «Modelo fijo».",
+      "unavailable": "La selección no está disponible en esta conexión. Vuelve a conectarte o borra el modelo seleccionado."
+    },
     "modelRouting": {
-      "updateFailed": "No se pudo cambiar el enrutamiento de modelos — revertido. Comprueba la conexión con la pasarela e inténtalo de nuevo.",
-      "sessionUpdateFailed": "No se pudo actualizar el enrutamiento de modelos de este chat: {error}"
+      "updateFailed": "No se pudo cambiar el enrutamiento de modelos — revertido. El cambio no está disponible temporalmente.",
+      "sessionUpdateFailed": "No se pudo actualizar el enrutamiento de modelos de este chat: {error}",
+      "manage": "Ajustes de modelos y enrutamiento",
+      "back": "Volver a modos de enrutamiento",
+      "title": "Modelos y enrutamiento",
+      "direct": "Modelo fijo",
+      "sessionModelFallback": "Usar el modelo de esta tarea",
+      "sessionModelTitle": "Modelo de esta conversación",
+      "sessionModelHint": "Se aplica al siguiente turno. Conserva el historial y no cambia la configuración global.",
+      "sessionModelBusy": "Podrás cambiar el modelo cuando termine la respuesta actual.",
+      "router": "Enrutamiento inteligente de modelos",
+      "ensemble": "Ensamble de modelos"
     },
     "routeFeedback": {
       "up": "Buena elección de modelo para este turno",
@@ -4226,6 +4787,13 @@
       "retry": "Reintentar"
     },
     "sidebar": {
+      "moveDown": "Bajar",
+      "moveUp": "Subir",
+      "subtasksAttention": "{count} requieren atención",
+      "subtasksRunning": "{count} en ejecución",
+      "subtaskCount": "{count} subtareas",
+      "collapseSubtasks": "Ocultar subtareas de {title}",
+      "expandSubtasks": "Mostrar subtareas de {title}",
       "recentConversations": "Tareas recientes",
       "recents": "Recientes",
       "pinned": "Fijadas",
@@ -4274,15 +4842,6 @@
       "bulkDeletePartial": "No se pudieron eliminar {count} sesiones",
       "bulkDeleteFailed": "No se pudieron eliminar las sesiones seleccionadas"
     },
-    "setupBanner": {
-      "ariaLabel": "Es necesaria la configuración de la puerta de enlace",
-      "title": "Es necesaria la configuración",
-      "dismiss": "Descartar",
-      "dismissNotice": "Descartar el aviso de configuración",
-      "hint": "La puerta de enlace aún no está lista para ejecutarse.",
-      "finishSetup": "Finalizar configuración",
-      "viewReadiness": "Ver preparación"
-    },
     "shortcuts": {
       "toggleSidebar": {
         "label": "Alternar barra lateral",
@@ -4313,12 +4872,17 @@
       "earlierCalls": "…{count} llamadas anteriores",
       "callsCount": "{count} llamadas",
       "resultsCount": "{count} resultados",
+      "executionIoPty": "Terminal real (TTY)",
+      "executionIoPipe": "Tubería normal",
+      "executionIoFallback": "TTY no disponible; se usa una tubería normal",
+      "executionIoMixed": "Modos de terminal mixtos",
+      "executionIoUnknown": "Modo de terminal no disponible",
       "sectionInput": "entrada",
       "sectionChanges": "cambios",
       "sectionDiagnostics": "diagnósticos",
       "sectionResult": "resultado",
       "sectionError": "error",
-      "viewFull": "ver completo",
+      "viewFull": "expandir contenido",
       "activityViewDetails": "ver detalles",
       "activityDetailsTitle": "detalles",
       "activityBytesWritten": "{size} escritos",

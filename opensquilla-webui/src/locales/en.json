@@ -1,4 +1,73 @@
 {
+  "processes": {
+    "title": "Background processes",
+    "runningCount": "{count} running",
+    "refresh": "Refresh",
+    "logs": "Logs",
+    "stop": "Stop",
+    "close": "Close",
+    "loading": "Loading…",
+    "loadError": "Could not refresh background processes. Try again.",
+    "stopError": "Could not stop the process. Refresh and try again.",
+    "logError": "Could not load the output. Try again.",
+    "emptyLog": "No output yet.",
+    "truncated": "Showing a limited preview of the output.",
+    "running": "Running",
+    "done": "Exited (0)",
+    "failed": "Exited ({code})",
+    "killed": "Stopped",
+    "timed_out": "Timed out"
+  },
+  "imageClipboard": {
+    "copyImage": "Copy image",
+    "copySource": "Copy SVG source",
+    "imageDescription": "Copy at original size as PNG. Animated images become a still image.",
+    "copying": "Copying…",
+    "copiedImage": "Image copied",
+    "copiedSource": "SVG source copied",
+    "unsupported": "Image copying is unavailable in this environment. Download the original file instead.",
+    "failed": "Could not copy. Try again or download the original file.",
+    "invalidImage": "This image cannot be decoded. Download the original file instead.",
+    "invalidSvg": "This file is not valid SVG or has no usable dimensions. Download the original file instead.",
+    "tooLarge": "This file exceeds the copy limit. Download the original file to keep its full quality.",
+    "timedOut": "Preparing the clipboard took too long. Try again or download the original file."
+  },
+  "workspaceReference": {
+    "open": "Open {path} in Workbench",
+    "actions": "File actions",
+    "copyPath": "Copy relative path",
+    "copyLocation": "Copy path and lines",
+    "loading": "Checking file…",
+    "copied": "Copied",
+    "copyFailed": "Could not copy. Try again.",
+    "stale": "This file has changed. Read it again to get an updated reference.",
+    "workspaceMismatch": "This file belongs to a different workspace.",
+    "forbidden": "You do not have access to this file.",
+    "missing": "The file or its task is no longer available.",
+    "invalid": "This file reference is invalid.",
+    "unsupported": "This file cannot be displayed as source text.",
+    "unavailable": "Unable to open the file. Check the connection and try again.",
+    "readonly": "Read-only source",
+    "refresh": "Check file again",
+    "lines": "Lines {start}–{end} of {total}",
+    "previous": "Show previous lines",
+    "next": "Show more lines",
+    "search": "Search source",
+    "searchPlaceholder": "Find text…",
+    "noMatches": "No matching lines",
+    "jumpToLine": "Jump to line",
+    "copyContents": "Copy file contents"
+  },
+  "resourceActions": {
+    "more": "File actions", "preview": "Preview in app", "openSource": "Open with default app",
+    "reveal": "Show in file manager", "revealFinder": "Reveal in Finder", "revealExplorer": "Show in File Explorer",
+    "openCopy": "Open a local copy", "saveAs": "Save as…", "copyPath": "Copy path",
+    "copyGatewayPath": "Copy server path", "copyContents": "Copy file contents", "saved": "File saved",
+    "singleFile": "Save this HTML file only; linked styles, images and pages are not included.",
+    "textOnly": "Copy supports UTF-8 text up to 1 MiB. Save this file instead.",
+    "unavailable": "The current source file is unavailable. Existing previews and downloads are unchanged.",
+    "failed": "The file action failed."
+  },
   "workspaces": {
     "projects": "Projects",
     "createProject": "Create project",
@@ -67,6 +136,13 @@
     "viewRelease": "View release",
     "dismiss": "Dismiss",
     "desktop": {
+      "installErrorTitle": "Could not start installation",
+      "quitAndInstall": "Quit and install",
+      "signedDownloadedDesc": "OpenSquilla {version} is verified and ready. Quit and install to close background services and open the installer.",
+      "manualApplyingStatus": "Closing background services",
+      "manualApplyingDesc": "OpenSquilla is closing its background services. The installer will open when they have stopped.",
+      "errorSignatureInvalid": "The installer signature is invalid or its publisher does not match OpenSquilla. Installation was blocked. Download the update again.",
+      "errorSignatureUnavailable": "OpenSquilla could not verify the installer signature. Installation was blocked. Try again later.",
       "indicatorAvailable": "Update {version}",
       "indicatorDownloaded": "Update ready",
       "indicatorInstallerReady": "Installer verified",
@@ -77,7 +153,7 @@
       "availableDesc": "Download it when you're ready. OpenSquilla will install it only after you relaunch.",
       "manualAvailableDesc": "Download the versioned Windows installer. Windows will ask you to complete the installation.",
       "manualDownloadedTitle": "Verified installer ready",
-      "manualDownloadedDesc": "OpenSquilla {version} was verified against the canonical GitHub checksum and shown in its folder. Run the installer when ready.",
+      "manualDownloadedDesc": "The OpenSquilla {version} installer has been verified. Choose Show installer to find the file, then run it manually when ready.",
       "downloadedTitle": "Ready to install",
       "downloadedDesc": "Relaunch OpenSquilla to finish updating to {version}.",
       "downloadingTitle": "Downloading update",
@@ -88,8 +164,8 @@
       "errorFallback": "Try checking again from Settings.",
       "errorSourceUnreachable": "The update sources are temporarily unreachable. Try again later.",
       "errorManifestInvalid": "The release-channel data is invalid, so OpenSquilla cannot safely confirm an update.",
-      "errorChecksumUnavailable": "The installer cannot be verified because the canonical GitHub checksum is unavailable. No installer was opened.",
-      "errorIntegrityFailed": "The downloaded installer failed integrity verification and was deleted.",
+      "errorChecksumUnavailable": "The installer cannot be verified because the official update checksum is unavailable. No installer was opened.",
+      "errorIntegrityFailed": "The installer failed integrity verification. Download the update again.",
       "errorDownloadFailed": "OpenSquilla could not download the update. Check your connection and try again.",
       "errorInstallFailed": "OpenSquilla could not prepare or open the installer. Try again or use the release page.",
       "idleDesc": "Check for a new desktop release.",
@@ -124,6 +200,8 @@
     }
   },
   "common": {
+    "more": "More",
+    "saving": "Saving…",
     "close": "Close",
     "save": "Save",
     "discard": "Discard",
@@ -166,11 +244,33 @@
       "failedDetail": "Reload the isolated browser to continue."
     },
     "artifactAnnotation": {
-      "start": "Annotate preview", "stop": "Stop annotating", "selectElement": "Select a page element to annotate", "selectElementShort": "Select element", "unavailable": "Preview annotation is unavailable.", "desktopEditingOnly": "Select and edit page elements with AI in the desktop app.",
-      "createFailed": "The selected element could not be attached.", "elementChanged": "The selected element changed before it could be attached. Select it again in the current preview.", "rearmFailed": "Annotation mode stopped because the element picker could not be restarted. Turn annotation mode on to try again.", "updateFailed": "The annotation draft could not be saved.", "discardFailed": "The annotation could not be discarded. It remains open so you can try again.", "closeFailed": "The annotation editor could not be closed. Try again before selecting another element.", "replacementCleanupFailed": "The new annotation was kept, but the previous draft could not be removed.",
+      "start": "Annotate preview",
+      "stop": "Stop annotating",
+      "selectElement": "Select a page element to annotate",
+      "selectElementShort": "Select element",
+      "unavailable": "Preview annotation is unavailable.",
+      "desktopEditingOnly": "Select and edit page elements with AI in the desktop app.",
+      "createFailed": "The selected element could not be attached.",
+      "elementChanged": "The selected element changed before it could be attached. Select it again in the current preview.",
+      "rearmFailed": "Annotation mode stopped because the element picker could not be restarted. Turn annotation mode on to try again.",
+      "updateFailed": "The annotation draft could not be saved.",
+      "discardFailed": "The annotation could not be discarded. It remains open so you can try again.",
+      "closeFailed": "The annotation editor could not be closed. Try again before selecting another element.",
+      "replacementCleanupFailed": "The new annotation was kept, but the previous draft could not be removed.",
       "overlayFallback": "Continue the annotation below.",
-      "fallbackTitle": "Continue annotation", "fallbackDetail": "The preview is temporarily hidden. Your annotation is still here.", "frozenPreview": "Preview of the selected page area",
-      "placeholder": "Describe the change for this area…", "newlineHint": "{shortcut} for a new line", "keepDraft": "Keep annotation", "submit": "Add annotation", "contextLabel": "Current selection", "bodyLabel": "Page annotation", "emptyBody": "Describe the requested change.", "reselectHint": "Select the matching area on the page.", "reuseHint": "The modification request was copied. Select the matching area on the page."
+      "fallbackTitle": "Continue annotation",
+      "fallbackDetail": "The preview is temporarily hidden. Your annotation is still here.",
+      "frozenPreview": "Preview of the selected page area",
+      "placeholder": "Describe the change for this area…",
+      "newlineHint": "{shortcut} for a new line",
+      "keepDraft": "Keep annotation",
+      "submit": "Add annotation",
+      "contextLabel": "Current selection",
+      "bodyLabel": "Page annotation",
+      "emptyBody": "Describe the requested change.",
+      "reselectHint": "Select the matching area on the page.",
+      "reuseHint": "The modification request was copied. Select the matching area on the page.",
+      "screenshotUploadFailed": "The page capture could not be attached. Your annotation is still available; you can add an image manually."
     },
     "artifactPreview": {
       "refresh": "Refresh preview",
@@ -180,7 +280,6 @@
       "readyWithWarnings": "The preview is running with warnings.",
       "warningsShort": "Warnings",
       "suspended": "Preview paused",
-      "agentEditInProgress": "Editing is continuing in the background.",
       "nativePreview": "Interactive preview",
       "allowRemoteResources": "Allow online images, styles, and media",
       "blockRemoteResources": "Block online images, styles, and media",
@@ -199,8 +298,8 @@
       "setDefaultMode": "Use this mode by default",
       "restoreDefaultMode": "Restore the default preview mode",
       "defaultModeSaved": "Default preview mode saved.",
-      "fullModeNotice": "Interactive preview can load online content, but it does not share OpenSquilla identity, local files, or your system browser login.",
       "offlineWebLimits": "Some external content and advanced web features may be unavailable in restricted preview.",
+      "pdfViewerUnavailable": "The current browser cannot render PDFs inside the app. Open the file externally or download it instead.",
       "compatibilityFallback": "This Desktop version supports only the legacy single-file preview.",
       "upgradeDesktopShort": "Update Desktop",
       "permissionTitle": "Allow page permission?",
@@ -222,7 +321,6 @@
     },
     "artifactErrors": {
       "documentChanged": "The page changed. Refresh it before trying again.",
-      "editSessionRenewalRequired": "Editing is reconnecting. Your unsaved changes are still available.",
       "writeBusy": "The page is being updated. Wait a moment and try again.",
       "mutationNotApplied": "The page was not updated. You can try again.",
       "mutationOutcomePending": "The update result cannot be confirmed. Open the page to check.",
@@ -231,10 +329,12 @@
       "permissionDenied": "You do not have permission to update this page.",
       "previewCapabilityExpired": "The preview needs to be reopened.",
       "previewRendererFailed": "The preview could not be displayed. Try reopening it.",
+      "previewPageUnsupported": "This client or Gateway does not support opening this subpage directly. Update and try again.",
       "annotationUnavailable": "This annotation is temporarily unavailable.",
       "annotationBusy": "Annotations are being updated. Wait a moment and try again.",
       "invalidRequest": "The request could not be completed. Check the input and try again.",
-      "internalError": "The operation could not be completed. Try again."
+      "internalError": "The operation could not be completed. Try again.",
+      "documentEditingRetired": "Update the client and reopen the page to send annotations as chat input."
     },
     "artifactDocument": {
       "sections": "Artifact document sections",
@@ -283,22 +383,7 @@
       "revertFailed": "This change could not be reverted. The document may have changed; review the latest version and retry.",
       "commentCreateFailed": "The comment could not be added. Review the latest document state and retry.",
       "commentResolveFailed": "The comment could not be resolved. Review the latest comment state and retry.",
-      "noElementSelected": "Place the cursor inside an HTML element",
-      "saving": "Saving…",
-      "saveSource": "Save",
-      "sourceUnavailable": "HTML source is unavailable.",
-      "sourceConflict": "The document changed elsewhere. Review or reload before saving.",
-      "copyUnsavedSource": "Copy unsaved source",
-      "unsavedSourceCopied": "Unsaved source copied",
-      "copyUnsavedSourceFailed": "The unsaved source could not be copied.",
-      "discardAndLoadLatest": "Discard and load latest",
-      "sourceStatus": {
-        "ready": "Ready",
-        "saving": "Saving…",
-        "dirty": "Unsaved",
-        "saved": "Saved",
-        "error": "Needs attention"
-      }
+      "sourceUnavailable": "HTML source is unavailable."
     }
   },
   "nav": {
@@ -355,6 +440,9 @@
     "connectionState": {
       "connected": "Connected",
       "connecting": "Connecting",
+      "checking": "Checking Gateway connection",
+      "suspect": "Connection unstable",
+      "reconnecting": "Reconnecting to Gateway",
       "disconnected": "Disconnected"
     },
     "bgm": {
@@ -378,6 +466,13 @@
     }
   },
   "settings": {
+    "search": {
+      "label": "Search settings",
+      "results": "Settings results",
+      "empty": "No matching settings",
+      "defaultModel": "Default model",
+      "permissions": "Permissions"
+    },
     "appearance": {
       "title": "Interface",
       "desc": "Theme and browser-local interface preferences. Presets apply instantly; custom widths use Apply.",
@@ -789,6 +884,47 @@
     }
   },
   "setup": {
+    "capacity": {
+      "customOpenAI": "Custom · OpenAI-compatible",
+      "customAnthropic": "Custom · Anthropic-compatible",
+      "partialSaved": "Saved: {saved}. Not saved: {pending}. Unsaved values are retained.",
+      "providerPartialSaved": "The provider was saved. Model limits were not saved; your input is retained.",
+      "backToRouting": "Back to Intelligent model routing",
+      "editSharedEnsemble": "Edit shared ensemble",
+      "sharedEnsemble": "C3 and multi-model fusion share this lineup.",
+      "title": "Model settings",
+      "forModel": "Model settings — {model}",
+      "unknown": "Limits unconfirmed",
+      "contextWindow": "Context window",
+      "maxOutputTokens": "Maximum output length",
+      "scope": "Applies everywhere this model is used with this provider.",
+      "current": "Currently {value} tokens · {source}",
+      "source": {
+        "catalog": "Model catalog",
+        "default": "System default",
+        "config": "Global configuration",
+        "override": "Custom value"
+      },
+      "autoValue": "Auto ({value})",
+      "autoHint": "Leave blank for automatic; enter a positive whole number to override.",
+      "requestHint": "The model’s output limit; actual replies may be shorter.",
+      "localHint": "Keep this value consistent with the context configured in your local model server.",
+      "serverControlled": "Output length is controlled by the server.",
+      "restore": "Restore automatic values",
+      "positiveInteger": "Enter a positive whole number, or leave blank for automatic.",
+      "upgrade": "Update the Gateway to view and edit model limits. Existing model settings remain available.",
+      "loadFailed": "Could not load model limits. Your changes are preserved.",
+      "retry": "Retry",
+      "draftHint": "After Done, select Save changes on the settings page to apply.",
+      "done": "Done",
+      "invalid": "Check the model limits values before saving.",
+      "saved": "Model limits saved.",
+      "saveFailed": "Could not save model limits. Unsaved values have been kept.",
+      "unknownHint": "One or both model limits are unconfirmed. System defaults remain in use; you can configure the limits here.",
+      "automaticSource": "Automatic · {source}",
+      "unsaved": "Not saved",
+      "effective": "Effective limit: {value} tokens"
+    },
     "cli": {
       "advancedTitle": "Advanced · built-in CLI",
       "hintBundled": "These commands use the CLI bundled with the app; paste into a terminal to run.",
@@ -846,6 +982,11 @@
       "memoryOptions": "Memory options"
     },
     "provider": {
+      "moreActions": "{provider} more actions",
+      "routerOutcomeSynchronized": "Router recommendations now follow the saved primary provider.",
+      "routerOutcomePreserved": "Saved Router tiers were preserved.",
+      "routerOutcomeDisabled": "Model Routing was turned off; saved tiers were preserved.",
+      "primarySavedAdditionalFailed": "The provider was saved, but additional settings could not be saved. Review settings before retrying.",
       "title": "Provider",
       "pageTitle": "Model Service",
       "pageDesc": "Connect providers and manage their credentials and models.",
@@ -854,13 +995,14 @@
       "configuredSummary": "{ready} of {count} ready. Testing sends one small model request.",
       "configuredDesc": "Saved providers remain available for routing until you remove them. Configuration verification sends a small model request using the saved settings; provider charges may apply.",
       "activeBadge": "Active",
+      "currentPrimary": "Current primary",
       "editingBadge": "Editing",
       "profileReady": "Credentials ready",
       "profileNeedsCredentials": "Needs credentials",
       "profileStatusUnavailable": "Status unavailable",
       "emptyTitle": "Add your first model provider",
       "configuredEmpty": "Connect a provider to verify credentials and choose available models.",
-      "emptyRoutingHint": "Once connected, you can set up intelligent routing; one provider can still route between multiple models.",
+      "emptyRoutingHint": "Once connected, you can set up Intelligent model routing; one provider can still route between multiple models.",
       "addProvider": "Add provider",
       "catalogTitle": "Add provider",
       "catalogDesc": "Choose a provider, then add its API key and model in one focused window.",
@@ -898,10 +1040,10 @@
       "openModelRouting": "Open Model Routing →",
       "modelUsageTitle": "Model usage",
       "modelUsageRouter": "Intelligent model routing",
-      "modelUsageEnsemble": "Multi-model collaboration",
+      "modelUsageEnsemble": "Model ensemble",
       "modelUsageFixed": "Fixed model",
       "modelUsageRouterDesc": "Choose one suitable configured model for each request.",
-      "modelUsageEnsembleDesc": "Generate with multiple models, then combine their results.",
+      "modelUsageEnsembleDesc": "Candidate models answer in parallel, then one aggregator model combines their answers into the final reply.",
       "modelUsageFixedDesc": "Send every request to the current direct model.",
       "crossProviderActive": "Cross-provider routing included",
       "configureModelRouting": "Set up model routing",
@@ -975,7 +1117,7 @@
       "choose": "Choose a provider",
       "chooseProviderShort": "choose provider",
       "routerTiers": "Model Routing",
-      "routingDesc": "Configure tiers, ensemble, and single-model behavior in Model Routing.",
+      "routingDesc": "Configure tiers, ensemble, and Fixed model behavior in Model Routing.",
       "routerReady": "SquillaRouter ready",
       "directOnly": "Direct only",
       "chooseToSeeFields": "Choose a provider to see required fields.",
@@ -1006,7 +1148,7 @@
       "configuredModelFallbackLabel": "Fallback model",
       "configuredModelDescFixed": "Fixed model mode: every request uses the model below.",
       "configuredModelDescRouter": "Intelligent model routing mode: each request is routed to a suitable model and falls back to the model below when routing is unavailable.",
-      "configuredModelDescEnsemble": "Multi-model collaboration mode: several models generate together, falling back to the model below when the ensemble cannot complete.",
+      "configuredModelDescEnsemble": "Model ensemble: Candidate models answer in parallel, then one aggregator model combines their answers into the final reply. If the ensemble cannot complete, the model below is used as a fallback.",
       "defaultModelDesc": "Used for direct requests and primary fallback. Routed models are configured in Model Routing.",
       "defaultModelSemantics": "A recommended model is prefilled when available. Choose or enter another model, then verify it before relying on it.",
       "profileModelTitle": "Direct and fallback model for {provider}",
@@ -1017,7 +1159,7 @@
       "runtimeDefaultsDesc": "Gateway-wide behavior shared by every normal model request.",
       "timeoutLabel": "Request timeout (seconds)",
       "timeoutDesc": "How long to wait for a single model response before timing out — raise this for slow local models (Ollama, vLLM, LM Studio).",
-      "timeoutGlobalDesc": "Gateway-wide timeout for normal model requests across all providers. Configuration verification uses a separate 30-second timeout.",
+      "timeoutGlobalDesc": "Gateway-wide timeout for normal model requests across all providers. Connection checks and model tests use separate fixed limits.",
       "contextWindowLabel": "Context window override (tokens)",
       "contextWindowDesc": "Cap the prompt-assembly budget for this model. Leave blank to use the auto-detected window.",
       "contextWindowIdentityLabel": "Context window · {provider} / {model}",
@@ -1068,7 +1210,14 @@
       "credentialSourceOptions": "Credential source",
       "credentialRevealUnavailable": "Couldn't reveal the saved API key.",
       "connectionLabel": "Current configuration",
-      "connectionDesc": "Sends a small model request using the current key, endpoint, and verification model, then validates that the stream completes. Provider charges may apply.",
+      "connectionDesc": "Check endpoint access quickly, then test a real streaming model call when needed. Model tests may incur provider charges.",
+      "checkConnection": "Check connection",
+      "checkingConnection": "Checking connection…",
+      "cancelConnectionCheck": "Cancel connection check",
+      "testModel": "Test model",
+      "testingModel": "Testing model…",
+      "cancelTest": "Cancel test",
+      "testSavedModel": "Test saved model",
       "testConnection": "Verify configuration",
       "testCurrentSettings": "Verify current configuration",
       "testing": "Verifying configuration…",
@@ -1078,6 +1227,11 @@
       "lastVerifyFailedAgo": "Last verification failed · {ago}",
       "currentSettingsNotTested": "Current configuration not verified",
       "endpointVerified": "Configuration verified",
+      "reachableNotModelTested": "Endpoint reachable · model not tested",
+      "endpointResponded": "Endpoint responded — {reason}",
+      "modelVerified": "Model call succeeded",
+      "modelTimedOut": "Model response timed out · verification incomplete",
+      "reachabilityTimedOut": "Connection check timed out · reachability unconfirmed",
       "probeMissingRequired": "Complete required fields before verifying: {fields}.",
       "requiredFieldJoiner": ", ",
       "connected": "✓ Configuration verified",
@@ -1096,6 +1250,7 @@
       "failureModelNotFound": "The provider doesn't recognize this model id.",
       "failureUnreachable": "Couldn't reach the endpoint.",
       "failureBadRequest": "The provider rejected the request.",
+      "failureProbeTimeout": "The verification deadline expired.",
       "failureGeneric": "Configuration verification failed.",
       "modelListLabel": "Discovered models",
       "modelOptionsToggle": "Model catalog · {count}",
@@ -1127,12 +1282,47 @@
       "modelNoMatches": "No matching models — you can keep what you typed.",
       "modelListTruncated": "Showing {shown} of {total} models — keep typing to narrow the list.",
       "modelProvenance": "Live provider list · capability source: {sources}",
-      "modelMetadataProvenance": "Live provider list · official values when available, catalog fallback otherwise"
+      "modelMetadataProvenance": "Live provider list · official values when available, catalog fallback otherwise",
+      "modelMultimodal": "Multimodal",
+      "modelMultimodalTitle": "Supports image input",
+      "saveAndStart": "Save and start using",
+      "saveAndMakeActive": "Save and set as primary",
+      "saveActivateUpgradeHint": "Upgrade the Gateway to save and set a provider as primary in one operation.",
+      "primaryRoleHint": "The primary provider handles default direct requests and fallback. Setting OpenRouter or TokenRhythm as primary also applies its recommended routing tiers. Ensemble settings are kept.",
+      "activationCredentialRequired": "Add a usable credential before setting this provider as primary.",
+      "routerConflictTitle": "Choose how to handle existing model routes",
+      "routerConflictBody": "The saved Router uses {conflicts}, which conflicts with {provider}. Use {provider} recommendations to replace saved and unsaved Router tier edits, or keep the existing tiers with routing off when offered. Cancel keeps your mode and drafts.",
+      "routerUseRecommended": "Use the target provider’s recommended routes",
+      "routerDisablePreserve": "Keep routes and turn Router off",
+      "alreadyActive": "The target provider is already primary. This credential edit was not saved.",
+      "primarySaveUncertain": "The save result could not be confirmed. Your draft was kept. Check the saved configuration before retrying; an active provider alone does not confirm that credential edits were saved."
     },
     "preset": {
       "modeCustom": "custom tiers"
     },
     "modelStrategy": {
+      "summaryPrimary": "Saved primary",
+      "summaryRouter": "Model routing",
+      "summaryOn": "On",
+      "summaryOff": "Off",
+      "bindingFollowPrimary": "Recommended · follows primary provider",
+      "bindingCustom": "Custom tiers",
+      "bindingLegacy": "Existing tiers · follow behavior unspecified",
+      "resetRecommended": "Use {provider} recommended tiers",
+      "resettingRecommended": "Updating recommended tiers…",
+      "resetKeepsOff": "Updates tiers; model routing stays off.",
+      "resetKeepsMode": "Replaces tiers and keeps the current mode.",
+      "retainedDrafts": "Unsaved routing changes",
+      "crossProviderDisabledMismatch": "Saved tiers use other providers; cross-provider execution is off.",
+      "resetUpgradeHint": "Upgrade the Gateway to use recommended tiers in one operation.",
+      "operationPending": "Another provider or routing operation is in progress.",
+      "activationUpgradeHint": "This Gateway cannot confirm safe Router activation. Upgrade the Gateway to review and resolve provider conflicts.",
+      "savedRefreshFailed": "Saved, but the updated settings could not be refreshed. Reload settings before making another change.",
+      "resultUncertain": "The save result is unknown. Review refreshed settings before trying again.",
+      "resetTitle": "Use {provider} recommended tiers?",
+      "resetBody": "Replace saved and unsaved Router tier edits with {provider} recommended tiers? The current mode and Router switch stay unchanged. Other unsaved settings are kept.",
+      "resetConfirm": "Replace recommended tiers",
+      "resetSaved": "{provider} recommended tiers saved; the current mode is unchanged.",
       "title": "Model routing",
       "desc": "Choose how models are picked for each request.",
       "newSessionDefault": "This is the default for new chats. Existing chats keep their own routing mode.",
@@ -1152,7 +1342,7 @@
       "visualModeLabel": "Routing decision panel style",
       "visualModeDesc": "How the routing decision appears in chat replies.",
       "routerDependency": "Pick a model for each request level. One provider can supply every level.",
-      "ensembleTitle": "Multi-model collaboration",
+      "ensembleTitle": "Model ensemble",
       "ensembleDependency": "Uses {provider} credentials; provider default model is {model}.",
       "ensembleMinimum": "Add at least one more candidate to benefit from ensemble routing.",
       "ensembleFailure": "If fusion cannot complete, use the Fixed and fallback model: {provider} · {model}.",
@@ -1163,7 +1353,7 @@
       "singleModelDesc": "Used for every request in Fixed model mode, and as the fallback if routing or ensemble execution cannot complete.",
       "singleModelPlaceholder": "Enter a model ID",
       "singleDesc": "Use one predictable model without automatic routing or model ensemble.",
-      "crossProviderNotice": "Cross-provider routing is active. Review each tier before saving.",
+      "crossProviderNotice": "Cross-provider execution is enabled.",
       "cards": {
         "router": {
           "title": "Intelligent model routing",
@@ -1185,7 +1375,7 @@
       "openrouterFixedDesc": "When your Model Service uses {provider}, ensemble routing uses four proposer models and one aggregator.",
       "openrouterFixedProposer": "Proposer model",
       "openrouterFixedAggregator": "Aggregator",
-      "credentialReady": "Connected",
+      "credentialReady": "Credentials ready",
       "credentialNeeded": "{provider} credentials needed",
       "credentialMissingEnv": "Needs {envKey}",
       "credentialUnknown": "Credentials not checked",
@@ -1197,6 +1387,7 @@
       "removeCandidateAria": "Remove {model}",
       "ensembleEmpty": "No candidate models yet. Save your Model Service settings to seed model tiers, or add candidates manually.",
       "ensemblePipeline": "How it works: proposer models draft in parallel, then the aggregator fuses the drafts into the final reply. Only the aggregator can call tools.",
+      "candidateModelHint": "Model ensemble supports text only. For images, use Intelligent model routing or Fixed model mode with a model that supports images.",
       "ensembleFlowDesc": "Models draft in parallel; an aggregator merges them into one answer. Uses more calls.",
       "legacyDynamicNotice": "This legacy fusion plan follows the saved model tiers. Convert it to a custom lineup to edit its members here.",
       "legacyDynamicMigrate": "Convert to custom lineup",
@@ -1215,7 +1406,7 @@
       "aggregatorNote": "Fuses every draft into the final answer; the only member that can call tools",
       "aggregatorSectionLabel": "Aggregator",
       "aggregatorSectionDesc": "Exactly one aggregator produces the final answer. Pick the strongest model in your lineup.",
-      "aggregatorInheritedNote": "No aggregator assigned — the current chat model fuses the drafts",
+      "aggregatorInheritedNote": "Follows the current model",
       "proposerSectionLabel": "Proposers",
       "proposerRoleLabel": "Proposer",
       "aggregatorRoleLabel": "Aggregator",
@@ -1233,13 +1424,13 @@
       "replaceCandidateConfirm": "Replace",
       "candidateDuplicate": "This model is already in the proposer list.",
       "addProposer": "Add proposer",
-      "chooseAggregator": "Choose aggregator",
+      "chooseAggregator": "Change model",
       "aggregatorPickerTitle": "Choose the aggregator",
       "aggregatorFromProposers": "Use an existing proposer",
       "aggregatorOtherModel": "Or choose another model",
       "capacityWarn": "{calls} model calls per turn — cost grows linearly and fusion gains taper past 4 proposers.",
       "capacityFull": "Limit of {max} proposers reached — more drafts stop improving fusion; remove one before adding another.",
-      "diversityHint": "Several proposers share a model family — adding a different vendor usually improves fusion.",
+      "diversityHint": "Consider models from different families for more varied answers.",
       "effectiveSummary": "{proposers} proposers in parallel + 1 aggregator · about {calls} model calls per turn",
       "runtimeStrategyTitle": "Runtime strategy",
       "runtimeStrategyDesc": "Success threshold, fallback, and time limits",
@@ -1252,7 +1443,8 @@
       "proposerRetriesDesc": "Retryable failures only; the initial request is not counted as a retry.",
       "proposerRetriesOption": "At most {count} retries after the initial request",
       "runtimeLimitsLabel": "Time limits",
-      "runtimeLimits": "Proposers {proposerTimeout}s total · aggregator {aggregatorTimeout}s idle between provider events (configured {configuredAggregatorTimeout}s) · outer turn deadline separate"
+      "runtimeLimits": "Proposers {proposerTimeout}s total · aggregator {aggregatorTimeout}s idle between provider events (configured {configuredAggregatorTimeout}s) · outer turn deadline separate",
+      "fallbackModelLabel": "Fallback model"
     },
     "behavior": {
       "title": "Session behavior",
@@ -1265,12 +1457,12 @@
     "router": {
       "title": "Model tiers",
       "mode": "Mode",
-      "modeModelRouting": "AI single-model routing",
+      "modeModelRouting": "Intelligent model routing",
       "modeSingleModel": "Off",
       "modeRecommended": "Follow current provider tiers",
       "modeDisabled": "Off",
-      "routingDisabledHint": "Turn on AI single-model routing to edit model tiers.",
-      "routingEnsembleReadOnlyHint": "AI ensemble routing is active. Standard model tier settings are temporarily inactive.",
+      "routingDisabledHint": "Turn on Intelligent model routing to edit model tiers.",
+      "routingEnsembleReadOnlyHint": "Model ensemble is active. Standard model tier settings are temporarily inactive.",
       "defaultTextModel": "Default model tier",
       "defaultRoutingTier": "Default model tier",
       "panelLabel": "Model tier table",
@@ -1280,6 +1472,7 @@
       "colModel": "Model",
       "colThinking": "Thinking",
       "colImage": "Image",
+      "imageCapabilityAutomatic": "Image capability is detected automatically from provider metadata and request results; no manual setting is needed.",
       "tierProviderAria": "{tier} request entry",
       "tierProviderManagedByEnsemble": "Determined by Multi-model fusion",
       "tierProviderManagedByEnsembleAria": "{tier} request entry is determined by the Multi-model fusion plan",
@@ -1310,7 +1503,8 @@
       "tierLegacyDynamicEnsembleSummaryGeneric": "Uses the previously saved tier-following fusion plan; if it fails, uses the Fixed and fallback model.",
       "tierLegacyDynamicEnsembleFallbackMissingSummary": "Uses the previously saved tier-following fusion plan; no usable Fixed and fallback model is configured yet.",
       "tierSingleModelAnnouncement": "C3 uses one model: {model}.",
-      "tierEnsembleImageRouting": "C3 fusion does not process images; image requests still use the Image model configuration.",
+      "tierEnsembleImageRouting": "C3 fusion receives text markers for images. Router image processing uses only configured C0–C3 models.",
+      "tierLegacyImageRouting": "Legacy compatibility setting: this model is preserved but not used for image input. Configure an image-capable model in C0–C3.",
       "tierThinkingManagedByEnsemble": "Determined by fusion plan",
       "tierThinkingManagedByEnsembleAria": "{tier} thinking is determined by the Multi-model fusion plan",
       "tierThinkingAria": "{tier} thinking level",
@@ -1319,9 +1513,9 @@
       "save": "Save Router",
       "chooseProviderFirst": "choose a provider first",
       "summaryDisabled": "off",
-      "summaryEnsemble": "AI ensemble routing",
-      "ensembleProfileTitle": "AI ensemble routing",
-      "ensembleProfileDesc": "The model tier table supplies candidate models for AI ensemble routing.",
+      "summaryEnsemble": "Model ensemble",
+      "ensembleProfileTitle": "Model ensemble",
+      "ensembleProfileDesc": "The model tier table supplies candidate models for Model ensemble.",
       "visualMode": {
         "real_candidates": "Real routing candidates",
         "legacy_grid": "Three-tier visual panel"
@@ -1335,8 +1529,8 @@
       }
     },
     "ensemble": {
-      "statusOn": "AI ensemble routing is on — several models answer and one model synthesizes the final reply.",
-      "statusOff": "AI ensemble routing is off.",
+      "statusOn": "Model ensemble is on. Candidate models answer in parallel, then one aggregator model combines their answers into the final reply.",
+      "statusOff": "Model ensemble is off.",
       "allFailedFallback": "Fall back to a single model",
       "allFailedError": "Stop and report an error"
     },
@@ -1527,6 +1721,8 @@
       "tokenLabel": "Token",
       "optional": "optional",
       "tokenDesc": "Bearer token for gateways that require auth. Stored in this tab only.",
+      "tokenRequired": "Token required",
+      "reasonTokenRequired": "Authentication failed. Automatic retries are paused. Enter a valid gateway token and choose Connect.",
       "reconnect": "Reconnect",
       "connect": "Connect",
       "disconnect": "Disconnect"
@@ -1746,12 +1942,19 @@
       "dataMaintenanceAria": "Open data maintenance",
       "runTraceLabel": "Run-trace drawer in Logs",
       "runTraceDesc": "Make log lines interactive and open a per-line node-step detail drawer in the Logs view.",
-      "runTraceAria": "Run-trace drawer in Logs (takes effect after reload)"
+      "runTraceAria": "Run-trace drawer in Logs (takes effect after reload)",
+      "configFileLabel": "Configuration file",
+      "configFileDesc": "More options can be adjusted in the configuration file."
     },
     "privacy": {
       "statusDisabledByEnv": "Disabled by an environment setting.",
-      "networkReportingLabel": "Diagnostics and updates",
-      "networkReportingDesc": "Share limited product diagnostics and check for updates. Conversation content, files, and model request content are not uploaded."
+      "statusNotChosen": "No choice has been saved yet. Data is not sent until you turn this on.",
+      "reliabilityDiagnosticsLabel": "Stability diagnostics",
+      "reliabilityDiagnosticsDesc": "Share operation outcomes, timings, and privacy-safe error fingerprints to help diagnose crashes and failures. Conversation and file content are never included.",
+      "productAnalyticsLabel": "Product and growth analytics",
+      "productAnalyticsDesc": "Share activation milestones and counts of MetaSkill and Coding Mode runs after they actually start, to measure conversion and feature use. Conversation content, task parameters, files, and raw account IDs are never included; a random, purpose-specific analytics identifier is used.",
+      "networkReportingLabel": "Diagnostics and usage reporting",
+      "networkReportingDesc": "Send anonymous diagnostics and usage statistics, including actual MetaSkill and Coding Mode run counts. Also controls update checks. Conversation content, task parameters, and files are not included."
     },
     "toast": {
       "loadFailed": "Failed to load settings: {error}",
@@ -1803,7 +2006,10 @@
       "channelEnabled": "Channel enabled. Restart required.",
       "channelEnabledLive": "Channel enabled and started.",
       "channelDisabled": "Channel disabled. Restart required.",
-      "channelDisabledLive": "Channel disabled and stopped."
+      "channelDisabledLive": "Channel disabled and stopped.",
+      "providerSavedAndActivated": "{provider} was saved and set as primary.",
+      "modelStrategyPartialSaved": "Some model settings were saved. The primary change was not completed; remaining edits are still in the form.",
+      "modelStrategyPartialSaveUncertain": "Some model settings were saved. The primary change could not be confirmed; check the saved state. Remaining edits are still in the form."
     },
     "needs": {
       "noApiKey": "No API key required.",
@@ -1934,10 +2140,98 @@
           "label": "Debounce window (s)"
         },
         "transport_name": {
+          "label": "Connection method",
           "choices": {
             "polling": "Polling",
             "webhook": "Webhook"
           }
+        },
+        "access_token": {
+          "label": "Access token"
+        },
+        "agent_id_int": {
+          "label": "Agent id (int)"
+        },
+        "app_password": {
+          "label": "App password"
+        },
+        "app_token": {
+          "label": "App-level token (xapp-...)"
+        },
+        "application_id": {
+          "label": "Application id"
+        },
+        "cool_app_code": {
+          "label": "Cool App Code"
+        },
+        "corp_id": {
+          "label": "Corp id"
+        },
+        "default_channel_id": {
+          "label": "Default channel id"
+        },
+        "device_id": {
+          "label": "Device id"
+        },
+        "domain": {
+          "label": "Domain"
+        },
+        "drop_pending_updates": {
+          "label": "Drop pending updates"
+        },
+        "encoding_aes_key": {
+          "label": "Encoding AES key"
+        },
+        "encrypt_key": {
+          "label": "Encrypt key"
+        },
+        "encryption": {
+          "label": "Encryption"
+        },
+        "gateway_url": {
+          "label": "Gateway URL"
+        },
+        "intents": {
+          "label": "Intents bitmask"
+        },
+        "password": {
+          "label": "Password"
+        },
+        "poll_idle_sleep_s": {
+          "label": "Poll idle sleep (s)"
+        },
+        "poll_limit": {
+          "label": "Poll limit"
+        },
+        "poll_timeout_s": {
+          "label": "Polling timeout (s)"
+        },
+        "reply_in_thread": {
+          "label": "Reply in thread"
+        },
+        "robot_code": {
+          "label": "Robot Code"
+        },
+        "slack_channel_id": {
+          "label": "Default channel id"
+        },
+        "token": {
+          "label": "Bot token (xoxb-...)"
+        },
+        "verification_token": {
+          "label": "Verification token"
+        },
+        "webhook_path": {
+          "label": "Webhook path"
+        },
+        "webhook_secret_token": {
+          "label": "Webhook secret token"
+        },
+        "webhook_url": {
+          "label": "Webhook URL (webhook only)"
+        },
+        "websocket_url": {
+          "label": "WebSocket URL"
         }
       },
       "groups": {
@@ -2373,6 +2667,13 @@
       "enable": "Enable",
       "disable": "Disable",
       "notReported": "Not reported",
+      "transport": {
+        "polling": "Polling",
+        "webhook": "Webhook",
+        "websocket": "WebSocket",
+        "http_sync": "HTTP sync",
+        "mixed": "Multiple connection methods"
+      },
       "tabs": {
         "overview": "Overview",
         "pairings": "Members",
@@ -2791,6 +3092,9 @@
       ,"workspaceOptionalHint": "Optional. Choose “No project workspace” for general tasks, or select a project when the task needs its files."
     },
     "form": {
+      "invalidTimezone": "Enter a valid time zone, such as Europe/Paris.",
+      "discardBody": "Your unsaved changes will be lost. Continue editing to keep them.",
+      "discardTitle": "Discard schedule changes?",
       "cronPreviewPlaceholder": "Enter a 5-field cron expression to preview",
       "cronParseError": "Could not parse expression — expected 5 fields (m h dom mon dow).",
       "cronCustomCadence": "matches a custom cadence",
@@ -3009,6 +3313,18 @@
       "add": "Add"
     },
     "skillDetail": {
+      "useUnavailable": "This skill is not available for a new task. Check its status and try again.",
+      "useInTaskHint": "Prepare a draft with this skill. Nothing is sent until you send it.",
+      "useInTask": "Use in new task",
+      "allowUse": "Allow use",
+      "allowUseHelp": "Applies to every skill with this name. Dependencies are installed separately.",
+      "enable": "Allow use",
+      "disable": "Disable use",
+      "saving": "Saving…",
+      "enabledSaved": "Skill use allowed.",
+      "disabledSaved": "Skill use disabled.",
+      "refreshPending": "Saved, but live refresh failed. Restart the Gateway before using this skill.",
+      "disabledContent": "Use is disabled. Allow use to read the skill instructions.",
       "dialogLabel": "Skill details: {name}",
       "triggers": "Triggers",
       "composition": "Composition ({kind}, {count} sub-skills)",
@@ -3050,6 +3366,7 @@
       "sourceLabel": "Community Skill source",
       "sourceClawHub": "ClawHub",
       "sourceGitHub": "GitHub",
+      "sourceSkillHub": "SkillHub",
       "githubReferencesLabel": "GitHub references",
       "githubReferencesPlaceholder": "One exact GitHub Skill URL or reference per line",
       "githubReferencesHint": "One reference per line. Commas, semicolons, and spaces do not separate references. Mutable branches are resolved by the Gateway before installation.",
@@ -3067,7 +3384,16 @@
       "clearActivity": "Clear activity",
       "expandActivity": "Expand install activity",
       "collapseActivity": "Collapse install activity",
+      "selectSkillDirectory": "Select a Skill directory",
+      "installPhase": {
+        "resolving": "Resolving Skill source",
+        "downloading": "Downloading Skill files",
+        "scanning": "Scanning Skill content",
+        "committing": "Saving installation"
+      },
       "queueStatus": {
+        "waiting": "Waiting for installation result",
+        "selection_required": "Choose directory",
         "queued": "Queued",
         "installing": "Installing",
         "cancelling": "Cancelling",
@@ -3091,6 +3417,7 @@
       "retryAfter": "Retry after: {value}",
       "installResultUnknown": "Installation result unknown",
       "viewDetails": "View details",
+      "viewInstallDetails": "View installation details",
       "notInstalled": "Not installed",
       "existingInstallPreserved": "Existing installation preserved",
       "diagnostics": "Diagnostics ({count})",
@@ -3105,6 +3432,7 @@
       "installGithub": "Install GitHub URL",
       "searching": "Searching ClawHub...",
       "hintBrowse": "Search ClawHub skills to browse and install.",
+      "hintBrowseSkillHub": "Search SkillHub skills to browse and install.",
       "hintGithub": "Paste a GitHub skill URL above for direct install.",
       "colName": "Name",
       "colDescription": "Description",
@@ -3397,12 +3725,116 @@
     }
   },
   "chat": {
+    "modelSetup": {
+      "notice": "Configure a model service before chatting.",
+      "configure": "Configure model"
+    },
+    "skillPalette": {
+      "title": "Commands and skills",
+      "command": "Commands",
+      "skill": "Skills",
+      "meta": "Workflows",
+      "empty": "No matching commands or skills",
+      "loading": "Loading skills…",
+      "autoHint": "Scroll or type to search · Skills match automatically",
+      "upgrade": "Update the Gateway to select skills for a message.",
+      "loadFailed": "Skills could not be loaded. Close and reopen the menu to retry.",
+      "disabled": "Disabled · Manage",
+      "needsSetup": "Needs setup · Manage",
+      "manualOnly": "Manual use only",
+      "thisMessage": "This message",
+      "remove": "Remove {name} from this message",
+      "queuedHint": "This message will run after the current task.",
+      "limit": "Select up to 16 skills per message.",
+      "metaTextOnly": "This workflow accepts text. Keep attachments and selected skills in a separate message.",
+      "commandAtStart": "Use this command at the start of a message.",
+      "usage": "Usage: {tokens} tokens",
+      "usageFailed": "Unable to load usage. Try again.",
+      "workflowTitle": "Start {name}",
+      "workflowRequest": "What would you like this workflow to do?",
+      "loaded": "Loaded",
+      "failed": "Load failed",
+      "loadingSkill": "Loading",
+      "user": "User selected",
+      "auto": "Automatic",
+      "selected": "Selected",
+      "unsupported": "Update the Gateway before sending a message with selected skills.",
+      "continue": "Continue",
+      "commandWithSkills": "Selected skills apply to a chat message. Remove the skill labels before running a command.",
+      "commandDescriptions": {
+        "new": "Start a new chat",
+        "compact": "Shorten the current context",
+        "goal": "Set a long-running goal",
+        "meta": "Choose a workflow",
+        "plan": "Plan the current task",
+        "reset": "Reset this conversation",
+        "usage": "View token usage"
+      },
+      "items": {
+        "xlsx": {
+          "name": "Excel spreadsheets",
+          "description": "Create, edit, and analyze spreadsheets"
+        },
+        "docx": {
+          "name": "Word documents",
+          "description": "Create and edit documents"
+        },
+        "pptx": {
+          "name": "PowerPoint slides",
+          "description": "Create and edit presentations"
+        },
+        "pdf": {
+          "name": "PDF tools",
+          "description": "Read, merge, and edit PDFs"
+        },
+        "github": {
+          "name": "GitHub",
+          "description": "Work with issues and pull requests"
+        },
+        "html": {
+          "name": "Web pages",
+          "description": "Build and edit HTML pages"
+        },
+        "webpage": {
+          "name": "Website builder",
+          "description": "Build a complete website"
+        },
+        "kidsProject": {
+          "name": "Kids’ projects",
+          "description": "Plan a creative project for children"
+        },
+        "shortDrama": {
+          "name": "Short drama",
+          "description": "Turn an idea into a video"
+        },
+        "skillCreator": {
+          "name": "Workflow builder",
+          "description": "Combine skills into a workflow"
+        },
+        "paperWriting": {
+          "name": "Academic writing",
+          "description": "Research and draft a paper"
+        }
+      }
+    },
     "sessionCreated": {
       "title": "Chat created",
       "open": "Open chat",
       "fallbackTitle": "Chat {suffix}",
       "deleted": "Deleted",
       "missing": "Session was deleted or does not exist"
+    },
+    "sessionReference": {
+      "open": "Open chat",
+      "unavailable": "Session unavailable",
+      "status": {
+        "queued": "Queued",
+        "running": "Running",
+        "idle": "Idle",
+        "failed": "Failed",
+        "missing": "Missing",
+        "checking": "Checking…"
+      }
     },
     "promptCacheKeepalive": {
       "action": "Prompt cache keepalive",
@@ -3429,6 +3861,7 @@
       "autoPauseLabel": "Auto-pause",
       "states": { "off": "Off", "waiting": "Waiting for a stable prefix", "scheduled": "Scheduled", "probing": "Probing", "paused": "Idle limit reached; waiting for the next message", "stopped": "Stopped after a miss or error" }
     },
+    "sendPending": "Sending…",
     "send": "Send",
     "sendQueues": "Send (queues for after current response)",
     "sendSteers": "Send (steers the current response now)",
@@ -3458,6 +3891,10 @@
     "aiGeneratedLabel": "Content generated by AI, for reference only.",
     "removeAttachment": "Remove attachment",
     "remove": "Remove",
+    "projectFileTarget": "Project file: {path}",
+    "importedFileTarget": "Imported copy",
+    "projectFileLiveTarget": "Live project file: {path}",
+    "importedFileWorkingTarget": "Imported file; edits use a working copy",
     "fileLabel": "File",
     "add": "Add",
     "attachFiles": "Attach files",
@@ -3491,7 +3928,7 @@
     "loadingSession": "Restoring conversation history…",
     "loadingSessionDescription": "You can keep using this conversation while history loads.",
     "loadSessionFailed": "Conversation history temporarily unavailable",
-    "loadSessionDescription": "The connection may have been interrupted, or history is temporarily unavailable. Reload to try again.",
+    "loadSessionDescription": "Conversation history is temporarily unavailable.",
     "reloadSession": "Reload history",
     "retryingSession": "Reloading conversation history…",
     "retryingSessionDescription": "Restoring conversation history…",
@@ -3499,18 +3936,21 @@
     "liveConnecting": "Restoring live updates…",
     "liveConnectingConnected": "Gateway connected. Restoring live updates for this session…",
     "gatewayReconnecting": "Reconnecting to the Gateway…",
+    "automaticRecoveryDescription": "Recovering automatically. You can keep editing; unsent text and attachments stay here.",
     "liveUnavailable": "Live updates are temporarily unavailable",
-    "liveUnavailableDescription": "History remains available. Reconnect before sending.",
-    "liveUnavailableConnectedDescription": "The Gateway is connected and history remains available. Sending resumes when this session's live updates recover.",
+    "liveUnavailableDescription": "History remains available. Sending resumes when live updates recover.",
+    "liveUnavailableConnectedDescription": "The Gateway is connected. Live updates for this session are temporarily unavailable.",
     "reconnectLive": "Reconnect",
     "liveSendBlockedConnecting": "Live updates are reconnecting. Your draft is saved.",
-    "liveSendBlockedDegraded": "Reconnect live updates before sending. Your draft is saved.",
+    "liveSendBlockedDegraded": "Live updates are temporarily unavailable. Your draft is saved.",
     "noMessagesYet": "No messages yet.",
     "newChat": "New task",
     "chatWithSuffix": "Chat {suffix}",
     "copied": "Copied",
     "copy": "Copy",
     "copySessionKey": "Copy session ID",
+    "copySessionAppLink": "Copy application link",
+    "copySessionGatewayLink": "Copy Gateway web link",
     "sessionActions": "Session actions",
     "share": "Share",
     "shareSendFirst": "Send a message first to share",
@@ -3547,7 +3987,7 @@
     "audioUnsupported": "This browser cannot play this audio format. Download the file instead.",
     "playVideo": "Play video",
     "videoLoadFailed": "Video could not be loaded.",
-    "videoUnsupported": "This browser cannot play this video format. Download the file instead.",
+    "videoUnsupported": "This browser cannot play this video. Download it instead.",
     "previewOf": "Preview: {title}",
     "closePreview": "Close preview",
     "previousImage": "Previous image",
@@ -3556,7 +3996,6 @@
     "previewDownload": "Preview download",
     "previewTimedOut": "Preview timed out.",
     "previewFailed": "Preview failed to load.",
-    "videoUnsupported": "This browser cannot play this video. Download it instead.",
     "loadVideoPreview": "Load video preview",
     "loadVideoPreviewFor": "Load video preview for {title}",
     "videoPreviewLoading": "Loading the video preview. You can cancel while it downloads.",
@@ -3583,11 +4022,60 @@
     "thinkingForSeconds": "Thinking · {seconds}s",
     "thoughtForSeconds": "Thought for {seconds}s",
     "thoughtForMinutes": "Thought for {minutes}m {seconds}s",
-    "activityTechnicalDetails": "Technical details",
     "toolResult": "Tool Result",
     "subagentPrefix": "Subagent: ",
     "subagentCompletion": "Subagent completion",
     "turnFailed": "Turn failed",
+    "copyDiagnosticId": "Copy diagnostic ID",
+    "copiedDiagnosticId": "Diagnostic ID copied",
+    "copyDiagnosticFailed": "Copy failed. Select the ID above and copy it manually.",
+    "errorMessage": {
+      "unknown": "The task did not finish. Please try again later.",
+      "noProvider": "No model is available.",
+      "credentials": "The model credentials are invalid.",
+      "credits": "The model account has insufficient credits.",
+      "modelUnavailable": "The selected model is unavailable.",
+      "contextLimit": "The input exceeds the model limit.",
+      "unsupported": "This model does not support this request.",
+      "imageUnsupported": "This model does not support images.",
+      "ensembleImageUnsupported": "This mode does not support images.",
+      "busy": "The model service is busy. Please try again later.",
+      "unavailable": "The model service is unavailable. Please try again later.",
+      "refused": "The model cannot process this request.",
+      "responseIncomplete": "The model response did not finish. Please try again later.",
+      "invalidRequest": "The model could not accept this request.",
+      "runLimit": "This turn reached its execution limit.",
+      "needsConfirmation": "Confirmation is needed to continue.",
+      "toolDenied": "A required tool is not allowed.",
+      "toolFailed": "A tool could not finish its work.",
+      "contextUnavailable": "The current conversation could not be processed.",
+      "timeout": "The task timed out before it finished.",
+      "stopped": "The task was stopped.",
+      "interrupted": "The task was interrupted.",
+      "approvalRequired": "Waiting for your approval."
+    },
+    "errorAction": {
+      "openModelSettings": "Open model settings",
+      "openProviderSettings": "Open provider settings",
+      "chooseModel": "Choose another model",
+      "resumeSandbox": "Resume",
+      "retryUsageReplay": "Retry"
+    },
+    "partialFailureNote": "Partial results were preserved.",
+    "providerFailure": {
+      "rate_limited": "The model provider is rate-limiting requests. Try again later.",
+      "provider_overloaded": "The model provider is temporarily busy. Try again later.",
+      "auth_invalid": "The model provider rejected the credentials. Check the provider credentials in settings.",
+      "context_overflow": "The request exceeds the model's context window. Shorten the request or choose a larger-context model.",
+      "unsupported_feature": "The model provider does not support this request. Check the selected model's capabilities.",
+      "insufficient_credits": "The provider account has insufficient credits. Check its balance or billing settings.",
+      "model_not_found": "The configured model is unavailable. Check the model name and your access permissions.",
+      "transport_transient": "The connection to the model provider was interrupted. Check your connection and provider status.",
+      "policy_refusal": "The provider refused this request under its policy. Review the request and provider policy.",
+      "empty_response": "The model provider returned no answer. Try again or choose another model.",
+      "malformed_response": "The model provider returned an invalid response. Try again or choose another model.",
+      "bad_request": "The model provider rejected the request. Check the request and model settings."
+    },
     "restartInterruptedTitle": "OpenSquilla restarted and interrupted this task.",
     "restartInterruptedGuidance": "This task won't continue automatically. Review any existing results or tool activity, then edit the original request or continue the conversation.",
     "usageAccountingBlockedTitle": "Usage accounting temporarily unavailable",
@@ -3602,6 +4090,7 @@
     "provenance": {
       "cron": "Cron",
       "scheduled": "Scheduled",
+      "scheduledTrigger": "Scheduled trigger",
       "cronSource": "Scheduled by {tool}"
     },
     "sandboxSetup": {
@@ -3633,14 +4122,16 @@
     },
     "addToShare": "Add to share image",
     "removeFromShare": "Remove from share image",
-    "aiModelRouter": "AI model router",
-    "aiModelEnsembleRouter": "AI model ensemble router",
+    "aiModelRouter": "Intelligent model routing",
+    "aiModelEnsembleRouter": "Model ensemble",
     "routerFx": {
       "selectedModel": "Router selected {model}",
-      "ensembleModel": "Multi-model fusion",
-      "ensembleSelecting": "AI model ensemble router · selecting candidates",
-      "ensembleHandedOff": "AI model ensemble router · handed off to agent",
-      "ensembleRunning": "AI model ensemble router · {count} candidates synthesizing",
+      "executionModel": "Currently executing {model}",
+      "executionModelCompleted": "Executed by {model}",
+      "ensembleModel": "Model ensemble",
+      "ensembleSelecting": "Model ensemble · selecting candidates",
+      "ensembleHandedOff": "Model ensemble · handed off to agent",
+      "ensembleRunning": "Model ensemble · {count} candidates synthesizing",
       "ensembleDone": "{count} candidates synthesized",
       "ensembleMode": "ensemble",
       "ensembleViewTrace": "view trace",
@@ -3677,6 +4168,7 @@
       "lifecycle": {
         "working": "Working",
         "answering": "Writing the answer",
+        "preparingToolCall": "Preparing tool call",
         "answerPrepared": "Answer composition",
         "settled": "Completed",
         "interrupted": "Interrupted",
@@ -3689,6 +4181,7 @@
         "rateLimited": "Rate limited · retrying in {seconds}s",
         "retryWait": "Retrying in {seconds}s",
         "retrying": "Retrying {attempt}/{limit}",
+        "retryingWithoutLimit": "Retrying · attempt {attempt}",
         "fallback": "Switching to backup model"
       },
       "purpose": {
@@ -3725,6 +4218,7 @@
       "more": "{count} more",
       "stale": "Still working — no recent signal",
       "liveStep": "step {n}",
+      "phaseElapsed": "Current step {duration}",
       "recordIncomplete": "Activity record incomplete; showing the compatible history view."
     },
     "suggestedTasks": "Suggested tasks",
@@ -3750,11 +4244,23 @@
       "cancelled": "Cancelled"
     },
     "toolModal": {
+      "retry": "Retry",
+      "logPending": "Execution log is still being saved. Try again when the command finishes.",
+      "copyPage": "Copy this page",
       "tree": "Tree",
       "raw": "Raw",
       "wrapLines": "Wrap lines",
       "preserveLines": "Preserve line width",
-      "contentMeta": "{type} · {lines} lines · {chars} chars"
+      "contentMeta": "{type} · {lines} lines · {chars} chars",
+      "executionLog": "View execution log",
+      "toolResult": "Tool result",
+      "characterOffset": "Character offset",
+      "go": "Go",
+      "previous": "Previous",
+      "next": "Next",
+      "logRange": "Characters {start}–{end} of {total}",
+      "logReadFailed": "Could not load execution log. Try again.",
+      "logIncomplete": "Log is incomplete. Only saved output is available."
     },
     "approval": {
       "required": "Approval required",
@@ -3799,6 +4305,8 @@
       }
     },
     "plan": {
+      "hidePlan": "Hide plan",
+      "showPlan": "Show plan",
       "label": "Plan",
       "process": "Planning process",
       "revision": "Revision {id}",
@@ -3837,7 +4345,7 @@
         "running": "Running",
         "paused": "Paused",
         "blocked": "Blocked",
-        "completed": "Completed",
+        "completed": "Execution ended",
         "cancelled": "Cancelled",
         "superseded": "Replaced by a newer plan"
       },
@@ -3851,7 +4359,7 @@
     },
     "planMode": {
       "label": "Plan mode",
-      "readOnly": "The agent researches and proposes a plan without changing files.",
+      "readOnly": "Research and discuss before implementation. Tests and builds follow normal permissions.",
       "nextTurn": "Applies to the next turn",
       "updating": "Updating…",
       "turnOff": "Turn plan mode off",
@@ -3872,11 +4380,13 @@
       "answerPlanQuestionnaire": "Answer the plan question above",
       "previousQuestion": "Previous",
       "nextQuestion": "Next",
-      "outcomeDoneTitle": "Reply sent · run resumed",
+      "outcomeDoneTitle": "Reply received",
       "outcomeBusyDetail": "Your reply is being processed now.",
-      "outcomeDoneDetail": "The agent has accepted this reply and moved on.",
+      "outcomeDoneDetail": "The agent has received your reply.",
       "replyReceived": "Reply received · continuing run…",
       "sendingReply": "Sending reply…",
+      "expiredTitle": "Question expired",
+      "expiredDetail": "This question is no longer active. You can send a new message.",
       "sendReply": "Send reply",
       "sendingContinuing": "Sending reply · continuing run…"
     },
@@ -3895,6 +4405,7 @@
       }
     },
     "goal": {
+      "emptyContinuations": "Paused after repeated turns with no output or tool activity. Review the Goal and resume when ready.",
       "placeholder": "Describe the goal, then press send to start working toward it",
       "modeLabel": "Goal mode",
       "modeDescription": "Start a long-running goal",
@@ -3962,7 +4473,7 @@
         "busy": "The goal state is still settling. Its latest status is shown above.",
         "notResumable": "This goal cannot be resumed from its current state.",
         "executionDisabled": "Goal execution is disabled in this workspace.",
-        "connectionRequired": "Reconnect this task before continuing the goal.",
+        "connectionRequired": "This task is not ready to continue yet.",
         "planModeActive": "The goal will wait until Plan mode ends.",
         "planRunActive": "The goal will wait for the active Plan run to finish.",
         "requestConflict": "That goal action was already used for a different request. Try again."
@@ -3979,6 +4490,8 @@
       "disableLabel": "Disable Coding mode"
     },
     "composer": {
+      "workStyleGroup": "Work style",
+      "contentGroup": "Content",
       "executionMode": "Execution mode",
       "ownerOnlyUnavailable": "Owner-only mode is unavailable for this browser session.",
       "enabled": "Enabled",
@@ -3988,16 +4501,16 @@
       "modelRouting": "Model routing",
       "sessionModelRouting": "This chat's model routing",
       "modelRoutingSessionScope": "Changes apply only to this chat. A running turn keeps its current mode.",
-      "ensembleImageUnsupported": "Ensemble doesn't support image input yet. Under Model routing, choose AI-powered single-model router with an image-capable tier configured, or turn routing Off and select an image-capable model.",
+      "ensembleImageUnsupported": "Model ensemble does not support image input yet. Under Model routing, choose Intelligent model routing with an image-capable tier configured, or Fixed model with an image-capable model.",
       "imageInputUnsupported": "The selected model cannot process image input. Choose an image-capable model or remove the image.",
       "routingUpdateBlocked": "Model routing is being updated. Wait before sending.",
       "routingUpdateImageBlocked": "Model routing is being updated. Wait before sending images.",
-      "modelRoutingOff": "Off",
+      "modelRoutingOff": "Fixed model",
       "modelRoutingOffDesc": "Send every turn to the selected model.",
-      "modelRoutingSquillaRouter": "AI-powered single-model router",
+      "modelRoutingSquillaRouter": "Intelligent model routing",
       "modelRoutingSquillaRouterDesc": "AI selects one suitable model per turn to lower cost.",
-      "modelRoutingEnsemble": "AI-powered ensemble router",
-      "modelRoutingEnsembleDesc": "AI coordinates multiple models to improve capability on complex tasks. Image input isn't supported yet.",
+      "modelRoutingEnsemble": "Model ensemble",
+      "modelRoutingEnsembleDesc": "Candidate models answer in parallel, then one aggregator model combines their answers into the final reply. Image input isn't supported yet.",
       "runMode": "Execution mode",
       "runModeSafe": "Safe",
       "runModeSafeDesc": "Uses the sandbox and your file, command, and network safety rules.",
@@ -4043,7 +4556,11 @@
         "generic": "Steer unavailable for the current task. The message remains queued."
       },
       "clearQueue": "Clear queue",
-      "removeMessage": "Remove pending message {index}"
+      "removeMessage": "Remove pending message {index}",
+      "offlineRejected": "The message was not accepted. Edit it to retry, or remove it.",
+      "offlineQueued": "Saved locally. Will send when the connection is restored.",
+      "identityChanged": "Connection identity changed. Reconnect to the original gateway and account to send this message.",
+      "annotationUpgradeRequired": "This queued annotation uses the retired editor. Edit the message and select the page again before sending."
     },
     "metaRuns": {
       "draft": "Draft",
@@ -4115,13 +4632,25 @@
       "launchFailed": "The toolchain was installed, but the MetaSkill could not be started."
     },
     "compact": {
+      "failureIntegrity": "The summary did not pass the completeness check",
+      "failureCapacity": "The summary does not fit the current model's context",
+      "failureUnavailable": "The summarization model is unavailable",
+      "failureProvider": "The model could not generate a usable summary",
+      "failureTimeout": "Context organization timed out",
+      "failureRejectedDetail": "The summary was not applied; your original context is preserved. Retry, or copy the diagnostic ID for troubleshooting if it fails again.",
+      "failureUnavailableDetail": "Check the model configuration and connection, then retry. You can copy the diagnostic ID for troubleshooting.",
+      "failureRetryDetail": "You can retry context organization. If it fails again, copy the diagnostic ID for troubleshooting.",
       "compacting": "Organizing context…",
       "compacted": "Context organized",
+      "temporarilyReduced": "History temporarily reduced; continuing",
+      "summarySaved": "Summary saved",
       "historyPreserved": "Earlier context summarized; original messages remain available in history",
       "historyIncomplete": "Earlier context summarized; some original messages are unavailable",
       "historySummarized": "Earlier context summarized",
       "failed": "Context organization failed",
       "withinBudget": "No organization needed; context has enough space",
+      "noSafeHistory": "There is currently no history that can be safely organized",
+      "alreadyConcise": "The current context is already concise",
       "skipped": "Context organization was not applied",
       "cancelled": "Context organization cancelled",
       "requestScoped": "Request-scoped; session history was not rewritten"
@@ -4231,6 +4760,7 @@
       "waitCompactionBeforeCommand": "Wait for context compaction before running {command}.",
       "waitResponseBeforeCommand": "Wait for the current response before running {command}.",
       "promptAnnotationBusy": "Wait for the current response to finish before sending artifact instructions.",
+      "offlineQueueFailed": "Could not queue this message. Your draft was kept.",
       "queueFull": "Queue is full — wait for the current response to finish.",
       "queuePersistenceUnavailable": "Keep this message in the composer until the fork finishes; durable recovery is unavailable.",
       "messageStillSaving": "This message hasn't finished saving — try again in a moment.",
@@ -4270,9 +4800,35 @@
       "usageIncompleteUnknown": "Incomplete · exact usage total unavailable",
       "unknownProviderCalls": "{count} provider call has unknown usage | {count} provider calls have unknown usage"
     },
+    "newTaskModel": {
+      "showAll": "View all models",
+      "title": "New task model",
+      "catalog": "Gateway model catalog",
+      "gatewayDefault": "Default model",
+      "gatewayDefaultHint": "Use the default from model settings",
+      "defaultBadge": "Default",
+      "search": "Search models or providers…",
+      "loading": "Loading models…",
+      "empty": "No matching models",
+      "retry": "Retry",
+      "scope": "Applies only to this new task. Global settings stay unchanged.",
+      "partialFailure": "Some providers could not load: {providers}",
+      "routingConflict": "An explicit model requires Fixed model mode. Clear it or choose Fixed model.",
+      "unavailable": "Model selection is unavailable on this connection. Reconnect or clear the explicit model."
+    },
     "modelRouting": {
-      "updateFailed": "Couldn't switch model routing — reverted. Check the gateway connection and try again.",
-      "sessionUpdateFailed": "Couldn't update this chat's model routing: {error}"
+      "updateFailed": "Couldn't switch model routing — reverted. The change is temporarily unavailable.",
+      "sessionUpdateFailed": "Couldn't update this chat's model routing: {error}",
+      "manage": "Model & routing settings",
+      "back": "Back to routing modes",
+      "title": "Models & routing",
+      "direct": "Fixed model",
+      "sessionModelFallback": "Use this task’s model",
+      "sessionModelTitle": "Conversation model",
+      "sessionModelHint": "Applies to the next turn in this conversation. Keeps its history and leaves global settings unchanged.",
+      "sessionModelBusy": "Finish the current response before changing its model.",
+      "router": "Intelligent model routing",
+      "ensemble": "Model ensemble"
     },
     "routeFeedback": {
       "up": "Right model choice for this turn",
@@ -4316,6 +4872,13 @@
       "retry": "Retry"
     },
     "sidebar": {
+      "moveDown": "Move down",
+      "moveUp": "Move up",
+      "subtasksAttention": "{count} needs attention | {count} need attention",
+      "subtasksRunning": "{count} running",
+      "subtaskCount": "{count} subtask | {count} subtasks",
+      "collapseSubtasks": "Hide subtasks for {title}",
+      "expandSubtasks": "Show subtasks for {title}",
       "recentConversations": "Recent tasks",
       "recents": "Recents",
       "pinned": "Pinned",
@@ -4364,15 +4927,6 @@
       "bulkDeletePartial": "{count} tasks failed to delete",
       "bulkDeleteFailed": "Failed to delete selected tasks"
     },
-    "setupBanner": {
-      "ariaLabel": "Gateway setup needed",
-      "title": "Setup needed",
-      "dismiss": "Dismiss",
-      "dismissNotice": "Dismiss setup notice",
-      "hint": "The gateway isn't ready to run yet.",
-      "finishSetup": "Finish setup",
-      "viewReadiness": "View readiness"
-    },
     "shortcuts": {
       "toggleSidebar": {
         "label": "Toggle sidebar",
@@ -4403,12 +4957,17 @@
       "earlierCalls": "…{count} earlier calls",
       "callsCount": "{count} calls",
       "resultsCount": "{count} results",
+      "executionIoPty": "Real terminal (TTY)",
+      "executionIoPipe": "Regular pipe",
+      "executionIoFallback": "TTY unavailable; using a regular pipe",
+      "executionIoMixed": "Mixed terminal modes",
+      "executionIoUnknown": "Terminal mode unavailable",
       "sectionInput": "input",
       "sectionChanges": "changes",
       "sectionDiagnostics": "diagnostics",
       "sectionResult": "result",
       "sectionError": "error",
-      "viewFull": "view full",
+      "viewFull": "expand content",
       "activityViewDetails": "view details",
       "activityDetailsTitle": "details",
       "activityBytesWritten": "{size} written",

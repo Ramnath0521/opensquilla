@@ -1,6 +1,13 @@
 import type { InjectionKey } from 'vue'
 
 export type GoalStatus = string
+export type GoalUsageCoverage = 'complete' | 'partial_history' | 'partial_usage'
+
+/** Preserve missing or future coverage as unknown. */
+export function normalizeGoalUsageCoverage(value: unknown): GoalUsageCoverage | undefined {
+  return value === 'complete' || value === 'partial_history' || value === 'partial_usage'
+    ? value : undefined
+}
 
 /** Domain projection of a durable goal; wire aliases stay in the adapter. */
 export interface GoalSnapshot {
@@ -29,6 +36,8 @@ export interface GoalSnapshot {
   readonly activeTimeMs?: number
   readonly windowActiveTimeMs?: number
   readonly usage?: unknown
+  readonly usageCoverage?: 'complete' | 'partial_history' | 'partial_usage'
+  readonly usageAccountingStartedAtMs?: number | null
   readonly pauseReason?: string | null
   readonly blockedReason?: string | null
   readonly terminalReason?: string | null

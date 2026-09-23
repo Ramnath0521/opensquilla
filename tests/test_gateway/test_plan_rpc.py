@@ -9,6 +9,7 @@ from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -21,6 +22,8 @@ from opensquilla.gateway.rpc_sessions import (
     _handle_plans_cancel_run,
     _handle_plans_implement,
     _handle_plans_revise,
+    _handle_plans_set_presentation,
+    _handle_sessions_send_contract,
 )
 from opensquilla.gateway.task_runtime import TaskRun, TaskRuntime
 from opensquilla.session.manager import SessionManager
@@ -69,7 +72,7 @@ async def _open_plan_rpc_stack(
         principal=_PRINCIPAL,
         config=GatewayConfig(
             workspace_dir=str(db_path.parent / "workspace"),
-            memory={"flush_enabled": False},
+            memory={},
             naming={"enabled": False},
         ),
         session_manager=manager,
@@ -115,6 +118,51 @@ async def _open_plan_rpc_stack(
 
 async def _ignore_subscriber_event(*_args: Any, **_kwargs: Any) -> None:
     return None
+
+
+@pytest.mark.asyncio
+async def test_hide_plan_during_execution_keeps_task_and_mode_and_replays_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    events: list[tuple[str, dict]] = []
+
+    async def handler(_run: TaskRun) -> None:
+        entered.set()
+        await release.wait()
+
+    async def capture(_ctx, _key, event, payload):
+        events.append((event, payload))
+
+    monkeypatch.setattr("opensquilla.gateway.rpc_sessions._emit_to_subscribers", capture)
+    async with _open_plan_rpc_stack(tmp_path / "presentation-rpc.sqlite", handler=handler) as stack:
+        accepted = await _handle_plans_implement({
+            "sessionKey": SOURCE_KEY, "planRevisionId": stack.source_revision.revision_id,
+            "clientRequestId": "presentation-running-implementation",
+        }, stack.context)
+        await asyncio.wait_for(entered.wait(), timeout=2.0)
+        before = await stack.storage.get_session(SOURCE_KEY)
+        params = {
+            "sessionKey": SOURCE_KEY, "revisionId": stack.source_revision.revision_id,
+            "dismissed": True, "expectedEpoch": 0, "expectedPresentationRevision": 0,
+            "clientRequestId": "presentation-running-hide",
+        }
+        hidden = await _handle_plans_set_presentation(params, stack.context)
+        replayed = await _handle_plans_set_presentation(params, stack.context)
+        assert hidden["accepted"] and not hidden["replayed"]
+        assert replayed["replayed"]
+        assert replayed["planPresentations"] == hidden["planPresentations"]
+        assert await stack.storage.get_session(SOURCE_KEY) == before
+        assert await stack.runtime.active_task_id(SOURCE_KEY) == accepted["task_id"]
+        assert len([name for name, _ in events if name == "session.event.plan_presentation"]) == 1
+        with pytest.raises(RpcHandlerError) as conflict:
+            await _handle_plans_set_presentation({
+                **params, "clientRequestId": "presentation-conflict", "dismissed": False,
+            }, stack.context)
+        assert conflict.value.code == "PLAN_PRESENTATION_CHANGED"
+        assert conflict.value.details["planPresentations"] == hidden["planPresentations"]
+        release.set()
 
 
 def _envelope(session_key: str, *, source_name: str) -> RouteEnvelope:
@@ -164,7 +212,7 @@ async def test_implement_binds_exact_run_injects_full_plan_and_rejects_duplicate
         assert accepted_run["planRevisionId"] == stack.source_revision.revision_id
         expected_message = (
             f"Implement the approved plan “{stack.source_revision.title}”. "
-            "Work through its ordered steps and record truthful checkpoints."
+            "Verify existing work, adapt the approach as needed, and report actual progress."
         )
         assert captured[0].message == expected_message
         assert captured[0].no_memory_capture is True
@@ -189,13 +237,20 @@ async def test_implement_binds_exact_run_injects_full_plan_and_rejects_duplicate
         assert tool_context.plan_run_id == accepted_run["runId"]
         assert tool_context.plan_revision == stack.source_revision
         prompt_context = TurnRunner._extra_context_for_tool_context(tool_context)
-        approved = prompt_context["Approved Plan Execution"]
-        assert "Checkpoint every current step immediately" in approved
-        assert "before starting work assigned to any later step" in approved
-        assert "Never jump over the current step" in approved
-        assert "one at a time in plan order" in approved
-        assert "After the final completed checkpoint is accepted" in approved
-        payload = json.loads(approved[approved.index("{") :])
+        from html import unescape
+
+        from opensquilla.engine.collaboration_prompt import collaboration_instructions
+
+        approved = collaboration_instructions(tool_context)
+        assert "ordinary Agent loop" in approved
+        assert "reorder steps" in approved
+        assert "unless they exceed the user's authorization" in approved
+        assert "progress is descriptive" in approved
+        assert "inspect the final artifact or resulting state" in approved
+        assert "does not waive those requirements" in approved
+        proposal = prompt_context["Approved Plan Proposal"]
+        assert proposal.startswith("<untrusted source='plan_revision'>")
+        payload = json.loads(unescape(proposal.split(">", 1)[1].rsplit("</untrusted>", 1)[0]))
         assert payload["markdown"] == stack.source_revision.markdown
         assert payload["steps"] == stack.source_revision.steps
         assert payload["content_hash"] == stack.source_revision.content_hash
@@ -231,9 +286,132 @@ async def test_implement_binds_exact_run_injects_full_plan_and_rejects_duplicate
         assert terminal.status == AgentTaskStatus.SUCCEEDED
         paused = await stack.storage.get_plan_run(accepted_run["runId"])
         assert paused is not None
-        assert paused.status == "paused"
-        assert paused.pause_reason == "manual_turn_finished"
+        assert paused.status == "completed"
+        assert paused.pause_reason is None
         assert paused.active_task_id is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("interruption", ["paused", "cancelled"])
+async def test_interrupted_plan_can_deliver_existing_artifact_in_a_new_turn(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    interruption: str,
+) -> None:
+    from opensquilla.tools.builtin.artifacts import publish_artifact
+    from opensquilla.tools.types import ToolContext, current_tool_context
+
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    report = workspace / "report.txt"
+    report.write_text("Synthetic verified report.\n", encoding="utf-8")
+    entered = asyncio.Event()
+    wait_for_cancel = asyncio.Event()
+    contexts: list[ToolContext] = []
+    published: list[dict[str, Any]] = []
+
+    async def publish(context: ToolContext) -> dict[str, Any]:
+        context.workspace_dir = str(workspace)
+        context.artifact_media_root = str(tmp_path / "media")
+        context.artifact_session_id = "plan-recovery-artifact"
+        token = current_tool_context.set(context)
+        try:
+            return json.loads(await publish_artifact(path="report.txt"))
+        finally:
+            current_tool_context.reset(token)
+
+    async def handler(task: TaskRun) -> None:
+        context = task.envelope.tool_context(is_owner=True)
+        contexts.append(context)
+        if len(contexts) == 1:
+            run = await stack.storage.get_plan_run(str(context.plan_run_id))
+            assert run is not None
+            await context.update_progress([
+                {"step": "Inspect", "status": "completed"},
+                {"step": "Implement", "status": "pending"},
+            ])
+            entered.set()
+            if interruption == "cancelled":
+                await wait_for_cancel.wait()
+            if interruption == "paused":
+                raise RuntimeError("Synthetic provider failure")
+            return
+        if interruption != "cancelled":
+            resumed = await stack.storage.get_plan_run(str(context.plan_run_id))
+            assert resumed is not None
+            assert resumed.status == "running"
+            assert resumed.step_states[0]["status"] == "completed"
+        # Complete the synthetic verification before publishing as the last
+        # operation; publication must not stand in for unfinished work.
+        assert report.read_text(encoding="utf-8") == "Synthetic verified report.\n"
+        published.append(await publish(context))
+
+    monkeypatch.setattr(
+        "opensquilla.gateway.rpc_sessions._emit_to_subscribers",
+        _ignore_subscriber_event,
+    )
+    async with _open_plan_rpc_stack(tmp_path / "plan-delivery.sqlite", handler=handler) as stack:
+        implement_params = {
+            "sessionKey": SOURCE_KEY,
+            "planRevisionId": stack.source_revision.revision_id,
+            "clientRequestId": "initial-implementation",
+            "intent": "continue",
+        }
+        first = await _handle_plans_implement(implement_params, stack.context)
+        await asyncio.wait_for(entered.wait(), timeout=2.0)
+        run_id = first["planRun"]["runId"]
+        if interruption == "cancelled":
+            run = await stack.storage.get_plan_run(run_id)
+            assert run is not None
+            await _handle_plans_cancel_run(
+                {
+                    "sessionKey": SOURCE_KEY,
+                    "runId": run_id,
+                    "expectedStateRevision": run.state_revision,
+                },
+                stack.context,
+            )
+        await stack.runtime.wait(first["turn_id"], timeout=2.0)
+        interrupted = await stack.storage.get_plan_run(run_id)
+        assert interrupted is not None
+        assert interrupted.status == interruption
+        assert interrupted.current_step_id is None
+        assert interrupted.step_states[0]["status"] == "completed"
+
+        if interruption == "cancelled":
+            second = await _handle_sessions_send_contract(
+                {
+                    "key": SOURCE_KEY,
+                    "message": "Publish the existing report.txt.",
+                    "clientRequestId": "publish-after-cancellation",
+                    "intent": "continue",
+                    "queueMode": "followup",
+                },
+                stack.context,
+            )
+        else:
+            second = await _handle_plans_implement(
+                {**implement_params, "clientRequestId": "resume-implementation"},
+                stack.context,
+            )
+            assert second["planRun"]["runId"] == run_id
+
+        terminal = await stack.runtime.wait(second["turn_id"], timeout=2.0)
+        assert terminal.status == AgentTaskStatus.SUCCEEDED
+        assert len(contexts) == 2
+        assert contexts[1].plan_run_id == (None if interruption == "cancelled" else run_id)
+        assert len(published) == 1
+        assert published[0]["status"] == "published"
+        assert published[0]["artifact"]["name"] == "report.txt"
+        final = await stack.storage.get_plan_run(run_id)
+        assert final is not None
+        if interruption == "cancelled":
+            assert final.status == "cancelled"
+            assert final.step_states == interrupted.step_states
+        else:
+            assert final.status == "completed"
+            assert final.current_step_id is None
+            assert final.step_states[-1]["status"] == "pending"
 
 
 @pytest.mark.asyncio
@@ -250,14 +428,16 @@ async def test_question_answer_submit_implement_and_first_checkpoint_chain(
         current = await storage_ref.get_plan_run(run_id)
         assert current is not None
         assert current.status == "running"
-        assert current.current_step_id == "inspect"
-        advanced = await storage_ref.checkpoint_plan_run(
-            run_id,
-            expected_state_revision=current.state_revision,
-            expected_active_task_id=run.task_id,
-            step_id="inspect",
-            step_status="completed",
-        )
+        assert current.current_step_id is None
+        from opensquilla.tools.builtin.plan_control import plan_run_checkpoint
+        from opensquilla.tools.types import current_tool_context
+
+        token = current_tool_context.set(run.envelope.tool_context(is_owner=True))
+        try:
+            await plan_run_checkpoint("inspect", "completed")
+        finally:
+            current_tool_context.reset(token)
+        advanced = await storage_ref.get_plan_run(run_id)
         checkpointed.append(str(advanced.current_step_id))
 
     monkeypatch.setattr(
@@ -362,14 +542,14 @@ async def test_question_answer_submit_implement_and_first_checkpoint_chain(
         )
         await stack.runtime.wait(response["turn_id"], timeout=2.0)
 
-        assert checkpointed == ["verify"]
+        assert checkpointed == ["None"]
         run = await stack.storage.get_plan_run(response["planRun"]["runId"])
         assert run is not None
-        assert run.status == "paused"
-        assert run.current_step_id == "verify"
+        assert run.status == "completed"
+        assert run.current_step_id is None
         assert [step["status"] for step in run.step_states] == [
             "completed",
-            "in_progress",
+            "pending",
         ]
 
 
@@ -972,3 +1152,51 @@ async def test_cancel_stops_a_queued_implementation_before_handler_entry(
 
         release_blocker.set()
         await stack.runtime.wait(blocker.task_id, timeout=2.0)
+
+
+@pytest.mark.parametrize("wait_failure", ["timeout", "still_running"])
+@pytest.mark.asyncio
+async def test_cancel_does_not_claim_success_without_terminal_ack(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, wait_failure: str,
+) -> None:
+    entered = asyncio.Event()
+    release = asyncio.Event()
+
+    async def handler(_run: TaskRun) -> None:
+        entered.set()
+        await release.wait()
+
+    monkeypatch.setattr(
+        "opensquilla.gateway.rpc_sessions._emit_to_subscribers", _ignore_subscriber_event,
+    )
+    async with _open_plan_rpc_stack(tmp_path / "cancel-ack.sqlite", handler=handler) as stack:
+        response = await _handle_plans_implement({
+            "sessionKey": SOURCE_KEY,
+            "planRevisionId": stack.source_revision.revision_id,
+            "clientRequestId": "cancel-ack-implementation",
+        }, stack.context)
+        await asyncio.wait_for(entered.wait(), timeout=2.0)
+        run = await stack.storage.get_plan_run(response["planRun"]["runId"])
+        assert run is not None and run.status == "running"
+        current_task = await stack.storage.get_agent_task(response["turn_id"])
+        assert current_task is not None
+        assert current_task.status == AgentTaskStatus.RUNNING
+        with monkeypatch.context() as pending:
+            cancel = AsyncMock(return_value=1)
+            wait = AsyncMock(
+                side_effect=TimeoutError if wait_failure == "timeout" else None,
+                return_value=current_task,
+            )
+            pending.setattr(stack.runtime, "cancel", cancel)
+            pending.setattr(stack.runtime, "wait", wait)
+            with pytest.raises(RpcHandlerError) as error:
+                await _handle_plans_cancel_run({
+                    "sessionKey": SOURCE_KEY, "runId": run.run_id,
+                    "expectedStateRevision": run.state_revision,
+                }, stack.context)
+            assert error.value.code == "PLAN_RUN_CANCEL_PENDING"
+            assert error.value.accepted is False
+            cancel.assert_awaited_once()
+            assert await stack.storage.get_plan_run(run.run_id) == run
+        release.set()
+        await stack.runtime.wait(response["turn_id"], timeout=2.0)

@@ -25,9 +25,14 @@ export interface SetupDiscoveryResult extends SetupStatus {
   readonly firstResponseMs?: number
   readonly totalMs?: number
   readonly latencyMs?: number
+  readonly verificationLevel?: 'reachable' | 'model_verified' | 'none'
+  readonly failureStage?: 'reachability' | 'model'
 }
 
-export interface SetupRequestOptions { signal?: AbortSignal }
+export interface SetupRequestOptions {
+  signal?: AbortSignal
+  timeoutMs?: number
+}
 
 export type SetupWorkflowErrorCode =
   | 'not-found'
@@ -39,9 +44,19 @@ export type SetupWorkflowErrorCode =
 
 export type SetupWorkflowFailureReason =
   | 'provider-invalid'
+  | 'router-provider-conflict'
+  | 'already-active'
   | 'router-invalid'
   | 'search-invalid'
   | 'image-generation-invalid'
+
+export type RouterResolutionAction = 'use_recommended' | 'disable'
+export interface RouterProviderConflict {
+  readonly reason: 'router_provider_conflict'
+  readonly providerId: string
+  readonly conflictProviders: readonly string[]
+  readonly allowedRouterActions: readonly string[]
+}
 
 export class SetupWorkflowError extends Error {
   constructor(
@@ -49,6 +64,7 @@ export class SetupWorkflowError extends Error {
     message: string,
     readonly reason?: SetupWorkflowFailureReason,
     readonly cause?: unknown,
+    readonly details?: RouterProviderConflict,
   ) {
     super(message)
     this.name = 'SetupWorkflowError'
@@ -67,7 +83,10 @@ export interface ConfigurePrimaryProvider {
   routerAction?: string | null
   imageGenerationIntent?: string | null
 }
-export interface ProbePrimaryProvider extends ConfigurePrimaryProvider {}
+export type ProviderProbeMode = 'reachability' | 'model'
+export interface ProbePrimaryProvider extends ConfigurePrimaryProvider {
+  mode?: ProviderProbeMode
+}
 export interface DiscoverPrimaryModels extends Omit<ConfigurePrimaryProvider, 'model' | 'presetId' | 'routerAction' | 'imageGenerationIntent'> { forceRefresh?: boolean | null }
 
 export interface UpsertProfile {
@@ -87,6 +106,10 @@ export interface ActivateProfile {
   routerAction?: string | null
   imageGenerationIntent?: string | null
 }
+export interface UpsertAndActivateProfile extends UpsertProfile {
+  routerAction?: string | null
+  imageGenerationIntent?: string | null
+}
 export interface RemoveActiveProfile {
   providerId: string
   replacementProviderId: string
@@ -103,6 +126,7 @@ export interface ProfileProbe {
   baseUrl?: string | null
   proxy?: string | null
   forceRefresh?: boolean | null
+  mode?: ProviderProbeMode
 }
 
 export interface ConfigureRouter {
@@ -179,6 +203,7 @@ export interface ProviderSetup {
 }
 export interface ProfileLifecycle {
   upsertProfile(command: UpsertProfile, options?: SetupRequestOptions): Promise<SetupStatus>
+  upsertAndActivateProfile(command: UpsertAndActivateProfile, options?: SetupRequestOptions): Promise<SetupStatus>
   activateProfile(command: ActivateProfile, options?: SetupRequestOptions): Promise<SetupStatus>
   probeProfile(command: ProfileProbe, options?: SetupRequestOptions): Promise<SetupStatus>
   probeDraftProfile(command: ProfileProbe, options?: SetupRequestOptions): Promise<SetupDiscoveryResult>
@@ -199,8 +224,11 @@ export interface CapabilitySetup {
 }
 export interface SetupCapabilities {
   readonly profileLifecycle: boolean
+  readonly profileUpsertAndActivate: boolean
   readonly primaryProviderRemoval: boolean
   readonly imageModelDiscovery: boolean
+  /** Omitted by in-process implementations that support the current API directly. */
+  readonly providerProbeModes?: boolean
 }
 export interface SetupWorkflow extends SetupCatalogPort, SetupStatusPort {
   readonly capabilities: SetupCapabilities

@@ -2,6 +2,7 @@ import { describe, expect, it, vi } from 'vitest'
 import { ref } from 'vue'
 import type { ChatMessage } from '@/types/chat'
 import { useChatRouterDecisionRuntime } from '@/composables/chat/useChatRouterDecisionRuntime'
+import { useChatRenderedMessages } from '@/composables/chat/useChatRenderedMessages'
 import type { ModelRoutingMode } from '@/types/modelRouting'
 
 function makeRuntime(
@@ -14,9 +15,10 @@ function makeRuntime(
   const scrollToBottom = vi.fn()
   const activeTurnUsesEnsemble = ref(modelRoutingMode === 'llm_ensemble')
   const activeTurnId = ref('turn-current')
+  const sessionKey = ref('sess')
   const runtime = useChatRouterDecisionRuntime({
     messages: messagesRef,
-    sessionKey: ref('sess'),
+    sessionKey,
     isStreaming: ref(isStreaming),
     autoScroll: ref(autoScroll),
     activeTurnUsesEnsemble,
@@ -35,8 +37,243 @@ function makeRuntime(
     scrollToBottom,
     activeTurnUsesEnsemble,
     activeTurnId,
+    sessionKey,
   }
 }
+
+describe('router attempt ownership', () => {
+  const progress = (turnId = 'turn-current') => ({
+    turn_id: turnId, event_type: 'proposer_start' as const,
+    proposer_provider: 'provider', proposer_model: 'candidate',
+  })
+  const decision = (seq: number, turnId = 'turn-current') => ({
+    turn_id: turnId, stream_seq: seq, tier: 'c1', model: 'provider/selected', source: 'squilla_router',
+  })
+
+  it('attaches untagged progress to the current tagged decision', () => {
+    const { runtime, messagesRef } = makeRuntime([{ role: 'user', text: 'q', ts: 0, turnId: 'turn-current' }])
+    runtime.queueRouterDecision(decision(10))
+    runtime.appendEnsembleProgress({
+      event_type: 'proposer_start', proposer_provider: 'provider', proposer_model: 'candidate',
+    })
+    const cards = messagesRef.value.filter(message => message.role === 'router')
+    expect(cards).toHaveLength(1)
+    expect(cards[0]?.ensemble?.models[0]?.model).toBe('candidate')
+  })
+
+  it('assigns untagged progress after replay to a new provisional card', () => {
+    const { runtime, messagesRef } = makeRuntime([{ role: 'user', text: 'q', ts: 0, turnId: 'turn-current' }])
+    runtime.queueRouterDecision(decision(10))
+    runtime.appendEnsembleProgress({ ...progress(), proposer_model: 'first' })
+    runtime.handleRouterControlReplay({ turn_id: 'turn-current', stream_seq: 20 })
+    runtime.appendEnsembleProgress({
+      event_type: 'proposer_start', proposer_provider: 'provider', proposer_model: 'second',
+    })
+    runtime.queueRouterDecision(decision(22))
+    const cards = messagesRef.value.filter(message => message.role === 'router')
+    expect(cards).toHaveLength(2)
+    expect(cards.map(card => card.messageId)).toEqual(['router-sess-10', 'router-sess-22'])
+    expect(cards.map(card => card.ensemble?.models.map(model => model.model)))
+      .toEqual([['first'], ['second']])
+  })
+
+  it('uses the same boundary identity for live and snapshot replay', () => {
+    const { runtime, messagesRef } = makeRuntime([{ role: 'user', text: 'q', ts: 0, turnId: 'turn-current' }])
+    runtime.handleRouterControlReplay({ turn_id: 'turn-current', stream_seq: 10 })
+    runtime.appendEnsembleProgress(progress())
+    runtime.resetRouterReplayCursor()
+    runtime.handleRouterControlReplay({ turn_id: 'turn-current' }, 10)
+    runtime.appendEnsembleProgress(progress())
+    runtime.queueRouterDecision(decision(12))
+    const cards = messagesRef.value.filter(message => message.role === 'router')
+    expect(cards).toHaveLength(1)
+    expect(cards[0]?.messageId).toBe('router-sess-12')
+  })
+
+  it('keeps unsequenced replay boundaries separate instead of guessing their identity', () => {
+    const { runtime, messagesRef } = makeRuntime([{ role: 'user', text: 'q', ts: 0, turnId: 'turn-current' }])
+    runtime.appendEnsembleProgress(progress())
+    runtime.handleRouterControlReplay()
+    runtime.appendEnsembleProgress(progress())
+    runtime.queueRouterDecision(decision(12))
+    const cards = messagesRef.value.filter(message => message.role === 'router')
+    expect(cards).toHaveLength(2)
+    expect(cards[0]?.messageId).not.toBe(cards[1]?.messageId)
+    expect(cards[1]?.messageId).toBe('router-sess-12')
+  })
+
+  it('does not reuse a replay boundary from a different stream generation', () => {
+    const { runtime, messagesRef } = makeRuntime([{ role: 'user', text: 'q', ts: 0, turnId: 'turn-current' }])
+    runtime.handleRouterControlReplay({ turn_id: 'turn-current', stream_seq: 10, stream_generation: 'a' })
+    runtime.appendEnsembleProgress(progress())
+    runtime.handleRouterControlReplay({ turn_id: 'turn-current', stream_seq: 10, stream_generation: 'b' })
+    runtime.appendEnsembleProgress(progress())
+    runtime.queueRouterDecision(decision(12))
+    expect(messagesRef.value.filter(message => message.role === 'router')).toHaveLength(2)
+  })
+
+  it('keeps replay ownership per turn when another turn receives a late decision', () => {
+    const { runtime, messagesRef } = makeRuntime([{ role: 'user', text: 'q', ts: 0, turnId: 'first' }])
+    runtime.appendEnsembleProgress(progress('first'))
+    messagesRef.value.push({ role: 'user', text: 'q2', ts: 1, turnId: 'second' })
+    runtime.handleRouterControlReplay({ turn_id: 'second', stream_seq: 10 })
+    runtime.appendEnsembleProgress(progress('second'))
+    runtime.queueRouterDecision(decision(11, 'first'))
+    runtime.queueRouterDecision(decision(12, 'second'))
+    const cards = messagesRef.value.filter(message => message.role === 'router')
+    expect(cards).toHaveLength(2)
+    expect(cards.map(card => [card.turnId, card.messageId])).toEqual([
+      ['first', 'router-sess-11'], ['second', 'router-sess-12'],
+    ])
+  })
+
+  it('does not promote a history row that only resembles a local provisional card', () => {
+    const { runtime, messagesRef } = makeRuntime([{
+      role: 'router', text: '', ts: 0, turnId: 'turn-current',
+      messageId: 'router-sess-ensemble-1', provenanceKind: 'router_decision',
+      routerDecision: { tier: 'c1', model: 'provider/old', source: 'llm_ensemble' },
+      restoredFromHistory: true,
+    }])
+    runtime.queueRouterDecision(decision(12))
+    expect(messagesRef.value.filter(message => message.role === 'router')).toHaveLength(2)
+  })
+
+  it('does not promote a provisional card twice for different real decisions', () => {
+    const { runtime, messagesRef } = makeRuntime([{ role: 'user', text: 'q', ts: 0, turnId: 'turn-current' }])
+    runtime.appendEnsembleProgress(progress())
+    runtime.queueRouterDecision(decision(11))
+    runtime.queueRouterDecision(decision(12))
+    expect(messagesRef.value.filter(message => message.role === 'router').map(card => card.messageId))
+      .toEqual(['router-sess-11', 'router-sess-12'])
+  })
+
+  it('drops pending decisions and ownership after switching sessions', () => {
+    const { runtime, messagesRef, sessionKey } = makeRuntime([{ role: 'user', text: 'q', ts: 0, turnId: 'turn-current' }])
+    runtime.queueRouterDecision({ ...decision(10), key: 'sess' })
+    runtime.handleRouterControlReplay({ turn_id: 'turn-current', stream_seq: 11 })
+    runtime.queueRouterDecision({ ...decision(12), key: 'sess' })
+    sessionKey.value = 'new'
+    messagesRef.value = [{ role: 'user', text: 'q2', ts: 0, turnId: 'turn-current' }]
+    runtime.flushPendingRouterDecision()
+    runtime.appendEnsembleProgress({ ...progress(), key: 'sess' })
+    runtime.queueRouterDecision({ ...decision(13), key: 'sess' })
+    expect(messagesRef.value).toHaveLength(1)
+    runtime.appendEnsembleProgress({ ...progress(), key: 'new' })
+    runtime.queueRouterDecision({ ...decision(14), key: 'new' })
+    expect(messagesRef.value.filter(message => message.role === 'router').map(card => card.messageId))
+      .toEqual(['router-new-14'])
+  })
+})
+
+describe('physical router replay settlement', () => {
+  function setup() {
+    const context = makeRuntime([
+      { role: 'user', text: 'Synthetic request', ts: 0, turnId: 'turn-current' },
+    ], true, 'squilla_router')
+    const { renderedMessages } = useChatRenderedMessages({
+      messages: context.messagesRef, sessionKey: context.sessionKey, isStreaming: ref(true),
+      routerSlots: ref(['c1', 'c2']),
+      routerModels: ref({ c1: 'deepseek-v4-pro', c2: 'kimi-k2.7-code' }),
+      routerTierConfigs: ref({}), routerVisualEffectsEnabled: ref(true),
+      routerVisualMode: ref('real_candidates'), renderMarkdown: text => text,
+      stripGeneratedArtifactMarkers: text => text, stripTimePrefix: text => text,
+      isSubagentCompletionMessage: () => false,
+    })
+    const decision = (seq: number, model: string) => {
+      context.runtime.queueRouterDecision({
+        turn_id: 'turn-current', stream_seq: seq,
+        tier: 'c1', model: 'deepseek-v4-pro', source: 'classifier',
+      })
+      context.runtime.bindRouterDecisionToModelCall(`${seq}.0`, seq, 'turn-current')
+      context.runtime.updateRouterExecutionModel(model, 'turn-current')
+    }
+    const cards = () => renderedMessages.value.filter(message => message.isRouterStrip)
+    return { ...context, decision, cards }
+  }
+
+  it('ends the previous physical attempt while the new attempt remains live', () => {
+    const h = setup()
+    h.decision(10, 'kimi-k2.7-code')
+    h.runtime.handleRouterControlReplay({ turn_id: 'turn-current', stream_seq: 20 })
+    expect(h.cards()[0]?.routerSettled).toBe(true)
+    h.decision(21, 'deepseek-v4-pro-0813')
+
+    expect(h.cards().map(card => [card.routerExecutionModel, card.routerSettled])).toEqual([
+      ['kimi-k2.7-code', true], ['deepseek-v4-pro-0813', false],
+    ])
+    expect(h.cards().map(card => card.routerSelectedModel)).toEqual([
+      'deepseek-v4-pro', 'deepseek-v4-pro',
+    ])
+  })
+
+  it('keeps an ordinary applied steer in the same physical attempt', () => {
+    const h = setup()
+    h.decision(10, 'kimi-k2.7-code')
+    h.messagesRef.value.push({
+      role: 'user', text: 'Synthetic adjustment', ts: 2,
+      turnId: 'turn-current', inputDisposition: 'applied',
+    })
+    h.runtime.updateRouterExecutionModel('deepseek-v4-pro-0813', 'turn-current')
+    expect(h.cards()).toHaveLength(1)
+    expect(h.cards()[0]).toMatchObject({
+      routerExecutionModel: 'deepseek-v4-pro-0813', routerSettled: false,
+    })
+  })
+
+  it('does not settle the active card when the same boundary is delivered again', () => {
+    const h = setup()
+    h.decision(10, 'kimi-k2.7-code')
+    const boundary = { turn_id: 'turn-current', stream_seq: 20, stream_generation: 'generation-a' }
+    h.runtime.handleRouterControlReplay(boundary)
+    h.decision(21, 'deepseek-v4-pro-0813')
+    h.runtime.handleRouterControlReplay(boundary)
+    expect(h.cards().map(card => card.routerSettled)).toEqual([true, false])
+  })
+
+  it('restores repeated multi-attempt snapshots without ending their current attempt', () => {
+    const h = setup()
+    const replaySnapshot = () => {
+      h.runtime.resetRouterReplayCursor()
+      h.decision(10, 'kimi-k2.7-code')
+      h.runtime.handleRouterControlReplay({ turn_id: 'turn-current' }, 20)
+      h.decision(21, 'deepseek-v4-pro-0813')
+      h.runtime.handleRouterControlReplay({ turn_id: 'turn-current' }, 30)
+      h.decision(31, 'kimi-k2.7-code')
+    }
+    replaySnapshot()
+    replaySnapshot()
+    replaySnapshot()
+    expect(h.cards().map(card => [card.routerModelCallId, card.routerSettled])).toEqual([
+      ['10.0', true], ['21.0', true], ['31.0', false],
+    ])
+    expect(h.cards().map(card => card.routerExecutionModel)).toEqual([
+      'kimi-k2.7-code', 'deepseek-v4-pro-0813', 'kimi-k2.7-code',
+    ])
+  })
+
+  it('ends an attempt when another generation reuses the boundary sequence', () => {
+    const h = setup()
+    h.runtime.handleRouterControlReplay({ turn_id: 'turn-current', stream_seq: 20, stream_generation: 'generation-a' })
+    h.decision(21, 'kimi-k2.7-code')
+    h.runtime.handleRouterControlReplay({ turn_id: 'turn-current', stream_seq: 20, stream_generation: 'generation-b' })
+    h.decision(22, 'deepseek-v4-pro-0813')
+    expect(h.cards().map(card => card.routerSettled)).toEqual([true, false])
+  })
+
+  it('leaves another turn untouched by the current turn replay boundary', () => {
+    const h = setup()
+    h.decision(10, 'kimi-k2.7-code')
+    h.messagesRef.value.push({ role: 'user', text: 'Next request', ts: 2, turnId: 'turn-next' })
+    h.runtime.queueRouterDecision({
+      turn_id: 'turn-next', stream_seq: 20,
+      tier: 'c1', model: 'deepseek-v4-pro', source: 'classifier',
+    })
+    h.runtime.updateRouterExecutionModel('deepseek-v4-pro-0813', 'turn-next')
+    h.runtime.handleRouterControlReplay({ turn_id: 'turn-next', stream_seq: 30 })
+    const rows = h.messagesRef.value.filter(message => message.role === 'router')
+    expect(rows.map(row => row.routerSettled)).toEqual([undefined, true])
+  })
+})
 
 describe('router decision identity', () => {
   it('reuses the live stream identity when the same decision is replayed from a snapshot', () => {
@@ -150,9 +387,143 @@ describe('router decision identity', () => {
       ['router-sess-20', 'provider/replay', '2.0', 2],
     ])
   })
+
+  it('keeps physical activity within its turn and router replay attempt', () => {
+    const { runtime, messagesRef } = makeRuntime([
+      { role: 'user', text: 'q', ts: 0, turnId: 'turn-1' },
+    ], true, 'squilla_router', false)
+    const decision = { turn_id: 'turn-1', tier: 'c1', model: 'deepseek-v4-pro', source: 'squilla_router' }
+    runtime.queueRouterDecision({ ...decision, stream_seq: 10 })
+    runtime.updateRouterExecutionModel('kimi-k2.7-code', 'turn-1')
+    runtime.handleRouterControlReplay({ turn_id: 'turn-1', stream_seq: 20 })
+    runtime.updateRouterExecutionModel('deepseek-v4-pro-0813', 'turn-1')
+    runtime.queueRouterDecision({ ...decision, stream_seq: 21 })
+    runtime.updateRouterExecutionModel('deepseek-v4-pro', 'turn-1')
+    runtime.updateRouterExecutionModel('unrelated-model', 'another-turn')
+    runtime.updateRouterExecutionModel('  ', 'turn-1')
+    const routers = messagesRef.value.filter(message => message.role === 'router')
+    expect(routers.map(message => message.routerExecutionModel)).toEqual([
+      'kimi-k2.7-code', 'deepseek-v4-pro',
+    ])
+    expect(routers.map(message => message.routerDecision?.model)).toEqual([
+      'deepseek-v4-pro', 'deepseek-v4-pro',
+    ])
+  })
+
+  it('tracks the physical fallback model without mutating the route decision', () => {
+    const { runtime, messagesRef } = makeRuntime([{
+      role: 'user',
+      text: 'q',
+      ts: 0,
+      turnId: 'turn-1',
+    }], true, 'squilla_router')
+
+    runtime.queueRouterDecision({
+      stream_seq: 10,
+      turn_id: 'turn-1',
+      tier: 'c1',
+      model: 'deepseek-v4-pro',
+      source: 'squilla_router',
+    })
+    const router = messagesRef.value.find(message => message.role === 'router')
+    const observedExecutionModels: string[] = []
+    for (const model of [
+      'deepseek-v4-pro',
+      'kimi-k2.7-code',
+      'deepseek-v4-pro-0813',
+    ]) {
+      runtime.updateRouterExecutionModel(model, 'turn-1')
+      expect(router?.routerDecision?.model).toBe('deepseek-v4-pro')
+      observedExecutionModels.push(String(router?.routerExecutionModel || ''))
+    }
+
+    expect(observedExecutionModels).toEqual([
+      'deepseek-v4-pro',
+      'kimi-k2.7-code',
+      'deepseek-v4-pro-0813',
+    ])
+    expect(router?.routerDecision?.model).toBe('deepseek-v4-pro')
+    expect(router?.routerExecutionModel).toBe('deepseek-v4-pro-0813')
+  })
 })
 
 describe('appendEnsembleProgress', () => {
+  it('promotes a same-turn provisional card when its real decision arrives', () => {
+    const { runtime, messagesRef } = makeRuntime([
+      { role: 'user', text: 'q', ts: 0, turnId: 'turn-1' },
+    ])
+
+    runtime.appendEnsembleProgress({
+      event_type: 'proposer_finish',
+      turn_id: 'turn-1',
+      proposer_provider: 'openrouter',
+      proposer_model: 'qwen/qwen3.7-plus',
+    })
+    const provisional = messagesRef.value.find(message => message.role === 'router')!
+    ;(provisional as ChatMessage & { routerExecutionModel?: string }).routerExecutionModel = 'fallback-model'
+
+    runtime.queueRouterDecision({
+      turn_id: 'turn-1',
+      stream_seq: 12,
+      tier: 'c1',
+      model: 'provider/selected',
+      source: 'squilla_router',
+    })
+
+    const routers = messagesRef.value.filter(message => message.role === 'router')
+    expect(routers).toHaveLength(1)
+    expect(routers[0]).toMatchObject({
+      messageId: 'router-sess-12',
+      turnId: 'turn-1',
+      routerDecision: { model: 'provider/selected' },
+    })
+    expect(routers[0]?.ensemble?.models).toHaveLength(1)
+    expect((routers[0] as ChatMessage & { routerExecutionModel?: string }).routerExecutionModel)
+      .toBe('fallback-model')
+  })
+
+  it('does not promote a provisional card across a router control replay boundary', () => {
+    const { runtime, messagesRef } = makeRuntime([
+      { role: 'user', text: 'q', ts: 0, turnId: 'turn-1' },
+    ])
+
+    runtime.appendEnsembleProgress({
+      event_type: 'proposer_start',
+      turn_id: 'turn-1',
+      proposer_provider: 'openrouter',
+      proposer_model: 'qwen/qwen3.7-plus',
+    })
+    runtime.handleRouterControlReplay()
+    runtime.queueRouterDecision({
+      turn_id: 'turn-1',
+      stream_seq: 13,
+      tier: 'c1',
+      model: 'provider/replayed',
+      source: 'squilla_router',
+    })
+
+    expect(messagesRef.value.filter(message => message.role === 'router')).toHaveLength(2)
+  })
+
+  it('promotes a handoff card without dropping its identity', () => {
+    const { runtime, messagesRef } = makeRuntime([
+      { role: 'user', text: 'q', ts: 0, turnId: 'turn-1' },
+    ])
+
+    runtime.markEnsembleHandoff()
+    runtime.queueRouterDecision({
+      turn_id: 'turn-1',
+      stream_seq: 14,
+      tier: 'c1',
+      model: 'provider/selected',
+      source: 'squilla_router',
+    })
+
+    const routers = messagesRef.value.filter(message => message.role === 'router')
+    expect(routers).toHaveLength(1)
+    expect(routers[0]).toMatchObject({ messageId: 'router-sess-14', turnId: 'turn-1' })
+  })
+
   it('normalizes every internal candidate label to the public Proposer role', () => {
     const { runtime, messagesRef } = makeRuntime([{ role: 'user', text: 'q', ts: 0 }])
 

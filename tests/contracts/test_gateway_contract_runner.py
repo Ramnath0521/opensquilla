@@ -447,6 +447,10 @@ def test_only_the_exact_production_sessions_list_schema_is_grandfathered(
         "sessions/sessions-list.schema.json",
         copied_document,
     )
+    with pytest.raises(runner.ContractConfigurationError, match="repository-pinned toolchain"):
+        runner.load_contract(copied_schema, contract_root=tmp_path)
+    copied_document["x-opensquilla-codegen"] = runner.PINNED_CODEGEN
+    _write_schema(tmp_path, "sessions/sessions-list.schema.json", copied_document)
     with pytest.raises(runner.ContractConfigurationError, match="declare kind"):
         runner.load_contract(copied_schema, contract_root=tmp_path)
 
@@ -455,7 +459,7 @@ def test_only_the_exact_production_sessions_list_schema_is_grandfathered(
     ("lifecycle", "canonical_alias", "message"),
     [
         ("legacy", None, "canonicalAlias"),
-        ("stable", "sessions.contextCompact", "stable method"),
+        ("stable", "exec.approval.status", "stable method"),
         ("legacy", "bad alias", "canonicalAlias"),
     ],
 )
@@ -465,14 +469,14 @@ def test_legacy_method_lifecycle_requires_one_legal_canonical_alias(
     canonical_alias: str | None,
     message: str,
 ) -> None:
-    document = _method_schema("sessions.compact")
+    document = _method_schema("plugin.approval.status")
     method = document["x-opensquilla-method"]
     method["lifecycle"] = lifecycle
     if canonical_alias is not None:
         method["canonicalAlias"] = canonical_alias
     schema = _write_schema(
         tmp_path,
-        "sessions/sessions-compact.schema.json",
+        "approvals/plugin-approval-status.schema.json",
         document,
     )
 
@@ -488,27 +492,77 @@ def test_compatibility_manifest_is_schema_derived_and_deterministic() -> None:
     manifest = json.loads(first)
 
     assert first == second
+    assert runner.COMPATIBILITY_MANIFEST_OUTPUT.read_text(encoding="utf-8") == first
     assert manifest["format"] == 1
     assert manifest["protocol"] == runner.GATEWAY_PROTOCOL
     assert manifest["wireVersion"] == 4
     assert manifest["source"] == {
-        "schemaCount": 224,
-        "methodCount": 215,
-        "eventFamilyCount": 9,
+        "schemaCount": 235,
+        "methodCount": 225,
+        "eventFamilyCount": 10,
         "schemaTreeSha256": runner._schema_tree_digest(specs),
         "generatorSha256": runner._generator_digest(),
+        "toolchains": {
+            "ordinaryTypes": {
+                "python": {
+                    "tool": "datamodel-code-generator",
+                    "version": "0.81.0",
+                    "target": "pydantic_v2.BaseModel",
+                },
+                "typescript": {"tool": "json-schema-to-typescript", "version": "16.0.0"},
+            },
+            "legacyTypes": {
+                "python": {
+                    "tool": "datamodel-code-generator",
+                    "version": "0.75.1",
+                    "target": "pydantic_v2.BaseModel",
+                },
+                "typescript": {"tool": "json-schema-to-typescript", "version": "15.0.4"},
+            },
+            "runtimeValidation": {
+                "tool": "ajv",
+                "version": "8.20.0",
+                "mode": "standalone-adapter-only",
+            },
+        },
     }
+    assert any(entry["name"] == "skills.install.status" for entry in manifest["methods"])
+    assert {"skills.candidates", "skills.setEnabled"}.issubset(
+        {entry["name"] for entry in manifest["methods"]}
+    )
     assert Counter(entry["lifecycle"] for entry in manifest["methods"]) == {
-        "stable": 210,
-        "legacy": 5,
+        "stable": 222,
+        "legacy": 3,
     }
+    assert [
+        entry["lifecycle"]
+        for entry in manifest["methods"]
+        if entry["name"] == "telemetry.product_active.record"
+    ] == ["stable"]
+    profile_save_activate = next(
+        entry
+        for entry in manifest["methods"]
+        if entry["name"] == "onboarding.llmProfile.upsertAndActivate"
+    )
+    assert profile_save_activate["lifecycle"] == "stable"
+    assert profile_save_activate["schema"] == (
+        "platform/onboarding-llm-profile-upsert-and-activate.schema.json"
+    )
+    plan_presentation = next(
+        entry for entry in manifest["methods"] if entry["name"] == "plans.setPresentation"
+    )
+    assert plan_presentation["lifecycle"] == "stable"
+    assert plan_presentation["schema"] == "plans/plans-set-presentation.schema.json"
+    capacity_resolve = next(
+        entry for entry in manifest["methods"] if entry["name"] == "models.capacity.resolve"
+    )
+    assert capacity_resolve["lifecycle"] == "stable"
+    assert capacity_resolve["schema"] == "platform/models-capacity-resolve.schema.json"
     assert {
         entry["name"]: entry["canonicalName"]
         for entry in manifest["methods"]
         if entry["lifecycle"] == "legacy"
     } == {
-        "sessions.compact": "sessions.contextCompact",
-        "sessions.steer": "sessions.steer.v2",
         "plugin.approval.status": "exec.approval.status",
         "plugin.approval.resolve": "exec.approval.resolve",
         "plugin.approval.extend": "exec.approval.extend",
@@ -518,12 +572,31 @@ def test_compatibility_manifest_is_schema_derived_and_deterministic() -> None:
         for entry in [*manifest["methods"], *manifest["events"]]
     )
     event_families = {entry["family"]: entry for entry in manifest["events"]}
-    assert len(event_families) == 9
+    assert len(event_families) == 10
     assert event_families["models.routing.changed"]["wireNames"] == ["models.routing.changed"]
+    assert event_families["transport.flow.dirty"]["wireNames"] == ["transport.flow.dirty"]
     assert "session.event.artifact_state" in event_families["conversation.events"]["wireNames"]
     assert "session.event.artifact_state" in event_families["document.state_changed"]["wireNames"]
     assert "private" not in first.lower()
     assert "allowlist" not in first.lower()
+
+
+def test_generator_digest_is_not_repeated_in_per_contract_headers() -> None:
+    specs = runner.discover_contracts()
+    spec = next(spec for spec in specs if not spec.uses_legacy_generator)
+
+    header = runner._header(spec, "#")
+    assert header.splitlines() == [
+        "# @generated by scripts/contracts/generate_gateway_contracts.py; do not edit.",
+        f"# source-sha256: {hashlib.sha256(spec.schema.read_bytes()).hexdigest()}",
+    ]
+
+    registration_header = runner._registration_header(specs)
+    assert "# sources-sha256: " in registration_header
+    assert f"# generator-sha256: {runner._generator_digest()}" in registration_header
+
+    manifest = json.loads(runner.render_compatibility_manifest(specs))
+    assert manifest["source"]["generatorSha256"] == runner._generator_digest()
 
 
 @pytest.mark.parametrize(
@@ -623,6 +696,10 @@ def test_generic_renderer_derives_all_adapter_only_artifacts(
             output.write_text("export interface SessionsResolveRequestFrame {}\n", encoding="utf-8")
 
     monkeypatch.setattr(runner, "_run", fake_run)
+    # This test synthesizes generator output; version discovery belongs to the
+    # same external-tool boundary, not the Python-only rendering contract.
+    monkeypatch.setattr(runner, "distribution_version", lambda _: "0.81.0")
+    monkeypatch.setattr(runner, "_verify_npm_generator", lambda *args: None)
     monkeypatch.setattr(
         runner,
         "_capture",
@@ -714,6 +791,37 @@ def test_python_renderer_keeps_field_alias_metadata_when_tightening_nullability(
     )
 
 
+def test_python_renderer_keeps_omittable_non_nullable_collection_constraints(
+    tmp_path: Path,
+) -> None:
+    from pydantic import ValidationError
+
+    document = _method_schema("sessions.resolve")
+    document["$defs"]["SessionsResolveResult"] = {
+        "type": "object",
+        "properties": {"values": {"type": "array", "items": {"type": "string"}, "maxItems": 2}},
+    }
+    schema = _write_schema(tmp_path, "sessions/sessions-resolve.schema.json", document)
+    spec = runner.load_contract(schema, contract_root=tmp_path)
+    generated = (
+        "from pydantic import BaseModel, Field\n\n"
+        "class SessionsResolveResult(BaseModel):\n"
+        "    values: list[str] | None = Field(None, max_length=2)\n"
+    )
+    rendered = runner._normalise_optional_non_nullable_defaults(spec, generated)
+    assert "list[str] = Field(None, max_length=2)  # type: ignore[assignment, arg-type]" in rendered
+    namespace: dict[str, Any] = {}
+    exec(rendered, namespace)
+    model = namespace["SessionsResolveResult"]
+    model.model_rebuild(_types_namespace=namespace)
+    assert model().model_dump(exclude_unset=True) == {}
+    assert model(values=[]).model_dump() == {"values": []}
+    with pytest.raises(ValidationError):
+        model(values=None)
+    with pytest.raises(ValidationError):
+        model(values=["one", "two", "three"])
+
+
 def test_python_renderer_aligns_json_integer_acceptance_with_ajv(
     tmp_path: Path,
 ) -> None:
@@ -793,6 +901,7 @@ def test_registration_descriptor_exposes_uniform_validation_models() -> None:
     specs = runner.discover_contracts()
 
     rendered = runner.render_registration_descriptor(specs)
+    assert runner.REGISTRATION_OUTPUT.read_text(encoding="utf-8") == rendered
 
     assert "class GatewayMethodContract:" in rendered
     assert "GATEWAY_METHOD_CONTRACTS: Final[dict[str, GatewayMethodContract]]" in rendered
@@ -949,15 +1058,9 @@ def test_sessions_list_legacy_artifacts_remain_byte_exact() -> None:
             "62dce72764117870a9055bfcfbe90fc02a6ec32be405896f5eba8888f5d4fe4a"
         ),
         "sessionsList.ts": "6dff702e0480fca29be404bfcfe28c3231ccc07ede1289e4b79f5a0170c06819",
-        "sessionsListValidators.cjs": (
-            "617ed876b51b73858f87bdfce69282ca7ca0d70ebd7a360ab02d7fd02e494712"
-        ),
-        "sessionsListValidators.d.cts": (
-            "dae25ccdadf944a91e8545406bb4d8898aed8ce54351ccc0504dfbc2c6c06482"
-        ),
     }
-    # Freeze every baseline byte except the separately verified generator
-    # provenance line: changing CLI publication must not change type/validator bodies.
+    # Freeze every type artifact byte except the separately verified generator
+    # provenance line: validator publication must not change the legacy types.
     generator_digest = hashlib.sha256(
         runner.LEGACY_GENERATORS[sessions_list.schema].read_bytes()
         + b"\0"
@@ -976,8 +1079,10 @@ def test_sessions_list_legacy_artifacts_remain_byte_exact() -> None:
         path.name: body_digest(path.read_text(encoding="utf-8"))
         for path in sessions_list.outputs[:3]
     } == {path.name: expected[path.name] for path in sessions_list.outputs[:3]}
-    # Frozen CJS bodies remain byte-oracles in the pinned toolchain job;
-    # they are no longer persisted in the production package.
+    assert tuple(path.name for path in sessions_list.outputs[3:]) == (
+        "sessionsListValidators.mjs",
+        "sessionsListValidators.d.mts",
+    )
     import os
 
     if os.environ.get("OPENSQUILLA_RUN_CONTRACT_TOOLCHAIN_INTEGRATION") == "1":

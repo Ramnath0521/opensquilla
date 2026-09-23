@@ -24,22 +24,23 @@ the capacity floor became a hard lower bound for physical fallback. Their
 goldens therefore include the sanitized floor tier and omit fallback models
 below it; the remaining corpus still pins the original extraction parity.
 
-The image-bypass cases were intentionally recaptured for the #1195 reopen
-after attachment capacity became mandatory for every attachment turn. Those
-entries include the capacity-required marker, material estimate, thinking
-reserve, and capacity-filtered fallback chain. Non-attachment cases retain
-their prior byte-identical behavior.
-
-The missing image-tier case was intentionally recaptured after Router image
-admission began returning a structured rejection instead of raising a runtime
-configuration exception. Its golden pins the stable rejection metadata while
-the later provider admission layer owns the user-facing error event.
+The image-bypass cases were intentionally recaptured for the configured-only
+multimodal policy. Router now evaluates only c0-c3, treats omitted capability
+as probeable, prefers proven support, and never executes the legacy
+``image_model`` row. Their goldens pin the strict configured fallback chain
+and image projection metadata. Active image history no longer relies on a
+selection gate or sets a separate history turn limit; non-attachment cases retain their prior
+byte-identical behavior.
 
 Classifier outputs are injected through a fake strategy: the corpus never
 loads the LightGBM/ONNX bundle, touches the network, or needs credentials.
 All tier/model/provider names and messages are synthetic dummy data; tier
 model ids intentionally contain no ``/`` so pricing stays on the offline
 static table.
+
+The router's token-estimator input is pinned to the deterministic material
+text estimator. Tokenizer availability and cold-cache loading belong to the
+token-estimation tests, not the byte-identical routing-policy goldens.
 """
 
 from __future__ import annotations
@@ -60,6 +61,7 @@ from opensquilla.engine.steps import squilla_router as squilla_router_step
 from opensquilla.gateway.config import GatewayConfig
 from opensquilla.provider import model_catalog as model_catalog_module
 from opensquilla.provider.model_catalog import ModelCatalog
+from opensquilla.token_estimation import estimate_material_text_tokens
 
 GOLDEN_PATH = Path(__file__).parent / "goldens" / "routing_policy_parity_golden.json"
 
@@ -245,8 +247,8 @@ def build_corpus() -> list[Case]:
     )
     cases.append(
         Case(
-            name="image_gate_history_bypass",
-            metadata={"router_vision_followup_needs_image": True},
+            name="image_active_history_bypass",
+            metadata={"image_context_has_images": True},
             classify_expected=False,
         )
     )
@@ -260,7 +262,7 @@ def build_corpus() -> list[Case]:
     )
     cases.append(
         Case(
-            name="image_without_image_tier_errors",
+            name="image_without_legacy_image_tier_uses_c_ladder",
             tiers={k: v for k, v in synthetic_tiers().items() if k != "image_model"},
             attachments=[{"type": "image/png"}],
             classify_expected=False,
@@ -731,6 +733,7 @@ def run_case(case: Case) -> dict:
         strategy = _UnexpectedClassifyStrategy()
 
     original_get_strategy = sr._get_strategy
+    original_estimate_tokens = sr.estimate_tokens
     original_catalog = model_catalog_module._shared_catalog
     capacity_catalog = ModelCatalog()
     capacity_catalog.set_user_overrides(
@@ -750,6 +753,7 @@ def run_case(case: Case) -> dict:
     )
     model_catalog_module._shared_catalog = capacity_catalog
     sr._get_strategy = lambda _config: strategy  # type: ignore[assignment]
+    sr.estimate_tokens = estimate_material_text_tokens
     error: str | None = None
     try:
         asyncio.run(sr.apply_squilla_router(ctx))
@@ -757,6 +761,7 @@ def run_case(case: Case) -> dict:
         error = f"{type(exc).__name__}: {exc}"
     finally:
         sr._get_strategy = original_get_strategy  # type: ignore[assignment]
+        sr.estimate_tokens = original_estimate_tokens
         model_catalog_module._shared_catalog = original_catalog
         sr._history_store.clear()
 
@@ -786,6 +791,28 @@ def test_routing_decision_parity(case: Case) -> None:
     # canonical JSON as the strict equality bar.
     assert observed == expected
     assert _canon(observed) == _canon(expected)
+
+
+def test_parity_harness_does_not_load_ambient_tokenizer(monkeypatch: pytest.MonkeyPatch) -> None:
+    from opensquilla import token_estimation
+
+    calls = []
+
+    def unavailable_encoding() -> None:
+        calls.append("load")
+        raise AssertionError("routing parity must not load the ambient tokenizer")
+
+    monkeypatch.setattr(token_estimation, "_get_encoding", unavailable_encoding)
+    original_estimate_tokens = squilla_router_step.estimate_tokens
+    golden = _load_golden()
+    for case in CORPUS:
+        assert run_case(case) == golden[case.name]
+        assert squilla_router_step.estimate_tokens is original_estimate_tokens
+    assert calls == []
+    # The harness must restore the real estimator for unrelated tests.
+    with pytest.raises(AssertionError, match="must not load the ambient tokenizer"):
+        squilla_router_step.estimate_tokens("independent caller")
+    assert calls == ["load"]
 
 
 def _capture() -> None:

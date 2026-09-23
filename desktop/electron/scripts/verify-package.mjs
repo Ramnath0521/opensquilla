@@ -6,6 +6,7 @@ import process from 'node:process'
 import { fileURLToPath } from 'node:url'
 
 import { verifyInstallerProgressPolicy } from './installer-progress-policy.mjs'
+import { verifyGatewayIntegrity } from './gateway-integrity.mjs'
 
 const scriptDir = dirname(fileURLToPath(import.meta.url))
 const packageRoot = resolve(scriptDir, '..')
@@ -227,6 +228,12 @@ async function verifyRuntime(root, label, { platform, executeCommands }) {
   }
 
   const files = await listFiles(root)
+  try {
+    verifyGatewayIntegrity(repoRoot, root, { platform })
+  } catch (error) {
+    fail(`${label} ${error instanceof Error ? error.message : String(error)}`)
+    return
+  }
   if (files.length === 0) {
     fail(`${label} runtime is empty: ${root}`)
     return
@@ -383,7 +390,7 @@ function verifyMainProcess(source, label) {
     /parent\s*:\s*parentWindow\s*\?\?\s*undefined/,
   )
   const modalOptionIndex = onboardingSource.search(
-    /modal\s*:\s*Boolean\(parentWindow\)/,
+    /modal\s*:\s*false/,
   )
   const onboardingWindowAssignmentIndex = onboardingSource.search(
     /onboardingWindow\s*=\s*window\b/,
@@ -401,7 +408,7 @@ function verifyMainProcess(source, label) {
     || modalOptionIndex < parentOptionIndex
     || onboardingWindowAssignmentIndex < modalOptionIndex
   ) {
-    fail(`${label} main process does not make first-run onboarding an owned modal child window`)
+    fail(`${label} main process does not make first-run onboarding an owned non-modal child window`)
   }
 
   const focusIndex = source.indexOf('function focusMainWindow')

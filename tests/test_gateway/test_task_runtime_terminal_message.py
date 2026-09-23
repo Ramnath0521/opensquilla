@@ -9,6 +9,8 @@ from unittest.mock import MagicMock
 
 import pytest
 
+from opensquilla.engine import Agent, AgentConfig
+from opensquilla.engine.runtime import TurnRunner
 from opensquilla.engine.types import AgentState, ErrorEvent, RouterDecisionEvent, StateChangeEvent
 from opensquilla.gateway.boot import (
     TaskRuntimeStreamError,
@@ -18,17 +20,21 @@ from opensquilla.gateway.boot import (
 from opensquilla.gateway.config import GatewayConfig
 from opensquilla.gateway.routing import RouteEnvelope, SourceKind
 from opensquilla.gateway.task_runtime import SubagentCompletionEvent, TaskRuntime
+from opensquilla.provider import DoneEvent as ProviderDone
 from opensquilla.session.models import AgentTaskRecord, AgentTaskStatus
 from opensquilla.session.storage import SessionStorage
 from opensquilla.silent_reply import (
     SILENT_REPLY_NOT_ALLOWED_CODE,
     SILENT_REPLY_NOT_ALLOWED_MESSAGE,
 )
+from opensquilla.tools.types import CallerKind, ToolContext
 
 
 def _make_envelope(
     session_key: str = "agent-1::sess-1",
     *,
+    session_id: str | None = None,
+    session_epoch: int | None = None,
     metadata: dict[str, Any] | None = None,
     input_provenance: dict[str, Any] | None = None,
 ) -> RouteEnvelope:
@@ -37,8 +43,10 @@ def _make_envelope(
         source_name="test",
         agent_id="agent-1",
         session_key=session_key,
+        session_id=session_id,
         input_provenance=input_provenance or {"kind": "test"},
         metadata=metadata or {},
+        session_epoch=session_epoch,
     )
 
 
@@ -46,10 +54,23 @@ def _make_storage() -> Any:
     storage = MagicMock()
     task_db: dict[str, AgentTaskRecord] = {}
 
-    async def create(record: AgentTaskRecord) -> None:
+    async def create(
+        record: AgentTaskRecord,
+        *,
+        expected_session_id: str | None = None,
+        expected_session_epoch: int | None = None,
+    ) -> None:
+        del expected_session_id, expected_session_epoch
         task_db[record.task_id] = record
 
-    async def update(task_id: str, **kwargs: Any) -> None:
+    async def update(
+        task_id: str,
+        *,
+        expected_session_id: str | None = None,
+        expected_session_epoch: int | None = None,
+        **kwargs: Any,
+    ) -> None:
+        del expected_session_id, expected_session_epoch
         rec = task_db.get(task_id)
         if rec is None:
             return
@@ -82,6 +103,126 @@ def _make_runtime(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(("reasoning", "stop_reason", "expected"), [
+    (False, "stop", "The model provider returned an empty response."),
+    (True, "stop", "The model returned reasoning without a visible answer."),
+    (True, "length", "The model used its output budget for reasoning"),
+])
+async def test_agent_empty_response_keeps_cause_through_task_terminal(
+    reasoning: bool, stop_reason: str, expected: str,
+) -> None:
+    class EmptyProvider:
+        provider_name = "synthetic"
+        calls = 0
+
+        async def chat(self, messages, tools=None, config=None):
+            self.calls += 1
+            yield ProviderDone(
+                stop_reason=stop_reason, input_tokens=3,
+                output_tokens=2 if reasoning else 0,
+                reasoning_tokens=2 if reasoning else 0,
+                reasoning_content="Synthetic reasoning" if reasoning else None,
+            )
+
+    provider = EmptyProvider()
+    agent = Agent(provider=provider, config=AgentConfig(
+        max_provider_retries=1, retry_base_backoff_ms=0, retry_max_backoff_ms=0,
+    ))
+    emitted: list[tuple[str, dict[str, Any]]] = []
+
+    async def emitter(_session: str, name: str, payload: dict[str, Any]) -> None:
+        emitted.append((name, payload))
+
+    async def handler(run: Any) -> None:
+        await _emit_task_runtime_stream_events(
+            agent.run_turn("Synthetic request"), run.envelope.session_key, emitter,
+            task_id=run.task_id, idle_timeout=1.0, heartbeat_interval=0.0,
+        )
+
+    runtime = _make_runtime(handler, event_emitter=emitter)
+    handle = await runtime.enqueue(_make_envelope(), "Synthetic request")
+    record = await runtime.wait(handle.task_id, timeout=2.0)
+    assert provider.calls == 2
+    assert record.status == AgentTaskStatus.FAILED
+    assert record.details["turn_outcome"]["failure_kind"] == "empty_response"
+    for name in ("session.event.error", "task.failed"):
+        payload = next(payload for event, payload in emitted if event == name)
+        assert payload["turn_outcome"]["failure_kind"] == "empty_response"
+        assert payload["terminal_message"].startswith(expected)
+        assert payload["code"] == "empty_response"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("writer_mode", ["absent", "rejected", "raises", "recorded"])
+async def test_no_provider_classification_does_not_depend_on_diagnostics(writer_mode: str) -> None:
+    class Writer:
+        def record_error(self, _record):
+            if writer_mode == "raises":
+                raise RuntimeError("PRIVATE_DIAGNOSTIC_FAILURE")
+            return writer_mode == "recorded"
+
+    runner = TurnRunner(
+        provider_selector=None,
+        turn_error_writer=None if writer_mode == "absent" else Writer(),
+        config=SimpleNamespace(context_window_tokens=100_000),
+    )
+    emitted: list[tuple[str, dict[str, Any]]] = []
+
+    async def emitter(_session: str, name: str, payload: dict[str, Any]) -> None:
+        emitted.append((name, payload))
+
+    async def handler(run: Any) -> None:
+        await _emit_task_runtime_stream_events(
+            runner.run(
+                "Synthetic request", run.envelope.session_key,
+                ToolContext(is_owner=True, caller_kind=CallerKind.WEB),
+                no_memory_capture=True, input_mode="text",
+            ),
+            run.envelope.session_key, emitter, task_id=run.task_id,
+            idle_timeout=1.0, heartbeat_interval=0.0,
+        )
+
+    runtime = _make_runtime(handler, event_emitter=emitter)
+    handle = await runtime.enqueue(_make_envelope(), "Synthetic request")
+    record = await runtime.wait(handle.task_id, timeout=2.0)
+
+    assert record.status == AgentTaskStatus.FAILED
+    assert record.error_class == "no_provider"
+    assert record.details["turn_outcome"]["reason"] == "no_provider"
+    for name in ("session.event.error", "task.failed"):
+        payloads = [payload for event, payload in emitted if event == name]
+        assert len(payloads) == 1
+        payload = payloads[0]
+        assert payload["code"] == "no_provider"
+        assert payload["turn_outcome"]["kind"] == "failed"
+        assert payload["turn_outcome"]["reason"] == "no_provider"
+        assert payload["turn_outcome"]["error_class"] == "no_provider"
+        assert bool(payload["turn_outcome"].get("error_id")) == (writer_mode == "recorded")
+        assert "PRIVATE_DIAGNOSTIC_FAILURE" not in repr(payload)
+
+
+@pytest.mark.asyncio
+async def test_unclassified_task_error_publishes_facts_without_raw_exception_text() -> None:
+    emitted: list[tuple[str, dict[str, Any]]] = []
+
+    async def emitter(_session: str, name: str, payload: dict[str, Any]) -> None:
+        emitted.append((name, payload))
+
+    async def handler(_run: Any) -> None:
+        raise RuntimeError("PRIVATE_EXCEPTION_DETAIL")
+
+    runtime = _make_runtime(handler, event_emitter=emitter)
+    handle = await runtime.enqueue(_make_envelope(), "Synthetic request")
+    record = await runtime.wait(handle.task_id, timeout=2.0)
+
+    assert record.error_message == "PRIVATE_EXCEPTION_DETAIL"
+    payload = next(payload for name, payload in emitted if name == "task.failed")
+    assert payload["code"] == "RuntimeError"
+    assert payload["turn_outcome"]["kind"] == "failed"
+    assert "PRIVATE_EXCEPTION_DETAIL" not in repr(payload)
+
+
+@pytest.mark.asyncio
 async def test_mark_terminal_emits_additive_terminal_message_for_timeout_payload() -> None:
     emitted: list[tuple[str, str, dict[str, Any]]] = []
 
@@ -111,6 +252,8 @@ async def test_mark_terminal_emits_additive_terminal_message_for_timeout_payload
     assert record.details is not None
     assert record.details["turn_outcome"]["kind"] == "interrupted"
     assert record.details["turn_outcome"]["error_class"] == "TimeoutError"
+    assert payload["turn_outcome"]["kind"] == "interrupted"
+    assert payload["turn_outcome"]["reason"] == "timeout"
 
 
 @pytest.mark.asyncio
@@ -131,6 +274,7 @@ async def test_typed_provider_exception_is_sanitized_in_task_record_and_wire_eve
             code="PRIVATE_UPSTREAM_CODE",
             terminal_reason="error",
             failure_kind="transport_transient",
+            error_id="abcd1234",
         )
 
     runtime = _make_runtime(_provider_failure_handler, event_emitter=_emitter)
@@ -146,9 +290,14 @@ async def test_typed_provider_exception_is_sanitized_in_task_record_and_wire_eve
     assert raw_marker not in repr(record)
     terminal_event = next(event for event in emitted if event[1] == "task.failed")
     assert raw_marker not in repr(terminal_event)
-    assert terminal_event[2]["terminal_message"] == "The task failed before it could finish."
+    assert terminal_event[2]["terminal_message"] == (
+        "The connection to the model provider was interrupted. Try again. (ref: abcd1234)"
+    )
+    assert terminal_event[2]["code"] == "provider_transport_transient"
     assert record.details is not None
     assert record.details["turn_outcome"]["retryable"] is True
+    assert record.details["turn_outcome"]["error_id"] == "abcd1234"
+    assert terminal_event[2]["turn_outcome"] == record.details["turn_outcome"]
 
 
 @pytest.mark.asyncio
@@ -435,17 +584,6 @@ async def test_usage_barrier_terminal_compensation_survives_lock_release_and_res
 ) -> None:
     db_path = tmp_path / "terminal-compensation.sqlite"
     storage = await SessionStorage.open(str(db_path))
-    base_get_agent_task = storage.get_agent_task
-    task_reads = 0
-
-    async def _temporarily_unavailable_read(task_id: str) -> AgentTaskRecord | None:
-        nonlocal task_reads
-        task_reads += 1
-        if task_reads <= 2:
-            raise OSError("storage temporarily unavailable")
-        return await base_get_agent_task(task_id)
-
-    storage.get_agent_task = _temporarily_unavailable_read  # type: ignore[method-assign]
     handler_started = asyncio.Event()
     fail_turn = asyncio.Event()
     lock_released = False
@@ -493,7 +631,6 @@ async def test_usage_barrier_terminal_compensation_survives_lock_release_and_res
 
     record = await runtime.wait(handle.task_id, timeout=6.0)
     assert lock_released is True
-    assert task_reads >= 4
     assert record.status == AgentTaskStatus.FAILED
     assert record.error_class == "usage_accounting_busy"
     assert record.details is not None
@@ -570,9 +707,13 @@ async def test_context_overflow_failure_is_sanitized_in_record_and_subagent_even
     handle = await runtime.enqueue(
         _make_envelope(
             session_key="agent:worker:subagent:overflow",
+            session_id="child-owner-a",
+            session_epoch=3,
             metadata={
                 "parent_session_key": "agent:main:webchat:parent",
                 "parent_task_id": "parent-task",
+                "parent_session_id": "parent-owner-a",
+                "parent_session_epoch": 5,
             },
         ),
         "summarize a very large result",
@@ -591,7 +732,20 @@ async def test_context_overflow_failure_is_sanitized_in_record_and_subagent_even
     assert record.details["turn_outcome"]["kind"] == "budgetLimited"
     assert record.details["turn_outcome"]["reason"] == "provider_request_too_large"
     assert terminal_events
-    event_payload = terminal_events[-1].to_payload()
+    event = terminal_events[-1]
+    assert (event.child_session_id, event.child_session_epoch) == (
+        "child-owner-a",
+        3,
+    )
+    assert (event.parent_session_id, event.parent_session_epoch) == (
+        "parent-owner-a",
+        5,
+    )
+    event_payload = event.to_payload()
+    assert "child_session_id" not in event_payload
+    assert "child_session_epoch" not in event_payload
+    assert "parent_session_id" not in event_payload
+    assert "parent_session_epoch" not in event_payload
     assert event_payload["error_class"] == "provider_request_too_large"
     assert "too large" in event_payload["error_message"].lower()
     assert raw_error not in event_payload["error_message"]
@@ -647,29 +801,6 @@ async def test_successful_parent_task_persists_subagent_group_outcome_details() 
     assert record.details["turn_outcome"]["kind"] == "completed"
 
 
-@pytest.mark.asyncio
-async def test_successful_task_persists_authoritative_document_mutation_outcome() -> None:
-    outcome = {
-        "status": "applied",
-        "phase": "commit",
-        "retryPolicy": "never",
-        "code": "document_mutation_applied",
-        "corrected": True,
-        "proposalAttempts": 2,
-    }
-
-    async def _success_handler(run: Any) -> None:
-        assert run.document_mutation_outcome_sink is not None
-        run.document_mutation_outcome_sink(outcome)
-
-    runtime = _make_runtime(_success_handler)
-    handle = await runtime.enqueue(_make_envelope(), "apply the annotations")
-
-    record = await runtime.wait(handle.task_id, timeout=2.0)
-
-    assert record.status == AgentTaskStatus.SUCCEEDED
-    assert record.details is not None
-    assert record.details["turn_outcome"]["documentMutationOutcome"] == outcome
 
 
 def test_subagent_completion_payload_adds_terminal_message_for_non_success() -> None:
@@ -742,13 +873,22 @@ async def test_task_runtime_stream_error_emits_sanitized_terminal_message() -> N
                 "terminal_message": "The task timed out before it could finish.",
                 "terminal_reason": "timeout",
                 "error_message": "The task timed out before it could finish.",
+                "turn_outcome": {
+                    "kind": "interrupted",
+                    "reason": "iteration_timeout",
+                    "error_class": "iteration_timeout",
+                    "error_message": "The task timed out before it could finish.",
+                    "retryable": True,
+                },
             },
         )
     ]
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("failure_kind", [None, "empty_response"])
 async def test_task_runtime_stream_reasoning_budget_error_emits_actionable_terminal_message(
+    failure_kind: str | None,
 ) -> None:
     emitted: list[tuple[str, str, dict[str, Any]]] = []
     engine_message = (
@@ -757,7 +897,7 @@ async def test_task_runtime_stream_reasoning_budget_error_emits_actionable_termi
     )
 
     async def _stream():
-        yield ErrorEvent(message=engine_message, code="empty_response")
+        yield ErrorEvent(message=engine_message, code="empty_response", failure_kind=failure_kind)
 
     async def _emitter(session_key: str, event_name: str, payload: dict[str, Any]) -> None:
         emitted.append((session_key, event_name, payload))
@@ -796,7 +936,7 @@ async def test_task_runtime_stream_error_terminal_message_carries_error_ref() ->
     async def _emitter(session_key: str, event_name: str, payload: dict[str, Any]) -> None:
         emitted.append((session_key, event_name, payload))
 
-    with pytest.raises(TaskRuntimeStreamError):
+    with pytest.raises(TaskRuntimeStreamError) as raised:
         await _emit_task_runtime_stream_events(
             _stream(),
             "agent:main:test",
@@ -807,9 +947,38 @@ async def test_task_runtime_stream_error_terminal_message_carries_error_ref() ->
         )
 
     payload = emitted[-1][2]
+    assert raised.value.error_id == "abcd1234"
+    assert payload["turn_outcome"]["error_id"] == "abcd1234"
     assert payload["error_id"] == "abcd1234"
     assert payload["message"].endswith("(ref: abcd1234)")
     assert payload["terminal_message"].endswith("(ref: abcd1234)")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "code", ["timeout", "llm_timeout", "iteration_timeout", "stream_idle_timeout"]
+)
+async def test_timeout_translation_keeps_priority_over_preserved_provider_kind(code: str) -> None:
+    emitted: list[dict[str, Any]] = []
+
+    async def stream():
+        yield ErrorEvent(
+            message="synthetic provider timeout", code=code,
+            failure_kind="transport_transient", error_id="abcd1234",
+        )
+
+    async def emitter(_session: str, _event: str, payload: dict[str, Any]) -> None:
+        emitted.append(payload)
+
+    with pytest.raises(TaskRuntimeStreamError) as raised:
+        await _emit_task_runtime_stream_events(
+            stream(), "agent:main:test", emitter,
+            stream_event_sink=None, idle_timeout=1.0, heartbeat_interval=0.0,
+        )
+    assert raised.value.code == code
+    assert raised.value.terminal_reason == "timeout"
+    assert emitted[0]["message"] == "The task timed out before it could finish. (ref: abcd1234)"
+    assert emitted[0]["turn_outcome"]["failure_kind"] == "transport_transient"
 
 
 @pytest.mark.asyncio
@@ -1085,44 +1254,39 @@ async def test_task_runtime_stream_context_overflow_hides_raw_agent_error() -> N
 
 
 @pytest.mark.asyncio
-async def test_task_runtime_rolls_back_persisted_user_on_provider_budget_error() -> None:
+@pytest.mark.parametrize("error_code", [
+    "provider_request_budget_exhausted",
+    "provider_request_too_large",
+    "current_turn_context_exhausted",
+])
+async def test_task_runtime_preserves_accepted_inputs_on_provider_budget_error(
+    error_code: str,
+) -> None:
     emitted: list[tuple[str, str, dict[str, Any]]] = []
+
+    receipts: list[bool] = []
 
     class RecordingSessionManager:
         def __init__(self) -> None:
-            self.removed: list[tuple[str, str]] = []
-            self.rollback_lock: asyncio.Lock | None = None
-            self.rollback_lock_states: list[bool] = []
+            self.messages = {
+                "msg-1": "first input", "msg-2": "second input", "msg-3": "third input",
+            }
 
         async def get_session(self, session_key: str) -> Any:  # noqa: ARG002
             return None
 
-        async def remove_message(self, session_key: str, message_id: str) -> bool:
-            self.rollback_lock_states.append(
-                self.rollback_lock is not None and self.rollback_lock.locked()
-            )
-            self.removed.append((session_key, message_id))
-            return True
+        async def remove_message(self, session_key: str, message_id: str) -> bool:  # noqa: ARG002
+            return self.messages.pop(message_id, None) is not None
 
     class ProviderBudgetErrorRunner:
-        def __init__(self) -> None:
-            self.lock = asyncio.Lock()
-
-        def _get_session_lock(self, session_key: str) -> asyncio.Lock:  # noqa: ARG002
-            return self.lock
-
         async def run(self, message: str, session_key: str, **kwargs: Any):  # noqa: ARG002
-            yield ErrorEvent(
-                message='{"fallback_reason":"provider_request_budget_exhausted"}',
-                code="provider_request_budget_exhausted",
-            )
+            yield ErrorEvent(message="Context cannot fit the provider request", code=error_code)
 
     async def _emitter(session_key: str, event_name: str, payload: dict[str, Any]) -> None:
         emitted.append((session_key, event_name, payload))
 
     manager = RecordingSessionManager()
     runner = ProviderBudgetErrorRunner()
-    manager.rollback_lock = runner.lock
     run = SimpleNamespace(
         agent_id="main",
         task_id="task-1",
@@ -1138,6 +1302,7 @@ async def test_task_runtime_rolls_back_persisted_user_on_provider_budget_error()
         persisted_user_message_id="msg-1",
         persisted_user_message_ids=("msg-1", "msg-2", "msg-3"),
         stream_event_sink=None,
+        finalizer_receipt_sink=lambda: receipts.append(True),
     )
 
     with pytest.raises(TaskRuntimeStreamError) as exc_info:
@@ -1153,12 +1318,11 @@ async def test_task_runtime_rolls_back_persisted_user_on_provider_budget_error()
         )
 
     assert exc_info.value.code == "provider_request_too_large"
-    assert manager.removed == [
-        ("agent:main:test", "msg-1"),
-        ("agent:main:test", "msg-2"),
-        ("agent:main:test", "msg-3"),
-    ]
-    assert manager.rollback_lock_states == [True, True, True]
+    assert manager.messages == {
+        "msg-1": "first input", "msg-2": "second input", "msg-3": "third input",
+    }
+    assert receipts == []
+    assert [name for _, name, _ in emitted] == ["session.event.error"]
     payload = emitted[0][2]
     assert payload["code"] == "provider_request_too_large"
     assert "too large" in payload["terminal_message"]

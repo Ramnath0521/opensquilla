@@ -41,7 +41,12 @@
               <span class="settings-rail__label">{{ t('settings.rail.' + s.id) }}</span>
               <span v-if="sectionDirty(s.id)" class="settings-rail__dirty" aria-hidden="true"></span>
               <span v-if="s.id === 'gateway'" class="settings-rail__dot" :class="sectionStatus(s.id).tone" aria-hidden="true"></span>
-              <span v-else-if="!s.client && sectionStatus(s.id).tone === 'is-warn'" class="settings-rail__warn" aria-hidden="true">!</span>
+              <span
+                v-else-if="s.id === 'provider' && loaded && sectionStatus(s.id).tone === 'is-warn'"
+                class="settings-rail__dot is-danger"
+                :title="sectionStatus(s.id).label"
+                aria-hidden="true"
+              ></span>
             </button>
           </template>
         </nav>
@@ -49,6 +54,7 @@
         <div class="settings-main">
           <header class="settings-modal__head">
             <h2 id="settings-modal-title" class="settings-modal__title">{{ t('settings.dialog.title') }}</h2>
+            <SettingsSearch :is-desktop="isDesktop" :disabled="settingsInteractionLocked" @select="selectSearchResult" />
             <button
               ref="closeBtn"
               type="button"
@@ -111,6 +117,8 @@
             v-else-if="section === 'advanced'"
             :auto-capture="memoryPanel.autoCapture"
             :loaded="loaded"
+            :config-path="displayConfigPath"
+            @copy-config-path="copyDisplayPath"
             @update-auto-capture="setMemoryAutoCapture"
             @open-agent-configuration="openAgentConfiguration"
             @open-data-maintenance="openDataMaintenance"
@@ -123,19 +131,25 @@
             <span>{{ t('shared.loading') }}</span>
           </div>
           <template v-else>
+            <SetupModelCapacity v-if="section === 'modelStrategy' && capacityTarget" :key="JSON.stringify(capacityTarget)"
+              v-bind="capacityTarget" initial-open hide-trigger
+              :disabled="saveAllPending || primaryMutationPending || modelStrategyRoutingBusy" />
             <SetupProviderPanel
               v-if="section === 'provider'"
               :panel="providerPanel"
               :dirty="providerDraftDirty"
-              :saving="saveAllPending || providerSavePending"
+              :saving="saveAllPending || providerSavePending || primaryMutationPending || modelStrategyRoutingBusy || providerPanel.busy"
               @update-provider-selected="selectProvider"
               @provider-change="onProviderChange"
               @update-provider-field="updateProviderField"
               @update-llm-timeout="updateLlmTimeout"
               @update-context-window="updateContextWindow"
               @probe-connection="probeProviderConnection"
+              @cancel-provider-probe="cancelProviderProbe"
               @refresh-models="refreshProviderModels"
+              @cancel-configured-provider-probe="cancelConfiguredProviderProbe"
               @save-provider="saveProvider"
+              @save-provider-and-activate="saveProviderAndActivate"
               @cancel-provider-edit="cancelProviderEdit"
               @copy="copyCommand"
               @go-to-section="selectSection"
@@ -149,8 +163,9 @@
             <SetupModelStrategyPanel
               v-else-if="section === 'modelStrategy'"
               :panel="modelStrategyPanel"
-              :routing-mode-busy="modelStrategyRoutingBusy"
+              :routing-mode-busy="modelStrategyRoutingBusy || providerPanel.busy"
               @update-strategy="setModelStrategy"
+              @reset-recommended-router="resetRecommendedRouter"
               @update-fixed-provider="setFixedProvider"
               @update-fixed-model="setFixedModel"
               @update-router-default-tier="setRouterDefaultTier"
@@ -206,21 +221,6 @@
         >{{ settingsInteractionLocked ? t('settings.dialog.savingChanges') : dirtySaveLabel }}</button>
       </div>
 
-      <footer class="settings-foot">
-        <span class="settings-foot__text">{{ t('settings.dialog.moreOptionsIn') }}</span>
-        <code class="settings-foot__path">{{ displayConfigPath }}</code>
-        <button
-          type="button"
-          class="settings-foot__copy"
-          :aria-label="t('settings.dialog.copyConfigPath')"
-          :title="t('settings.dialog.copyConfigPath')"
-          @click="copyDisplayPath"
-        >
-          <Icon name="copy" :size="13" />
-        </button>
-        <span class="settings-foot__sep" aria-hidden="true">&middot;</span>
-        <span class="settings-foot__text">{{ t('settings.dialog.applyLiveNote') }}</span>
-      </footer>
       </section>
       </Transition>
     </div>
@@ -231,12 +231,15 @@
 import { computed, nextTick, onMounted, onUnmounted, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { useI18n } from 'vue-i18n'
+import { hasOpenDialogLayer } from '@/composables/useDialogA11y'
 import Icon from '@/components/Icon.vue'
 import LoadingSpinner from '@/components/LoadingSpinner.vue'
 import SetupProviderPanel from '@/components/setup/SetupProviderPanel.vue'
+import SetupModelCapacity from '@/components/setup/SetupModelCapacity.vue'
 import SetupModelStrategyPanel from '@/components/setup/SetupModelStrategyPanel.vue'
 import SetupCapabilitiesPanel from '@/components/setup/SetupCapabilitiesPanel.vue'
 import SettingsAppearancePanel from '@/components/settings/SettingsAppearancePanel.vue'
+import SettingsSearch from '@/components/settings/SettingsSearch.vue'
 import SettingsKeyboardPanel from '@/components/settings/SettingsKeyboardPanel.vue'
 import SettingsAdvancedPanel from '@/components/settings/SettingsAdvancedPanel.vue'
 import SettingsMemoryPanel from '@/components/settings/SettingsMemoryPanel.vue'
@@ -256,6 +259,12 @@ import '@/styles/settings-forms.css'
 
 const route = useRoute()
 const router = useRouter()
+const capacityTarget = computed(() => {
+  const provider = route.query.capacityProvider
+  const model = route.query.capacityModel
+  return typeof provider === 'string' && provider.trim() && provider.length <= 1024
+    && typeof model === 'string' && model.trim() && model.length <= 1024 ? { provider, model } : null
+})
 const { t } = useI18n()
 const { confirmChoice, confirmState } = useConfirm()
 
@@ -295,6 +304,7 @@ const {
   setMemoryAutoCapture,
   setProviderImageGenerationOptIn,
   setModelStrategy,
+  resetRecommendedRouter,
   setFixedProvider,
   setFixedModel,
   setRouterDefaultTier,
@@ -314,8 +324,10 @@ const {
   updateLlmTimeout,
   updateContextWindow,
   probeProviderConnection,
+  cancelProviderProbe,
   refreshProviderModels,
   probeConfiguredProvider,
+  cancelConfiguredProviderProbe,
   activateProvider,
   removeProviderProfile,
   updateTierField,
@@ -325,6 +337,8 @@ const {
   onImageProviderChange,
   useImageRecommendation,
   saveProvider,
+  saveProviderAndActivate,
+  primaryMutationPending,
   resetCapability,
   copyCommand,
   copyConfigPath,
@@ -422,11 +436,12 @@ const hasSettingsExitDraft = computed(() => (
 const hasPendingSettingsWrite = computed(() => (
   saveAllPending.value
   || providerSavePending.value
+  || primaryMutationPending.value
   || modelStrategyRoutingBusy.value
   || closeSavePending.value
 ))
 const settingsInteractionLocked = computed(() => (
-  saveAllPending.value || closeSavePending.value
+  saveAllPending.value || closeSavePending.value || primaryMutationPending.value
 ))
 const shouldGuardBrowserUnload = computed(() => (
   hasSettingsExitDraft.value || hasPendingSettingsWrite.value
@@ -487,6 +502,40 @@ function selectSection(id: string) {
   }
 }
 
+const SEARCH_TARGET_IDS: Record<string, string> = {
+  'setup.connection.wsUrlLabel': 'conn-ws-url',
+  'setup.connection.tokenLabel': 'conn-ws-token',
+  'setup.runtime.title': 'settings-gateway-runtime',
+  'settings.search.permissions': 'settings-security-sandbox',
+  'settings.sandbox.title': 'settings-security-sandbox',
+  'settings.sandbox.mode.title': 'settings-security-sandbox',
+}
+
+async function selectSearchResult(id: string, labelKey: string) {
+  selectSection(id)
+  await nextTick()
+  const panel = panelRef.value
+  if (!panel || section.value !== id || settingsInteractionLocked.value) return
+
+  const targetId = SEARCH_TARGET_IDS[labelKey]
+  const label = labelKey ? t(labelKey) : ''
+  const explicitTarget = targetId ? panel.querySelector<HTMLElement>(`#${targetId}`) : null
+  const matched = label
+    ? Array.from(panel.querySelectorAll<HTMLElement>('label, .control-row__label, .capability-card__title, h3, h4'))
+      .find(element => element.textContent?.trim() === label)
+    : undefined
+  const row = matched?.closest<HTMLElement>('.control-row, .capability-card')
+  // A section-only result must not focus an unrelated action at the top of
+  // that section. Exact setting rows can focus their own native control.
+  const target = explicitTarget
+    ?? row?.querySelector<HTMLElement>('input:not(:disabled), select:not(:disabled), button:not(:disabled)')
+    ?? matched
+    ?? panel
+  target.scrollIntoView?.({ block: 'nearest', behavior: 'auto' })
+  if (!target.matches('input, select, button, [tabindex]')) target.tabIndex = -1
+  target.focus({ preventScroll: true })
+}
+
 // Resolve aliases and nested destinations. Old URLs are canonicalized with a
 // subsection hash so bookmarks keep landing on their original content.
 function applyRouteSection() {
@@ -517,7 +566,8 @@ function focusCompositeHash(): boolean {
   const target = document.getElementById(targetId)
   if (!target) return false
   target.scrollIntoView({ block: 'start', inline: 'nearest', behavior: 'auto' })
-  target.focus({ preventScroll: true })
+  const initialFocus = target.querySelector<HTMLElement>('[data-settings-initial-focus]')
+  ;(initialFocus ?? target).focus({ preventScroll: true })
   return true
 }
 
@@ -588,8 +638,7 @@ function navigateAway() {
   // directly (same breakpoint/platform branch as the '/' redirect in sharedRoutes)
   // so close is a single, predictable, loop-proof exit. `returnTo` is already
   // null for a cold deep link (onMounted rejects any '/settings…' back-entry).
-  const fallback = isDesktop || window.matchMedia('(max-width: 768px)').matches ? '/chat' : '/sessions'
-  void router.push(returnTo ?? fallback)
+  void router.push(returnTo ?? '/chat')
 }
 
 // The modal's leave transition finished — perform the deferred navigation that
@@ -720,7 +769,7 @@ function onDocumentKeydown(event: KeyboardEvent) {
   if (event.defaultPrevented) return
   // The confirm modal owns the keyboard while it is open; let it handle Escape
   // so a single keypress cannot both dismiss the prompt and re-open it.
-  if (confirmState.value) return
+  if (confirmState.value || hasOpenDialogLayer()) return
   if (event.key === 'Escape') {
     event.preventDefault()
     void requestClose()
@@ -870,6 +919,7 @@ onUnmounted(() => {
 .settings-modal__head {
   align-items: center;
   display: flex;
+  flex-wrap: wrap;
   flex-shrink: 0;
   gap: var(--sp-3);
   padding: var(--sp-4) var(--sp-4) 0;
@@ -973,24 +1023,9 @@ onUnmounted(() => {
 }
 
 .settings-rail__dot.is-ok { background: var(--ok); }
+.settings-rail__dot.is-danger { background: var(--danger); }
 .settings-rail__dot.is-warn { background: var(--warn-fill); }
 .settings-rail__dot.is-muted { background: var(--text-dim); opacity: 0.5; }
-
-.settings-rail__warn {
-  align-items: center;
-  background: var(--warn-fill);
-  clip-path: polygon(50% 0, 100% 100%, 0 100%);
-  color: var(--bg);
-  display: inline-flex;
-  flex-shrink: 0;
-  font-size: 7px;
-  font-weight: 700;
-  height: 11px;
-  justify-content: center;
-  line-height: 1;
-  padding-top: 3px;
-  width: 12px;
-}
 
 .settings-rail__dirty {
   background: var(--accent);
@@ -1057,50 +1092,6 @@ onUnmounted(() => {
   flex: 1;
 }
 
-/* Footer */
-.settings-foot {
-  align-items: center;
-  border-top: 1px solid var(--border);
-  color: var(--text-dim);
-  display: flex;
-  flex-shrink: 0;
-  flex-wrap: wrap;
-  font-size: var(--fs-xs);
-  gap: var(--sp-2);
-  min-width: 0;
-  padding: var(--sp-2) var(--sp-4);
-}
-
-.settings-foot__path {
-  color: var(--text-muted);
-  flex: 1 1 240px;
-  font-family: var(--font-mono);
-  font-size: var(--fs-xs);
-  min-width: 0;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
-.settings-foot__copy {
-  align-items: center;
-  background: transparent;
-  border: 1px solid transparent;
-  border-radius: var(--radius-sm);
-  color: var(--text-muted);
-  cursor: pointer;
-  display: inline-flex;
-  height: 24px;
-  justify-content: center;
-  width: 24px;
-}
-
-.settings-foot__copy:hover {
-  background: var(--bg-hover);
-  border-color: var(--border);
-  color: var(--text);
-}
-
 /* Mobile: full screen, horizontal section chips */
 @media (max-width: 768px) {
   .settings-overlay {
@@ -1150,24 +1141,6 @@ onUnmounted(() => {
 
   .settings-panel {
     padding: var(--sp-3);
-  }
-
-  .settings-foot {
-    align-items: flex-start;
-    gap: var(--sp-1) var(--sp-2);
-    padding-bottom: max(var(--sp-2), env(safe-area-inset-bottom));
-  }
-
-  .settings-foot__text:first-child {
-    display: none;
-  }
-
-  .settings-foot__path {
-    flex-basis: calc(100% - 32px);
-  }
-
-  .settings-foot__sep {
-    display: none;
   }
 }
 </style>
